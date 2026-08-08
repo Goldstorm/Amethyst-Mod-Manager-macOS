@@ -14,6 +14,7 @@ No UI imports here (Utils stays gui-free).
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 # ~/.var/app is excluded from --filesystem=home; these are granted
@@ -36,7 +37,11 @@ def flatpak_blocked_path_hint(path) -> str | None:
     or when the path lies inside a granted tree (a missing path there is a
     genuine missing path, not a permission problem). Otherwise returns the
     command the user can run (or replicate in Flatseal) to grant access.
+
+    macOS:   Always returns None (no Flatpak sandbox on macOS).
     """
+    if sys.platform == "darwin":
+        return None
     if not in_flatpak():
         return None
     try:

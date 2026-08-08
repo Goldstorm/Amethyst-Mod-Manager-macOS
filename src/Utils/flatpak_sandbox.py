@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
@@ -378,7 +379,11 @@ def ensure_symlink_target_access(
 
     No-op when the game is not sandbox-launched, the paths are already
     granted, or AMM_FLATPAK_OVERRIDE=0.  Never raises.
+
+    macOS:   Always no-op (no Flatpak sandbox on macOS).
     """
+    if sys.platform == "darwin":
+        return
     if os.environ.get("AMM_FLATPAK_OVERRIDE", "1") == "0":
         return
     try:

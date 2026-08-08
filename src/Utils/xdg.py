@@ -18,6 +18,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 import threading
 from pathlib import Path
 from typing import Callable
@@ -131,11 +132,14 @@ def _in_flatpak() -> bool:
 def xdg_download_dir() -> Path:
     """Return the user's Downloads directory.
 
-    Desktops record localised user dirs ("Téléchargements", "Descargas", …)
-    in ~/.config/user-dirs.dirs but rarely export XDG_DOWNLOAD_DIR into the
-    environment, so check the env var first, then parse the file, then fall
-    back to ~/Downloads.
+    macOS:   ~/Downloads
+    Linux:   Desktops record localised user dirs ("Téléchargements", "Descargas", …)
+             in ~/.config/user-dirs.dirs but rarely export XDG_DOWNLOAD_DIR into the
+             environment, so check the env var first, then parse the file, then fall
+             back to ~/Downloads.
     """
+    if sys.platform == "darwin":
+        return Path.home() / "Downloads"
     env = os.environ.get("XDG_DOWNLOAD_DIR")
     if env:
         return Path(env)
@@ -239,19 +243,23 @@ def spawn_watched(
 
 
 def xdg_open(path: str | Path, log_fn: Callable[[str], None] | None = None) -> None:
-    """Open *path* with the user's default application via xdg-open.
+    """Open *path* with the user's default application.
+
+    macOS:   uses ``open``
+    Linux:   uses ``xdg-open`` (or ``flatpak-spawn --host xdg-open`` in Flatpak)
 
     Uses host_env() so that the launched application (e.g. Dolphin) loads
     its own system libraries. Failures are logged to app_log (always) and
     log_fn (if provided), so they don't disappear silently.
 
-    Inside a Flatpak sandbox, mirror open_url's chain rather than betting
-    everything on one command - a single `flatpak-spawn --host xdg-open`
-    silently does nothing when the *host* has no inode/directory handler
-    (a Deck that never booted to Desktop Mode), when its mimeapps.list
-    points at a removed .desktop, or when a user revoked
-    org.freedesktop.Flatpak in Flatseal (flatpak-spawn is still on PATH
-    inside the sandbox, so which() can't detect that). Try, in order:
+    macOS:   uses ``open``
+    Linux:   Inside a Flatpak sandbox, mirror open_url's chain rather than betting
+             everything on one command - a single `flatpak-spawn --host xdg-open`
+             silently does nothing when the *host* has no inode/directory handler
+             (a Deck that never booted to Desktop Mode), when its mimeapps.list
+             points at a removed .desktop, or when a user revoked
+             org.freedesktop.Flatpak in Flatseal (flatpak-spawn is still on PATH
+             inside the sandbox, so which() can't detect that). Try, in order:
       1. `flatpak-spawn --host xdg-open <path>` - host handler, opens the
          user's real file manager outside the sandbox.
       2. `gio open <path>` - OpenURI portal from *inside* the sandbox;
@@ -260,6 +268,9 @@ def xdg_open(path: str | Path, log_fn: Callable[[str], None] | None = None) -> N
     Each step's failure is logged and triggers the next.
     """
     target = str(path)
+    if sys.platform == "darwin":
+        spawn_watched(["open", target], f"open {target!r}", log_fn)
+        return
     if not _in_flatpak():
         spawn_watched(["xdg-open", target], f"xdg-open {target!r}", log_fn)
         return
@@ -300,13 +311,18 @@ def xdg_open(path: str | Path, log_fn: Callable[[str], None] | None = None) -> N
 def open_url(url: str, log_fn: Callable[[str], None] | None = None) -> None:
     """Open *url* in the user's default browser.
 
-    Inside a Flatpak sandbox `xdg-open` from the runtime usually can't reach
-    the host's browser. Try, in order:
-      1. `flatpak-spawn --host xdg-open <url>` - runs xdg-open on the host.
-      2. `gio open <url>` - uses the OpenURI portal from inside the sandbox.
-      3. bare `xdg-open <url>` - last resort.
+    macOS:   uses ``open``
+    Linux:   Inside a Flatpak sandbox, `xdg-open` from the runtime usually can't reach
+             the host's browser. Try, in order:
+      1. `flatpak-spawn --host xdg-open <url>` — runs xdg-open on the host.
+      2. `gio open <url>` — uses the OpenURI portal from inside the sandbox.
+      3. bare `xdg-open <url>` — last resort.
     Each step's failure is logged and triggers the next.
     """
+    if sys.platform == "darwin":
+        spawn_watched(["open", url], f"open {url!r}", log_fn)
+        return
+
     if not _in_flatpak():
         spawn_watched(["xdg-open", url], f"xdg-open {url!r}", log_fn)
         return

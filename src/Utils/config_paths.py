@@ -2,26 +2,47 @@
 config_paths.py
 Central helpers for resolving user-writable config directories.
 
-Follows the XDG Base Directory Specification:
-  Config lives in $XDG_CONFIG_HOME/AmethystModManager  (default: ~/.config/AmethystModManager)
+Linux:   Follows the XDG Base Directory Specification
+          Config lives in $XDG_CONFIG_HOME/AmethystModManager (default: ~/.config/AmethystModManager)
+macOS:   Uses ~/Library/Application Support/AmethystModManager
 
 This is required for AppImage packaging - the AppImage mount is read-only,
 so all user config must be written outside the app bundle.
 """
 
 import os
+import sys
 from pathlib import Path
 
 APP_NAME = "AmethystModManager"
 
 
+def _is_macos() -> bool:
+    return sys.platform == "darwin"
+
+
+def _macos_config_base() -> Path:
+    """macOS standard config base: ~/Library/Application Support/"""
+    return Path.home() / "Library" / "Application Support"
+
+
+def _linux_config_base() -> Path:
+    """Linux XDG config base: $XDG_CONFIG_HOME or ~/.config"""
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    return Path(xdg) if xdg else Path.home() / ".config"
+
+
+def _config_base() -> Path:
+    return _macos_config_base() if _is_macos() else _linux_config_base()
+
+
 def get_config_dir() -> Path:
     """Return the app config directory, creating it if it doesn't exist.
 
-    Respects $XDG_CONFIG_HOME; falls back to ~/.config/AmethystModManager.
+    macOS:   ~/Library/Application Support/AmethystModManager
+    Linux:   Respects $XDG_CONFIG_HOME; falls back to ~/.config/AmethystModManager
     """
-    xdg = os.environ.get("XDG_CONFIG_HOME")
-    base = Path(xdg) if xdg else Path.home() / ".config"
+    base = _config_base()
     config_dir = base / APP_NAME
     config_dir.mkdir(parents=True, exist_ok=True)
     return config_dir
@@ -81,6 +102,37 @@ def get_default_staging_root() -> Path:
     the Flatpak, AppImage and native installs alike.
     """
     return Path.home() / "Games" / "Amethyst"
+
+
+def get_downloads_dir() -> Path:
+    """Return the user's Downloads directory.
+
+    macOS:   ~/Downloads
+    Linux:   Checks $XDG_DOWNLOAD_DIR, then ~/.config/user-dirs.dirs, then ~/Downloads
+    """
+    if _is_macos():
+        return Path.home() / "Downloads"
+
+    # Linux: check XDG_DOWNLOAD_DIR env var first
+    env = os.environ.get("XDG_DOWNLOAD_DIR")
+    if env:
+        return Path(env)
+
+    home = Path.home()
+    cfg_base = os.environ.get("XDG_CONFIG_HOME") or (home / ".config")
+    try:
+        for line in (Path(cfg_base) / "user-dirs.dirs").read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line.startswith("XDG_DOWNLOAD_DIR="):
+                continue
+            raw = line.split("=", 1)[1].strip().strip('"')
+            raw = raw.replace("$HOME", str(home))
+            if raw and Path(raw) != home:
+                return Path(raw)
+            break
+    except (OSError, UnicodeDecodeError):
+        pass
+    return home / "Downloads"
 
 
 def get_default_game_staging_root(game_name: str) -> Path:
