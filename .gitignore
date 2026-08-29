@@ -27,5 +27,4 @@ src/appimage/dist/
 /native/amethyst_filegraph/target/
 /assets
 *.DS_Store
-CLAUDE.md
 PLAN.md
