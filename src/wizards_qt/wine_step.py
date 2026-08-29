@@ -1,4 +1,4 @@
-"""Reusable "Choose Wine Runner" wizard step — platform-agnostic successor to
+"""Reusable "Choose Wine Runner" wizard step — platform-agnostic replacement for
 ProtonStepWidget (wizards_qt/proton_step.py).
 
 On Linux:  Identical to ProtonStepWidget — picks Proton version + prefix mode.
@@ -7,12 +7,13 @@ On macOS: Picks CrossOver bottle or system Wine + prefix mode.
 The callback contract is unchanged:
     on_continue(runner_name: str, prefix_mode: str)
 
-The runner_name is the Proton version on Linux, the bottle name on macOS.
+The runner_name is the Proton version on Linux, the CrossOver bottle name on
+macOS. All existing callers (dyndolod_view, pandora_view, xedit_view,
+_view_base) work without changes.
 """
 
 from __future__ import annotations
 
-import os
 import sys
 import threading
 from pathlib import Path
@@ -21,8 +22,7 @@ from typing import TYPE_CHECKING
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QCheckBox, QComboBox, QLineEdit, QRadioButton, QButtonGroup,
-    QGroupBox, QFormLayout,
+    QCheckBox, QComboBox, QLineEdit,
 )
 
 from gui_qt.theme_qt import active_palette, _c, button_qss, ok_text, err_text
@@ -39,22 +39,17 @@ if TYPE_CHECKING:
     from Games.base_game import BaseGame
 
 
-# ---------------------------------------------------------------------------
-# WineStepWidget — the dual-mode widget
-# ---------------------------------------------------------------------------
-
 class WineStepWidget(QWidget):
     """Choose Wine/Proton runner + prefix placement for a wizard tool.
 
     On Linux:  Shows Proton versions (identical to ProtonStepWidget).
-    On macOS:  Shows CrossOver bottles or system Wine option.
+    On macOS:  Shows CrossOver bottles or system Wine.
 
-    Callback:  on_continue(runner_name: str, prefix_mode: str)
+    Constructor and callback are drop-in replacements for ProtonStepWidget.
     """
 
     _delete_done = Signal(bool, str)
 
-    # Constructor mirrors ProtonStepWidget exactly
     def __init__(self, game: "BaseGame", exe: Path,
                  tool_exe_name: str, tool_display_name: str,
                  on_continue, log_fn=None, *,
@@ -71,10 +66,9 @@ class WineStepWidget(QWidget):
             title = self.tr("Choose Wine Runner") if sys.platform == "darwin" \
                 else self.tr("Choose Proton Version")
         if deps_note is None:
-            deps_note = self.tr("Each version gets its own prefix; "
+            deps_note = self.tr("Each runner gets its own prefix; "
                                 "dependencies are installed into it "
                                 "automatically on the next step.")
-
         self._game = game
         self._exe = exe
         self._tool_exe_name = tool_exe_name
@@ -90,7 +84,8 @@ class WineStepWidget(QWidget):
             isolated_prefix_dir_fn
             or (lambda name: self._exe.parent / f"prefix_{name}"))
         self._confirm_delete = False
-        # UI refs (populated by platform-specific builder)
+
+        # UI refs (populated by _build_ui)
         self._version_combo: QComboBox | None = None
         self._delete_btn: QPushButton | None = None
         self._prefix_status: QLabel | None = None
@@ -98,13 +93,11 @@ class WineStepWidget(QWidget):
         self._game_chk: QCheckBox | None = None
         self._winetricks_chk: QCheckBox | None = None
         self._versions: list[str] = []
+        self._env_entry: QLineEdit | None = None
 
         self._delete_done.connect(self._on_delete_done)
 
-        self._build_ui(
-            title, deps_note, default_prefix_mode,
-            show_discrete_gpu,
-        )
+        self._build_ui(title, deps_note, default_prefix_mode, show_discrete_gpu)
 
     # -----------------------------------------------------------------------
     # Public API (identical to ProtonStepWidget)
@@ -117,67 +110,31 @@ class WineStepWidget(QWidget):
             and self._prefer_discrete_gpu_cb.isChecked()
         )
 
-    def current_runner_name(self) -> str:
-        """The currently selected runner/bottle name."""
-        if self._version_combo is not None:
-            return self._version_combo.currentText().strip()
-        return ""
-
-    def current_prefix_mode(self) -> str:
-        """The currently selected prefix mode."""
-        if self._game_chk is not None and self._game_chk.isChecked():
-            return PREFIX_MODE_GAME
-        if self._shared_chk is not None and self._shared_chk.isChecked():
-            return PREFIX_MODE_SHARED
-        return PREFIX_MODE_ISOLATED
-
     # -----------------------------------------------------------------------
-    # UI Builder — delegates to platform-specific method
+    # UI Construction
     # -----------------------------------------------------------------------
 
     def _build_ui(self, title, deps_note, default_prefix_mode, show_discrete_gpu):
-        """Build the widget's layout."""
         p = active_palette()
         v = QVBoxLayout(self)
         v.setContentsMargins(20, 16, 20, 16)
         v.setSpacing(6)
 
-        # Header
         head = QLabel(title)
         head.setAlignment(Qt.AlignHCenter)
         head.setStyleSheet(f"color:{_c(p,'TEXT_MAIN')}; font-weight:600;")
         v.addWidget(head)
 
-        if sys.platform == "darwin":
-            self._build_macos_ui(v, deps_note, p, default_prefix_mode, show_discrete_gpu)
-        else:
-            self._build_linux_ui(v, deps_note, p, default_prefix_mode, show_discrete_gpu)
-
-    # -----------------------------------------------------------------------
-    # Linux UI — identical to ProtonStepWidget
-    # -----------------------------------------------------------------------
-
-    def _build_linux_ui(self, v, deps_note, p, default_prefix_mode, show_discrete_gpu):
-        """Build the Linux/Proton UI (identical to ProtonStepWidget)."""
-        from Utils.steam_finder import list_installed_proton
-
-        self._versions = [s.parent.name for s in list_installed_proton()]
+        # Load runner versions (platform-specific)
+        self._load_versions()
         if not self._versions:
-            err = QLabel(self.tr(
-                "No Proton versions were found.\n\n"
-                "Install a Proton version in Steam (or with "
-                "Heroic's Wine Manager), then reopen this wizard."))
-            err.setAlignment(Qt.AlignHCenter)
-            err.setWordWrap(True)
-            err.setStyleSheet(f"color:{err_text()};")
-            v.addWidget(err)
-            v.addStretch(1)
+            self._show_no_runners_error(v)
             return
 
         desc = QLabel(
             self.tr("{0} runs in its own Wine prefix, stored next to "
             "its exe and separate from the game's prefix, so you can pick any "
-            "Proton version without affecting the game.\n\n").format(
+            "runner without affecting the game.\n\n").format(
                 self._tool_display_name) + deps_note)
         desc.setWordWrap(True)
         desc.setAlignment(Qt.AlignHCenter)
@@ -185,59 +142,6 @@ class WineStepWidget(QWidget):
         v.addWidget(desc)
         v.addSpacing(6)
 
-        self._build_common_controls(v, p, default_prefix_mode, show_discrete_gpu)
-
-    # -----------------------------------------------------------------------
-    # macOS UI — CrossOver bottle picker + system wine
-    # -----------------------------------------------------------------------
-
-    def _build_macos_ui(self, v, deps_note, p, default_prefix_mode, show_discrete_gpu):
-        """Build the macOS UI: CrossOver bottles or system Wine."""
-        from Utils.crossover_finder import list_crossover_bottles, find_crossover_wine_binary
-        from Utils.wine_runner import SystemWineRunner
-
-        bottles = list_crossover_bottles()
-        has_system_wine = SystemWineRunner().find_wine_binary() is not None
-
-        if not bottles and not has_system_wine:
-            err = QLabel(self.tr(
-                "No CrossOver bottles or system Wine were found.\n\n"
-                "Install CrossOver from code.weavers.com or install Wine "
-                "via Homebrew (`brew install --cask wine-stable`), "
-                "then reopen this wizard."))
-            err.setAlignment(Qt.AlignHCenter)
-            err.setWordWrap(True)
-            err.setStyleSheet(f"color:{err_text()};")
-            v.addWidget(err)
-            v.addStretch(1)
-            return
-
-        # Build version list from bottles + system wine
-        self._versions = []
-        for b in bottles:
-            self._versions.append(b.name)
-        if has_system_wine:
-            self._versions.append("System Wine")
-
-        desc = QLabel(
-            self.tr("{0} runs in its own Wine prefix, stored next to "
-            "its exe and separate from the game's prefix, so you can pick any "
-            "CrossOver bottle without affecting the game.\n\n").format(
-                self._tool_display_name) + deps_note)
-        desc.setWordWrap(True)
-        desc.setAlignment(Qt.AlignHCenter)
-        desc.setStyleSheet(f"color:{_c(p,'TEXT_DIM')};")
-        v.addWidget(desc)
-        v.addSpacing(6)
-
-        self._build_common_controls(v, p, default_prefix_mode, show_discrete_gpu)
-
-    # -----------------------------------------------------------------------
-    # Common controls (prefix mode, winetricks, runner picker, env vars)
-    # -----------------------------------------------------------------------
-
-    def _build_common_controls(self, v, p, default_prefix_mode, show_discrete_gpu):
-        """Build controls shared by both Linux and macOS UIs."""
         dim = f"color:{_c(p,'TEXT_DIM')};"
 
         # ---- prefix mode checkboxes ----
@@ -380,6 +284,46 @@ class WineStepWidget(QWidget):
         self._update_runner_row_state()
 
     # -----------------------------------------------------------------------
+    # Platform-specific version loading
+    # -----------------------------------------------------------------------
+
+    def _load_versions(self):
+        """Load available runner versions (platform-specific)."""
+        if sys.platform == "darwin":
+            from Utils.crossover_finder import list_crossover_bottles
+            from Utils.wine_runner import SystemWineRunner
+
+            bottles = list_crossover_bottles()
+            for b in bottles:
+                self._versions.append(b.name)
+            # Also add system Wine if available
+            sys_wine = SystemWineRunner().find_wine_binary()
+            if sys_wine:
+                self._versions.append("System Wine")
+        else:
+            from Utils.steam_finder import list_installed_proton
+            self._versions = [s.parent.name for s in list_installed_proton()]
+
+    def _show_no_runners_error(self, layout: QVBoxLayout):
+        """Show error when no runners are available."""
+        if sys.platform == "darwin":
+            msg = self.tr(
+                "No CrossOver bottles or system Wine were found.\n\n"
+                "Install CrossOver (code.weavers.com) or Wine via Homebrew "
+                "(`brew install --cask wine-stable`), then reopen this wizard.")
+        else:
+            msg = self.tr(
+                "No Proton versions were found.\n\n"
+                "Install a Proton version in Steam (or with "
+                "Heroic's Wine Manager), then reopen this wizard.")
+        err = QLabel(msg)
+        err.setAlignment(Qt.AlignHCenter)
+        err.setWordWrap(True)
+        err.setStyleSheet(f"color:{err_text()};")
+        layout.addWidget(err)
+        layout.addStretch(1)
+
+    # -----------------------------------------------------------------------
     # Defaults / State
     # -----------------------------------------------------------------------
 
@@ -414,6 +358,13 @@ class WineStepWidget(QWidget):
         except Exception:
             return False
 
+    def _current_prefix_mode(self) -> str:
+        if self._game_chk is not None and self._game_chk.isChecked():
+            return PREFIX_MODE_GAME
+        if self._shared_chk is not None and self._shared_chk.isChecked():
+            return PREFIX_MODE_SHARED
+        return PREFIX_MODE_ISOLATED
+
     def _on_shared_toggle(self, on: bool):
         if on and self._game_chk is not None:
             self._game_chk.setChecked(False)
@@ -425,29 +376,24 @@ class WineStepWidget(QWidget):
         self._update_runner_row_state()
 
     def _update_runner_row_state(self):
-        """Grey out runner picker when game prefix mode is selected."""
         use_game = self._game_chk is not None and self._game_chk.isChecked()
-        if self._version_combo is not None:
+        if self._version_combo:
             self._version_combo.setEnabled(not use_game)
         if use_game:
-            if self._delete_btn is not None:
+            if self._delete_btn:
                 self._delete_btn.setEnabled(False)
-            if self._prefix_status is not None:
+            if self._prefix_status:
                 self._prefix_status.setText(
-                    self.tr("Using the game's existing prefix - runner version follows "
+                    self.tr("Using the game's existing prefix - runner follows "
                     "the game's launcher setting and no new prefix is created."))
                 self._prefix_status.setStyleSheet(
                     f"color:{_c(active_palette(),'TEXT_DIM')};")
         else:
             self._update_prefix_delete_state()
 
-    # -----------------------------------------------------------------------
-    # Continue / Save
-    # -----------------------------------------------------------------------
-
     def _on_chosen(self):
-        mode = self.current_prefix_mode()
-        name = self.current_runner_name()
+        mode = self._current_prefix_mode()
+        name = self._version_combo.currentText() if self._version_combo else ""
         save_proton_override(self._game, self._tool_exe_name, name)
         save_prefix_mode(self._game, self._tool_exe_name, mode)
         wt = self._winetricks_chk.isChecked() if self._winetricks_chk else False
@@ -479,7 +425,7 @@ class WineStepWidget(QWidget):
     # -----------------------------------------------------------------------
 
     def _selected_prefix_dir(self) -> Path | None:
-        name = self.current_runner_name().strip()
+        name = self._version_combo.currentText().strip() if self._version_combo else ""
         if not name:
             return None
         if self._shared_chk is not None and self._shared_chk.isChecked():
@@ -509,8 +455,6 @@ class WineStepWidget(QWidget):
             if exists else "")
 
     def _on_delete_prefix(self):
-        if self._delete_btn is None:
-            return
         d = self._selected_prefix_dir()
         if d is None or not d.is_dir():
             self._update_prefix_delete_state()
@@ -557,18 +501,3 @@ class WineStepWidget(QWidget):
             self._delete_btn.setText(self.tr("Delete Prefix"))
             self._delete_btn.setStyleSheet("")
             self._delete_btn.setEnabled(d is not None and d.is_dir())
-
-
-# ---------------------------------------------------------------------------
-# Backwards-compat alias
-# ---------------------------------------------------------------------------
-
-class ProtonStepWidget(WineStepWidget):
-    """Alias for WineStepWidget — preserves the old import name.
-
-    Wizard views that still import `from wizards_qt.proton_step import
-    ProtonStepWidget` continue to work because proton_step.py re-exports
-    this class. When they are migrated, switch to:
-        from wizards_qt.wine_step import WineStepWidget
-    """
-    pass
