@@ -471,8 +471,8 @@ class DynDOLODView(QWidget):
             err.setStyleSheet(f"color:{err_text()};")
             lay.addWidget(err)
             return
-        from wizards_qt.proton_step import ProtonStepWidget
-        self._proton_step = ProtonStepWidget(
+        from wizards_qt.wine_step import WineStepWidget
+        self._proton_step = WineStepWidget(
             self._game, self._exe, self._exe_name, self._name,
             on_continue=self._on_proton_chosen,
             log_fn=self._log,

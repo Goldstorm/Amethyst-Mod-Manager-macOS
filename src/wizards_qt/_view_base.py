@@ -637,8 +637,8 @@ class WizardViewBase(QWidget):
             err.setStyleSheet(f"color:{err_text()};")
             lay.addWidget(err)
             return
-        from wizards_qt.proton_step import ProtonStepWidget
-        lay.addWidget(ProtonStepWidget(
+        from wizards_qt.wine_step import WineStepWidget
+        lay.addWidget(WineStepWidget(
             self._game, exe, exe_name, display_name,
             on_continue=on_chosen,
             log_fn=self._log,

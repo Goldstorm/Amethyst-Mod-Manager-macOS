@@ -211,8 +211,8 @@ class PandoraView(QWidget):
             lay.addWidget(err)
             lay.addStretch(1)
             return page
-        from wizards_qt.proton_step import ProtonStepWidget
-        return ProtonStepWidget(
+        from wizards_qt.wine_step import WineStepWidget
+        return WineStepWidget(
             self._game, self._exe, EXE_NAME, "Pandora",
             on_continue=self._on_proton_chosen,
             log_fn=self._log,

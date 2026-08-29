@@ -490,8 +490,8 @@ class XEditView(QWidget):
             err.setStyleSheet(f"color:{err_text()};")
             lay.addWidget(err)
             return
-        from wizards_qt.proton_step import ProtonStepWidget
-        lay.addWidget(ProtonStepWidget(
+        from wizards_qt.wine_step import WineStepWidget
+        lay.addWidget(WineStepWidget(
             self._game, self._exe, self._exe_name, self._name,
             on_continue=self._on_proton_chosen,
             log_fn=self._log,
