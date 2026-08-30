@@ -12,6 +12,7 @@ Used by CrossOverRunner in wine_runner.py.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -237,12 +238,8 @@ def get_crossover_version() -> str | None:
     return None
 
 
-# Lazy import to avoid circular dependency at module level
-import shutil
-
-
-# CrossOver version-specific wine binary patterns
-# Newer CrossOver versions nest their wine binary deeper
+# CrossOver version-specific wine binary patterns (deep-search fallback).
+# Defined at the bottom but referenced by find_crossover_wine_binary / the
 _CX_WINE_PATTERNS = [
     "Contents/SharedSupport/CrossOver/CrossOver-Hosted Application/wine",
     "Contents/SharedSupport/libexec/wine/mac/wine",
@@ -253,3 +250,58 @@ _CXEXEC_PATTERNS = [
     "Contents/Frameworks/CrossOver.app/Contents/MacOS/cxexec",
     "Contents/MacOS/cxexec",
 ]
+
+
+def find_wine_binary_for_name(name: str, *, prefer_plain_wine: bool = False
+                                ) -> "Path | None":
+    """Map a :class:`WineStepWidget` runner *name* to a wine/cxexec binary.
+
+    The macOS picker (``wizards_qt/wine_step.py``) offers one of two kinds of
+    runner name:
+
+      * a **CrossOver bottle name** (e.g. ``"Steam"``, ``"CrossOver 24"``) ->
+        the CrossOver wine binary. The bottle itself is the prefix; the caller
+        selects it via ``WINEPREFIX``.
+      * the **``"System Wine"`` pseudo-name** (or ``""``) -> a Homebrew/PATH
+        wine binary, resolved through
+        :class:`Utils.wine_runner.SystemWineRunner`.
+
+    ``prefer_plain_wine`` selects a generic ``wine`` binary over CrossOver's
+    ``cxexec`` entry point. ``cxexec`` is bottle-specific (it configures a named
+    bottle's environment), so isolated/shared *tool* prefixes -- which are plain
+    Wine prefixes, not CrossOver bottles -- must use a plain ``wine``. A
+    CrossOver bottle prefix itself is fine with ``cxexec``.
+
+    Returns ``None`` off-darwin or when no binary can be resolved.
+    """
+    if not _is_macos():
+        return None
+
+    low = (name or "").strip().lower()
+
+    # System Wine (Homebrew cask or a `wine` on PATH): reuse the abstraction's
+    # own binary discovery so we never duplicate its candidate list here.
+    if low in ("", "system wine", "wine", "wine-stable", "system"):
+        from Utils.wine_runner import SystemWineRunner
+        binary = SystemWineRunner().find_wine_binary()
+        if binary is not None:
+            return binary
+        if not prefer_plain_wine:
+            return find_crossover_wine_binary()
+        return None
+
+    if prefer_plain_wine:
+        # Isolated/shared tool prefixes are plain Wine prefixes: prefer a raw
+        # `wine` binary over the bottle-bound `cxexec` so the prefix is used as
+        # a standalone WINEPREFIX.
+        for candidate in _CX_WINE_CANDIDATES:
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return candidate
+        from Utils.wine_runner import SystemWineRunner
+        binary = SystemWineRunner().find_wine_binary()
+        if binary is not None:
+            return binary
+
+    # Named CrossOver bottle: any CrossOver wine binary is a valid runner; the
+    # specific bottle is selected by the caller's WINEPREFIX.
+    return find_crossover_wine_binary()

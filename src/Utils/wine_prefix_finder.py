@@ -648,12 +648,57 @@ def build_prefix_env(
     prefix = prefix_info.prefix
 
     if prefix_info.launcher == LAUNCHER_STEAM:
-        # Steam compatdata: STEAM_COMPAT_DATA_PATH is the compatdata/<id>/ dir
+         # Steam compatdata: STEAM_COMPAT_DATA_PATH is the compatdata/<id>/ dir
         compat_data = prefix.parent if prefix.name in ("pfx", "prefix") else prefix
         env["STEAM_COMPAT_DATA_PATH"] = str(compat_data)
         env["WINEPREFIX"] = str(prefix)
     else:
-        # Non-Steam: WINEPREFIX is the prefix root
+         # Non-Steam: WINEPREFIX is the prefix root
         env["WINEPREFIX"] = str(prefix)
 
     return env
+
+
+# ---------------------------------------------------------------------------
+# Runner name → wine binary + prefix env (cross-platform, macOS-aware)
+# ---------------------------------------------------------------------------
+
+def resolve_wine_runner_env(
+    runner_name: str,
+    *,
+    prefix_path: "Path | None" = None,
+    base_env: "dict | None" = None,
+) -> "tuple[Path, dict] | tuple[None, None]":
+    """Resolve a *runner name* to ``(wine_binary, env)`` for any platform.
+
+    This is the macOS entry point that the Linux-only resolvers in
+    :mod:`Utils.exe_launch` / :mod:`Utils.protontricks` fall back to when
+    ``find_steam_root_for_proton_script`` returns ``None``. On Linux it is not
+    used (those resolvers already handle Proton directly), so this never
+    changes Linux behaviour.
+
+    *runner_name* is whatever :class:`WineStepWidget` hands the caller — a
+    CrossOver bottle name, ``"System Wine"``, or ``""``. *prefix_path* is the
+    prefix to run in (a CrossOver bottle root, an isolated/shared tool prefix,
+    or the game's own prefix); when given it goes into ``env['WINEPREFIX']``.
+
+    Returns ``(wine_binary, env)`` on success or ``(None, None)`` when no
+    wine binary can be found (i.e. neither CrossOver nor system Wine is
+    installed).
+    """
+    from Utils.crossover_finder import find_wine_binary_for_name
+
+    runner = find_wine_binary_for_name(runner_name)
+    if runner is None:
+        return None, None
+
+    env = {}
+    if prefix_path is not None:
+        env["WINEPREFIX"] = str(prefix_path)
+    if base_env:
+        # Let the caller's explicit env win over the runner's own, but always
+        # keep WINEPREFIX (the prefix is the whole point).
+        merged = dict(base_env)
+        merged.setdefault("WINEPREFIX", env.get("WINEPREFIX", ""))
+        env = merged
+    return runner, env
