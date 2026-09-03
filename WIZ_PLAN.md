@@ -4,6 +4,97 @@
 
 Make all wizard tool functionality work on macOS (CrossOver/Wine) alongside the existing Linux/Proton support.
 
+---
+
+## HANDOFF / Progress Log (updated 2026-08-30)
+
+> Read this first. Phases 1–3 are committed. Phase 4 is **partly done and
+> uncommitted** — the macOS resolver fallback is implemented but not tested or
+> committed.
+
+### What is committed (do not redo)
+
+| Phase | Deliverable | State |
+|---|---|---|
+| 0 | Core compat (config paths, xdg, steam_finder macOS path, sandbox no-ops, libloot rebuild) | ✅ committed |
+| 1 | `Utils/wine_runner.py` — `WineRunner` ABC + `ProtonRunner` / `CrossOverRunner` / `SystemWineRunner` / `LutrisRunner` / `HeroicRunner` + `get_runner()` / `get_default_runner_type()` + back-compat shims `wine_run_command` / `wine_reg_add`. Selftest `Utils/_wine_runner_selftest.py`. | ✅ committed |
+| 2 | `Utils/crossover_finder.py` (bottle + wine-binary discovery), `Utils/wine_prefix_finder.py` (unified `find_prefix_for_game` / `identify_prefix` / `PrefixInfo`). Selftests present. | ✅ committed |
+| 3 | `wizards_qt/wine_step.py` — `WineStepWidget` dual-mode UI (Proton on Linux, CrossOver bottle / system Wine on macOS). `proton_step.py` kept as fallback, **not** deleted. | ✅ committed |
+| 4 (part 1) | `Utils/proton_compat.py` routed through `get_runner()`; the two cross-platform helpers `crossover_finder.find_wine_binary_for_name(name, prefer_plain_wine=…)` and `wine_prefix_finder.resolve_wine_runner_env(runner_name, prefix_path, base_env, prefer_plain_wine=…)` were added (commit "Orphaned File Commits"). | ✅ committed |
+
+### What is UNCOMMITTED (the current work — verify before building on it)
+
+The macOS **resolver fallback**: on `darwin`, the prefix-env resolvers that
+previously returned `None` when no Proton could be found now fall back to a
+CrossOver bottle / system-Wine prefix. Mirrors the existing
+`proton_tools._resolve_lutris_wine_env` precedent. **Linux is a no-op** (the
+fallback is guarded by `sys.platform == "darwin"`), so Linux behaviour is
+unchanged. `git status` shows 4 modified files, ~129 insertions, all compile:
+
+- **`Utils/proton_tools.py`** — new `_resolve_macos_wine_env(prefix_path,
+   runner_name="", log_fn=_noop)`: no-op off darwin; on darwin calls
+   `resolve_wine_runner_env(..., prefer_plain_wine=True)` so the result is a raw
+   `wine`-named binary (never CrossOver's `cxexec`, which `proton_run_command`
+   would mis-build as `python3 cxexec …`). Wired into `resolve_proton_env`.
+- **`Utils/protontricks.py`** — `build_proton_env_for_game` calls
+   `_resolve_macos_wine_env` after its Lutris fallback.
+- **`Utils/exe_launch.py`** — macOS fallback in four spots: `get_tool_prefix_env`
+   (isolated tool prefix, builds `prefix_<runner>` next to the exe),
+   `get_game_prefix_env` (game prefix, 3-tuple), and `launch_exe_via_proton`
+   (both its isolated-override hole and its game-prefix cascade hole — the latter
+   routes through the existing `lutris_env_extra` "bare wine, no steam" env path).
+- **`Utils/wine_prefix_finder.py`** — `resolve_wine_runner_env` gained a
+   `prefer_plain_wine: bool = False` param, threaded into
+   `find_wine_binary_for_name`.
+
+**Why `prefer_plain_wine`:** `crossover_finder.find_crossover_wine_binary()`
+prefers `cxexec`, but `proton_run_command` only takes its bare-wine branch for a
+binary literally named `wine`/`wine64`. Every resolver returns its result into
+the `proton_script` slot that feeds `proton_run_command`, so the fallback must
+yield a `wine`-named binary, not `cxexec`.
+
+### What is still TODO (in priority order)
+
+1. **Extend the selftests** (not yet done). Add cases to
+   `Utils/_wine_prefix_finder_selftest.py`:
+   - `resolve_wine_runner_env(name, prefix_path, prefer_plain_wine=True)` returns
+     a `wine`-named binary when `find_wine_binary_for_name` yields one;
+   - `_resolve_macos_wine_env` returns `(None, None)` when the platform is not
+     darwin (mock `sys.platform`) and when no binary is found.
+   - Run all three selftests (`_wine_runner_selftest.py`,
+     `_crossover_finder_selftest.py`, `_wine_prefix_finder_selftest.py`) from
+     `src/` — must stay green. They run without a real CrossOver install.
+2. **macOS runtime verification** — the fallback is unverified end-to-end. With
+   CrossOver or Homebrew wine installed: open a migrated wizard (Pandora / xEdit
+   / DynDOLOD — the only 3 views on `WineStepWidget`), pick a bottle / "System
+   Wine", run, and confirm the tool launches via a `wine` binary with
+   `WINEPREFIX` set. Watch for: `resolve_compat_data(game_prefix)` must return the
+   CrossOver bottle *root* (not its parent) for the game-prefix resolvers, or
+   `WINEPREFIX` will point at the wrong prefix.
+3. **Commit** the 4 files when 1–2 pass.
+4. **Phase 5** — migrate the remaining ~45 wizard views off `proton_step.py`
+   onto `wine_step.py` (only `pandora_view`, `dyndolod_view`, `xedit_view`
+   done; they still say "ProtonStepWidget" in stale docstrings).
+5. **Phase 6** — settings UI launcher-type picker (Steam Proton / CrossOver /
+   Lutris / Heroic / System Wine) + default-prefix override. Not started.
+6. **Known gap:** `list_installed_proton()` is not macOS-aware, but this does
+   **not** block the fallback — `WineStepWidget` lists CrossOver bottles / system
+   Wine directly (`wizards_qt/wine_step.py`), and the resolvers use
+   `_resolve_macos_wine_env`. Only add macOS population to `list_installed_proton`
+   if a Linux-only caller starts showing an empty picker.
+
+### Quick reference for the next agent
+
+- The **integration point** is `proton_run_command` (in
+  `Utils/steam_finder.py`): it already runs a bare `wine` binary when the script
+  is named `wine`/`wine64`. The macOS fallback plugs into that — do **not** add a
+  `cxexec` branch there; yield a `wine` binary instead.
+- All macOS fallbacks funnel through `_resolve_macos_wine_env`
+  (`Utils/proton_tools.py`). Add new resolvers there too.
+- Run from `src/` so imports resolve: `../.venv/bin/python3 …`.
+
+---
+
 ## Current State
 
 The wizard system has **44 Qt views** in `wizards_qt/`, but nearly all depend on **Proton-specific infrastructure**:
@@ -23,7 +114,7 @@ Create a platform-agnostic "Wine Runner" layer so wizards can run on macOS (Cros
 
 ---
 
-## Phase 1: Create the Runner Abstraction
+## Phase 1: Create the Runner Abstraction  ✅ Done (committed)
 
 **New file: `src/Utils/wine_runner.py`**
 
@@ -70,7 +161,7 @@ def get_runner() -> WineRunner:
 
 ---
 
-## Phase 2: Prefix Discovery for macOS
+## Phase 2: Prefix Discovery for macOS  ✅ Done (committed)
 
 **New file: `src/Utils/crossover_finder.py`**
 
@@ -104,7 +195,7 @@ def find_wine_prefix(game_path: Path, launcher: str, ...) -> Path | None:
 
 ---
 
-## Phase 3: Replace ProtonStepWidget with Platform-Agnostic Version
+## Phase 3: Replace ProtonStepWidget with Platform-Agnostic Version  ⚠️ Widget done; 3 of ~48 views migrated
 
 **Modify/Rename: `wizards_qt/proton_step.py` -> `wizards_qt/wine_step.py`**
 
@@ -131,7 +222,7 @@ All existing wizard views that embed `ProtonStepWidget` get updated to import `W
 
 ---
 
-## Phase 4: Update Core Utility Functions
+## Phase 4: Update Core Utility Functions  ⚠️ In progress — part 1 + macOS resolver fallback UNCOMMITTED (see HANDOFF)
 
 **Strategy: Don't delete existing functions — wrap them through the abstraction.**
 
@@ -152,7 +243,7 @@ def proton_run_command(*args, **kwargs):
 
 ---
 
-## Phase 5: Update Individual Wizard Views
+## Phase 5: Update Individual Wizard Views  ❌ ~3 of 48 views done (pandora / dyndolod / xedit)
 
 ### Priority 1 — Already macOS-Compatible (no Proton dependency)
 
@@ -200,7 +291,7 @@ These depend on Linux-specific features or native binaries:
 
 ---
 
-## Phase 6: Settings & UI Configuration
+## Phase 6: Settings & UI Configuration  ❌ Not started
 
 Add to settings/preferences:
 
@@ -210,16 +301,18 @@ Add to settings/preferences:
 
 ---
 
-## Suggested Implementation Order
+## Phase Status (as of 2026-08-30 — see HANDOFF above for detail)
 
-| Week | Phase | Deliverable |
+| Phase | Deliverable | State |
 |---|---|---|
-| 1 | Phase 1 | `wine_runner.py` + `crossover_finder.py` |
-| 2 | Phase 3 | `WineStepWidget` replacing `ProtonStepWidget` |
-| 3 | Phase 4 | Wrap `proton_run_command` and friends through abstraction |
-| 4 | Phase 5 (P1) | Update download-only wizards (already mostly compatible) |
-| 5 | Phase 5 (P2) | Update Windows-tool wizards |
-| 6 | Phase 6 | Settings integration + testing |
+| 0 | Core compat | ✅ Committed |
+| 1 | `wine_runner.py` + `crossover_finder.py` discovery | ✅ Committed |
+| 2 | `crossover_finder.py` + `wine_prefix_finder.py` | ✅ Committed |
+| 3 | `WineStepWidget` (dual-mode) | ✅ Widget committed; ⚠️ 3/48 views migrated |
+| 4 part 1 | `proton_compat.py` routed through `get_runner()` | ✅ Committed |
+| 4 part 2 | **macOS resolver fallback** (`_resolve_macos_wine_env` + wiring) | ⚠️ **Done, UNCOMMITTED, unverified** |
+| 5 | Migrate remaining ~45 wizard views to `WineStepWidget` | ❌ Not started |
+| 6 | Settings launcher-type picker + prefix override | ❌ Not started |
 
 ---
 

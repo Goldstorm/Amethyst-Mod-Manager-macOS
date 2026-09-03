@@ -602,7 +602,7 @@ def find_tool_prefix(
     """
     if prefix_mode == "game":
         pfx = (game.get_prefix_path()
-               if hasattr(game, "get_prefix_path") else None)
+    if hasattr(game, "get_prefix_path") else None)
         return Path(pfx) if pfx else None
 
     try:

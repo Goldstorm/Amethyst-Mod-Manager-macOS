@@ -110,7 +110,7 @@ def install_dotnet_runtime(
         # the game as "Running" in Steam (the prefix already exists here).
         proton_run_command(proton_script, "runinprefix",
                            str(cache_path), "/quiet", "/norestart",
-                           env=env),
+    env=env),
         env, cache_path.parent,
         label=f".NET {version}", log_fn=log_fn,
         proton_script=proton_script, compat_data=compat_data,
@@ -355,7 +355,7 @@ def launch_wine_tool(game, tool: str, log_fn: LogFn = _noop) -> bool:
     log_fn(f"Proton Tools: launching {tool} …")
     try:
         subprocess.Popen(cmd, env=env,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return True
     except Exception as e:
         log_fn(f"Proton Tools error: {e}")
@@ -425,7 +425,7 @@ def launch_exe_in_prefix(game, exe_path, log_fn: LogFn = _noop) -> bool:
         subprocess.Popen(proton_run_command(proton_script, "run", str(exe_path),
                                             env=env),
                          env=env, cwd=exe_path.parent,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return True
     except Exception as e:
         log_fn(f"Proton Tools error: {e}")

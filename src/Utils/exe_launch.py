@@ -164,7 +164,7 @@ _PREFIX_DIR_NAMES = frozenset({"pfx", "drive_c"})
 
 def _walk_launchables(root: Path, seen: set, found: list,
                       skip_key: "str | None" = None,
-                      expand_links: bool = False) -> None:
+    expand_links: bool = False) -> None:
     """os.walk *root* for launchable files, pruning prefix dirs before descent.
 
     *expand_links* - STAGING roots only: a Profile Group's mods/ is a farm of
@@ -189,7 +189,7 @@ def _walk_one_launchable_root(root: Path, seen: set, found: list,
         # into them (rglob visited every Windows system exe first and only
         # filtered them out afterwards).
         dirnames[:] = [d for d in dirnames
-                       if d.lower() not in _PREFIX_DIR_NAMES]
+    if d.lower() not in _PREFIX_DIR_NAMES]
         for fname in filenames:
             if os.path.splitext(fname)[1].lower() not in STAGING_EXE_SUFFIXES:
                 continue
@@ -589,7 +589,7 @@ def split_preserving_backslash(s: str) -> list:
 
 
 def parse_launch_options(opts: str, command: list,
-                         split_fn=shlex.split) -> tuple[dict, list]:
+    split_fn=shlex.split) -> tuple[dict, list]:
     """Parse Steam-style launch options into (env_vars, final_command).
 
     Tokens matching KEY=VALUE are extracted as environment variables.
@@ -1062,7 +1062,7 @@ def game_is_faugus_install(game) -> bool:
 # ---------------------------------------------------------------------------
 
 def spawn_process_watched(cmd: list, *, env: "dict | None" = None,
-                          cwd=None, label: str, log_fn=_noop_log) -> None:
+    cwd=None, label: str, log_fn=_noop_log) -> None:
     """Popen *cmd* detached and watch its exit so failures aren't silent.
 
     The old ``Popen(..., stdout=DEVNULL, stderr=DEVNULL)`` pattern made a
@@ -1547,7 +1547,7 @@ def link_game_documents(game, pfx: Path, subpath, log_fn=_noop_log) -> None:
         return
     game_pfx = game.get_prefix_path() if hasattr(game, "get_prefix_path") else None
     src = (Path(game_pfx) / "pfx" / _DOCUMENTS_REL / sub
-           if game_pfx is not None else None)
+    if game_pfx is not None else None)
     try:
         dst.parent.mkdir(parents=True, exist_ok=True)
         if src is not None and src.is_dir():

@@ -38,7 +38,8 @@ def _find_game(games: dict, key: str):
     for name, game in games.items():
         if name.lower() == key_lower:
             return game
-        if by_game_id is None and getattr(game, "game_id", "").lower() == key_lower:
+        if by_game_id is None and getattr(
+                game, "game_id", "").lower() == key_lower:
             by_game_id = game
         if by_steam_id is None:
             sid = getattr(game, "steam_id", "")
@@ -89,14 +90,19 @@ def cmd_deploy(games: dict, key: str, profile: str):
         print(f"Error: game '{key}' not found.", file=sys.stderr)
         sys.exit(1)
     if not game.is_configured():
-        print(f"Error: game '{game.name}' is not configured (game path not set).", file=sys.stderr)
+        print(
+            f"Error: game '{
+                game.name}' is not configured (game path not set).",
+            file=sys.stderr)
         sys.exit(1)
 
     from Utils.deploy_pipeline import run_deploy_pipeline
 
     profile_dir = game.get_profile_root() / "profiles" / profile
     if not profile_dir.is_dir():
-        print(f"Error: profile '{profile}' does not exist at {profile_dir}", file=sys.stderr)
+        print(
+            f"Error: profile '{profile}' does not exist at {profile_dir}",
+            file=sys.stderr)
         sys.exit(1)
 
     success = run_deploy_pipeline(game, profile, log_fn=_log)
@@ -107,9 +113,9 @@ def cmd_deploy(games: dict, key: str, profile: str):
 
 
 def cmd_launch(games: dict, key: str, profile: "str | None" = None,
-               deploy: bool = True,
-               vanilla_command: "list[str] | None" = None,
-               sandbox_bridge: bool = False):
+    deploy: bool = True,
+    vanilla_command: "list[str] | None" = None,
+    sandbox_bridge: bool = False):
     """Launch through the deployed profile, or pass through vanilla unchanged.
 
     Intended for a launcher wrapper, so the game remains a child of Steam,
@@ -171,8 +177,10 @@ def cmd_launch(games: dict, key: str, profile: "str | None" = None,
         print(f"Error: game '{key}' not found.", file=sys.stderr)
         sys.exit(1)
     if not game.is_configured():
-        print(f"Error: game '{game.name}' is not configured (game path not set).",
-              file=sys.stderr)
+        print(
+            f"Error: game '{
+                game.name}' is not configured (game path not set).",
+            file=sys.stderr)
         sys.exit(1)
 
     # A launcher handoff is a permanent setting, while deployment is
@@ -257,7 +265,10 @@ def cmd_launch(games: dict, key: str, profile: "str | None" = None,
         vfs_builder = getattr(game, "get_vfs_passthrough_command", None)
         if not callable(vfs_builder):
             vfs_builder = getattr(game, "get_vfs_steam_command", None)
-        if getattr(game, "vfs_launch_enabled", False) and callable(vfs_builder):
+        if getattr(
+            game,
+            "vfs_launch_enabled",
+                False) and callable(vfs_builder):
             if not vanilla_command:
                 raise RuntimeError(
                     "The launcher's game command was not supplied after '--'. "
@@ -326,7 +337,10 @@ def cmd_restore(games: dict, key: str):
         print(f"Error: game '{key}' not found.", file=sys.stderr)
         sys.exit(1)
     if not game.is_configured():
-        print(f"Error: game '{game.name}' is not configured (game path not set).", file=sys.stderr)
+        print(
+            f"Error: game '{
+                game.name}' is not configured (game path not set).",
+            file=sys.stderr)
         sys.exit(1)
 
     from Utils.deploy import restore_root_folder_for_game
@@ -337,7 +351,8 @@ def cmd_restore(games: dict, key: str):
     last_deployed = game.get_last_deployed_profile()
     if last_deployed:
         game.set_active_profile_dir(profile_root / "profiles" / last_deployed)
-        # Reload so the last-deployed profile's path overrides drive the restore.
+        # Reload so the last-deployed profile's path overrides drive the
+        # restore.
         game.load_paths()
         game_root = game.get_game_path()
 
@@ -365,12 +380,17 @@ def main():
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    subparsers.add_parser("list-games", help="List all discovered games and whether they are configured")
+    subparsers.add_parser(
+        "list-games",
+        help="List all discovered games and whether they are configured")
 
-    lp = subparsers.add_parser("list-profiles", help="List profiles for a game")
+    lp = subparsers.add_parser(
+        "list-profiles",
+        help="List profiles for a game")
     lp.add_argument("game", help="game_id or display name (case-insensitive)")
 
-    dp = subparsers.add_parser("deploy", help="Build filemap and deploy mods for a profile")
+    dp = subparsers.add_parser(
+        "deploy", help="Build filemap and deploy mods for a profile")
     dp.add_argument("game", help="game_id or display name (case-insensitive)")
     dp.add_argument("profile", help="Profile name")
 
@@ -379,15 +399,20 @@ def main():
     gp.add_argument("game", help="game_id or display name (case-insensitive)")
     gp.add_argument("--profile", default=None,
                     help="Profile to deploy and launch (default: last active)")
-    gp.add_argument("--no-deploy", action="store_true",
-                    help="Launch the existing mod list without deploying first")
+    gp.add_argument(
+        "--no-deploy",
+        action="store_true",
+        help="Launch the existing mod list without deploying first")
     gp.add_argument(
         "--sandbox-bridge", action="store_true", help=argparse.SUPPRESS)
 
-    rp = subparsers.add_parser("restore", help="Restore the game directory (undo last deploy)")
+    rp = subparsers.add_parser(
+        "restore", help="Restore the game directory (undo last deploy)")
     rp.add_argument("game", help="game_id or display name (case-insensitive)")
 
-    subparsers.add_parser("clear-credentials", help="Remove stored Nexus Mods API key and OAuth tokens")
+    subparsers.add_parser(
+        "clear-credentials",
+        help="Remove stored Nexus Mods API key and OAuth tokens")
 
     # Launcher wrappers append the vanilla launch command after ``--`` (Steam
     # gets it from %command%; Heroic/Lutris/Faugus append it implicitly).

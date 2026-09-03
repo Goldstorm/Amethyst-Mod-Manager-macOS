@@ -156,7 +156,7 @@ def master_boundary(rows: list[PluginRow]) -> int:
 
 
 def master_flags_resolved(rows: list[PluginRow],
-                          resolved: dict[str, Path]) -> bool:
+    resolved: dict[str, Path]) -> bool:
     """Whether every row's master-ness is known from a real file on disk."""
     # _to_row falls back to extension-only detection for unresolved plugins, so
     # a master-flagged .esp would look normal and get demoted out of the master
@@ -172,7 +172,7 @@ def master_flags_resolved(rows: list[PluginRow],
 
 
 def enforce_master_block(rows: list[PluginRow]
-                         ) -> "tuple[list[PluginRow], bool]":
+    ) -> "tuple[list[PluginRow], bool]":
     """Stable-partition *rows* by rank -> (new_rows, changed); MO2 parity."""
     # Row objects are reused, never copied, so callers can remap selection by id.
     if not rows:

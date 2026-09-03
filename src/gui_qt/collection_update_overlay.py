@@ -32,9 +32,9 @@ class UpdateOverlay(OverlayBase):
     ESC_RESULT = False
 
     def __init__(self, host: QWidget, *, profile_name: str,
-                 from_rev, to_rev, to_remove: "list[str]",
-                 to_update: "list[str]", to_add: "list[str]",
-                 orphans: "list[str]", on_done):
+    from_rev, to_rev, to_remove: "list[str]",
+    to_update: "list[str]", to_add: "list[str]",
+    orphans: "list[str]", on_done):
         super().__init__(host, on_done=on_done)
         self._p = active_palette()
         self._profile_name = profile_name or ""
