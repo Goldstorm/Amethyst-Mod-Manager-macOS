@@ -1,12 +1,6 @@
-# Amethyst Mod Manager — CLAUDE.md
+git# Amethyst Mod Manager — CLAUDE.md
 
 Amethyst Mod Manager is a Python/PySide6 mod manager for Bethesda, Obsidian, and other games. Originally Linux-only, now being ported to macOS.
-
-## Current Focus: Wizard macOS Compatibility
-
-The active work on the `feature/macOS` branch is making the **Wizard tool functionality** compatible with macOS. See [WIZ_PLAN.md](./WIZ_PLAN.md) for the full plan.
-
-**Strategy:** Create a `WineRunner` abstraction layer (`src/Utils/wine_runner.py`) that lets wizards run Windows tools through either Proton (Linux) or CrossOver/system Wine (macOS) without conditional spaghetti throughout the views.
 
 ## Project Structure
 
@@ -46,9 +40,7 @@ cd src
 ```
 Produces `loot.cpython-3XX-*.so` in the project root. On macOS this produces `loot.cpython-313-darwin.so`.
 
-## macOS Port
-
-### Phase 0 — Core Compatibility (Complete)
+## macOS Port (Phase 0 — Complete)
 
 The following files were modified for macOS compatibility:
 
@@ -62,22 +54,6 @@ The following files were modified for macOS compatibility:
 | `Utils/flatpak_i386.py` | No-op on macOS |
 | `Utils/portal_filechooser.py` | Skip portal/zenity on macOS, use Qt file dialog directly |
 | `LOOT/rebuild_libloot.sh` | Platform-aware wheel pattern matching (`*macosx*.whl` vs `*linux*.whl`) |
-
-### Phase 1 — Wizard Compatibility (In Progress)
-
-Making the **Wizard tool system** macOS-compatible. Full plan in [WIZ_PLAN.md](./WIZ_PLAN.md).
-
-**Approach:** `WineRunner` abstraction in `src/Utils/wine_runner.py` decouples wizard views from Proton-specific code so they work on macOS via CrossOver or system Wine.
-
-**Key new files (to be created):**
-- `src/Utils/wine_runner.py` — Abstract runner interface + factory
-- `src/Utils/crossover_finder.py` — CrossOver bottle discovery
-- `src/Utils/wine_prefix_finder.py` — Unified prefix discovery
-
-**Key modified files (to be updated):**
-- `src/Utils/steam_finder.py` — Wrap `proton_run_command` through WineRunner
-- `src/wizards_qt/proton_step.py` → `wine_step.py` — Dual-mode UI (Proton/CrossOver)
-- `src/wizards_qt/*.py` — 44 wizard views, updated in priority order
 
 ## Game Handler Architecture
 

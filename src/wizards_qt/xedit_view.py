@@ -13,7 +13,7 @@ extracted under Profiles/<game>/Applications/<app_dir>/):
   2. Locate the archive in ~/Downloads (Try Again / Browse).
   3. Extract to Applications/<app_dir>/ and flatten wrapper dirs.
   4. Deploy the modlist (auto-starts through QtWizardContext.run_deploy).
-  5. Choose Proton version + prefix placement (shared ProtonStepWidget).
+  5. Choose runner version + prefix placement (shared WineStepWidget).
   6. Run <xEdit>.exe via Proton with -d:<game>/Data after prefix prep
      (registry seed, plugins.txt + My Games links, viewsettings seed, WinXP
      compat flag).  When the tool exits: wineserver shutdown → finalize

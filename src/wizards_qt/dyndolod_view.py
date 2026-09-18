@@ -10,7 +10,7 @@ already extracted under Profiles/<game>/Applications/<app_dir>/):
      (xLODGen) auto-download from GitHub with progress → extract.
   2. Deploy the modlist (explicit Deploy button after the delete-previous-
      output reminder, through QtWizardContext.run_deploy).
-  3. Choose Proton version + prefix placement (shared ProtonStepWidget).
+  3. Choose runner version + prefix placement (shared WineStepWidget).
   4. Run the tool via Proton with ``-d:<game>/Data -o:<staging>/<Tool>_Output
      -sse`` after prefix prep (registry seed, plugins.txt + My Games links).
      Done enables once it has launched; the wizard closes and refreshes the

@@ -8,7 +8,7 @@ Steps (plugins-panel-scoped tab):
   1. Deploy the modlist (through the app's deploy machinery via
      QtWizardContext.run_deploy, so the deploy mutex + progress popup apply).
      The user is reminded to delete any previous 'Pandora_output' mod first.
-  2. Choose Proton version + prefix placement (shared ProtonStepWidget).
+  2. Choose runner version + prefix placement (shared WineStepWidget).
   3. Silently install the .NET 10 desktop runtime into that prefix
      (skipped when already marked installed).
   4. Run Pandora via Proton with --tesv:<game_path>; Done enables once it
