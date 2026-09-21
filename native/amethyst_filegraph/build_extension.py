@@ -25,10 +25,17 @@ def main() -> int:
          "--release", "--locked"],
         check=True,
         env=environment,
+        cwd=str(crate),
     )
-    source = target / "release" / "libamethyst_filegraph.so"
-    if not source.is_file():
-        raise SystemExit(f"cargo did not produce {source}")
+    # cargo names the cdylib by platform: .dylib on macOS, .so elsewhere. The
+    # Python loader expects a fixed name (amethyst_filegraph.abi3.so), so copy
+    # whichever artifact this host produced onto that name.
+    candidates = [target / "release" / "libamethyst_filegraph.dylib",
+                  target / "release" / "libamethyst_filegraph.so"]
+    source = next((path for path in candidates if path.is_file()), None)
+    if source is None:
+        missing = target / "release"
+        raise SystemExit(f"cargo did not produce a release artifact under {missing}")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source, output_path)
     print(f"Installed {output_path}")

@@ -5,7 +5,12 @@ Amethyst Mod Manager is a Python/PySide6 mod manager for Bethesda, Obsidian, and
 ## Project Structure
 
 - **`src/`** — Main source root (run from here so packages import cleanly)
-  - `src/Utils/` — Core logic: deployment, filemap, config paths, game helpers
+  - `src/Utils/` — Core logic, now split into subpackages after the main refactor
+     (`launchers/`, `wine/`, `environment/`, `executables/`, `bethesda/`,
+     `deployment/`, `filegraph/`, `games/`, …). Top-level helpers include
+     `config_paths.py`; macOS CrossOver/system-Wine support lives in
+     `proton_compat.py`, `wine_runner.py`, `crossover_finder.py`,
+     `wine_prefix_finder.py`.
   - `src/Games/` — Game handlers (one per game/game family, auto-discovered)
   - `src/gui_qt/` — PySide6 Qt GUI (main window, modlist, plugins, dialogs)
   - `src/LOOT/` — LOOT sorting integration (calls libloot Python extension)
@@ -42,24 +47,25 @@ Produces `loot.cpython-3XX-*.so` in the project root. On macOS this produces `lo
 
 ## macOS Port (Phase 0 — Complete)
 
-The following files were modified for macOS compatibility:
+The following files were modified for macOS compatibility (paths reflect the
+post-refactor `src/Utils/` subpackage layout):
 
 | File | Change |
 |------|--------|
 | `Utils/config_paths.py` | macOS config in `~/Library/Application Support/AmethystModManager/` |
-| `Utils/xdg.py` | Use `open` instead of `xdg-open` on macOS; macOS downloads dir |
-| `Utils/steam_finder.py` | Added macOS Steam path (`~/Library/Application Support/Steam/`) |
-| `Utils/sandbox_paths.py` | No-op on macOS (no Flatpak) |
-| `Utils/flatpak_sandbox.py` | No-op on macOS |
-| `Utils/flatpak_i386.py` | No-op on macOS |
-| `Utils/portal_filechooser.py` | Skip portal/zenity on macOS, use Qt file dialog directly |
+| `Utils/environment/xdg.py` | Use `open` instead of `xdg-open` on macOS; macOS downloads dir |
+| `Utils/launchers/steam.py` | Added macOS Steam path (`~/Library/Application Support/Steam/`) |
+| `Utils/environment/sandbox.py` | No-op on macOS (no Flatpak) |
+| `Utils/flatpak/sandbox.py` | No-op on macOS |
+| `Utils/flatpak/i386.py` | No-op on macOS |
+| `Utils/ui/portal.py` | Skip portal/zenity on macOS, use Qt file dialog directly |
 | `LOOT/rebuild_libloot.sh` | Platform-aware wheel pattern matching (`*macosx*.whl` vs `*linux*.whl`) |
 
 ## Game Handler Architecture
 
 - `Games/base_game.py` — Abstract `BaseGame` class
 - Each game/family in `Games/<name>/` with a `.py` file subclassing `BaseGame`
-- Auto-discovered by `Utils/game_loader.py`
+- Auto-discovered by `Utils/games/discovery.py`
 - LOOT integration via `loot_sort_enabled`, `loot_game_type`, `loot_masterlist_repo` properties
 
 ## LOOT Integration
@@ -71,7 +77,7 @@ The following files were modified for macOS compatibility:
 ## Deployment
 
 - Hardlink/symlink/copy modes (hardlink default, auto-fallback on EXDEV)
-- Filemap tracks deployed files for clean restore
+- Filegraph (`Utils/filegraph/`, the `amethyst_filegraph` Rust extension) tracks deployed files for clean restore
 - Same-filesystem requirement for hardlinks (works on APFS)
 
 ## Config & Data Paths
