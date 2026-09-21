@@ -13,7 +13,7 @@ extracted under Profiles/<game>/Applications/<app_dir>/):
   2. Locate the archive in ~/Downloads (Try Again / Browse).
   3. Extract to Applications/<app_dir>/ and flatten wrapper dirs.
   4. Deploy the modlist (auto-starts through QtWizardContext.run_deploy).
-  5. Choose runner version + prefix placement (shared WineStepWidget).
+  5. Choose Proton version + prefix placement (shared ProtonStepWidget).
   6. Run <xEdit>.exe via Proton with -d:<game>/Data after prefix prep
      (registry seed, plugins.txt + My Games links, viewsettings seed, WinXP
      compat flag).  When the tool exits: wineserver shutdown → finalize
@@ -38,9 +38,11 @@ from PySide6.QtWidgets import (
     QStackedWidget,
 )
 
-from gui_qt.theme_qt import active_palette, _c, button_qss, ok_text, err_text
+from gui_qt.theme_qt import (
+    active_palette, _c, button_qss, close_button, ok_text, err_text,
+)
 from gui_qt.safe_emit import safe_emit
-from Utils.xedit_tools import tool_exe_path
+from Utils.bethesda.xedit import tool_exe_path
 
 if TYPE_CHECKING:
     from Games.base_game import BaseGame
@@ -90,6 +92,8 @@ class XEditView(QWidget):
         # Resolve per-game config from kwargs, falling back to SSEEdit
         # defaults (mirrors the Tk wizard's __init__).
         base_exe = xedit_exe or _EXE_NAME
+        self._exe_64bit_name = Path(base_exe).stem + "64.exe"
+        self._use_64bit = False
         # The Discord build has no separate QuickAutoClean exe - QAC
         # is the same launcher with a ``-quickautoclean`` command-line arg (added
         # in _start_run).  The Nexus builds ship a distinct <build>QuickAutoClean.exe.
@@ -162,10 +166,7 @@ class XEditView(QWidget):
         title.setStyleSheet(f"color:{_c(p,'TEXT_MAIN')}; font-weight:600;")
         hb.addWidget(title)
         hb.addStretch(1)
-        close = QPushButton(self.tr("✕ Close"))
-        close.setCursor(Qt.PointingHandCursor)
-        close.setStyleSheet(
-            button_qss("BTN_DANGER", padding="5px 12px"))
+        close = close_button(self.tr("✕ Close"), pal=p)
         close.clicked.connect(self._finish)
         self._close_btn = close
         hb.addWidget(close)
@@ -274,7 +275,7 @@ class XEditView(QWidget):
         return page
 
     def _open_download_page(self):
-        from Utils.xdg import open_url
+        from Utils.environment.xdg import open_url
         open_url(self._nexus_url)
 
     # ---- hands-free archive fetch (premium download / folder watch) --------------
@@ -345,7 +346,7 @@ class XEditView(QWidget):
         return page
 
     def _scan_downloads(self):
-        from Utils.wizard_archives import find_archive, get_downloads_dir
+        from Utils.wizards.archives import find_archive, get_downloads_dir
         found = find_archive(get_downloads_dir(), [self._archive_keyword])
         if found:
             self._archive_path = found
@@ -364,7 +365,7 @@ class XEditView(QWidget):
                 err_text())
 
     def _browse_archive(self):
-        from Utils.portal_filechooser import pick_file
+        from Utils.ui.portal import pick_file
         # Portal callback fires on a WORKER thread - marshal via Signal.
         pick_file(self.tr("Select the {0} archive").format(self._xedit_name),
                   lambda *a: safe_emit(self._picked_sig, *a))
@@ -391,8 +392,8 @@ class XEditView(QWidget):
         exe_name, app_dir = self._exe_name, self._app_dir
 
         def worker():
-            from Utils.wizard_archives import extract_archive
-            from Utils.xedit_tools import applications_dir, flatten_subdirs
+            from Utils.wizards.archives import extract_archive
+            from Utils.bethesda.xedit import applications_dir, flatten_subdirs
             try:
                 if archive is None or not archive.is_file():
                     raise RuntimeError(self.tr("Archive not found."))
@@ -490,16 +491,25 @@ class XEditView(QWidget):
             err.setStyleSheet(f"color:{err_text()};")
             lay.addWidget(err)
             return
-        from wizards_qt.wine_step import WineStepWidget
-        lay.addWidget(WineStepWidget(
+        from wizards_qt.proton_step import ProtonStepWidget
+        self._proton_step = ProtonStepWidget(
             self._game, self._exe, self._exe_name, self._name,
             on_continue=self._on_proton_chosen,
             log_fn=self._log,
             title=self.tr("Step 5: Choose Proton Version"),
             show_launch_args=True,
-        ))
+            exe_64bit=(self._exe.parent / "Optional" / self._exe_64bit_name
+                       if not self._discord else None),
+            wizard_id=getattr(self._ctx, "wizard_tool_id", ""),
+            wizard_label=getattr(self._ctx, "wizard_tool_label", ""),
+            wizard_label_args=getattr(
+                self._ctx, "wizard_tool_label_args", ()),
+        )
+        lay.addWidget(self._proton_step)
 
     def _on_proton_chosen(self, proton_name: str, prefix_mode: str):
+        self._exe = self._proton_step.selected_exe()
+        self._use_64bit = not self._discord and self._exe.name == self._exe_64bit_name
         self._proton_name = proton_name
         self._prefix_mode = prefix_mode
         self._goto_step(_PG_RUN)
@@ -531,7 +541,7 @@ class XEditView(QWidget):
     def _build_dirty_plugins_panel(self):
         """QAC only: list the LOOT-flagged dirty plugins above the run status
         so the user can see what needs cleaning without closing the wizard."""
-        from Utils.xedit_tools import collect_dirty_plugins
+        from Utils.bethesda.xedit import collect_dirty_plugins
         dirty = collect_dirty_plugins(self._game)
         if not dirty or self._dirty_box_added:
             return
@@ -585,12 +595,12 @@ class XEditView(QWidget):
         proton_name, prefix_mode = self._proton_name, self._prefix_mode
 
         def worker():
-            from Utils.exe_launch import (
+            from Utils.executables.launch import (
                 PREFIX_MODE_GAME, load_tool_launch_args, parse_launch_args,
                 resolve_tool_prefix, run_tool_logged, shutdown_prefix_wineserver,
             )
-            from Utils.wine_paths import to_wine_path
-            from Utils.xedit_tools import (
+            from Utils.wine.paths import to_wine_path
+            from Utils.bethesda.xedit import (
                 begin_xedit_vfs_session, finalize_xedit_saves,
                 persist_xedit_vfs_changes, prepare_xedit_prefix,
                 restore_after_xedit,
@@ -623,9 +633,10 @@ class XEditView(QWidget):
                 pfx = compat_data / "pfx"
                 data_arg = f'-d:{to_wine_path(game_path / "Data", pfx)}'
                 extra_args = [data_arg]
-                # The Discord build's QuickAutoClean is the same launcher with a
-                # -quickautoclean switch (the Nexus builds ship a separate exe).
-                if self._qac and self._discord:
+                if self._use_64bit:
+                    scripts = to_wine_path(exe.parent.parent / "Edit Scripts", pfx)
+                    extra_args.append(f'-s:{scripts}\\')
+                if self._qac and (self._discord or self._use_64bit):
                     extra_args.insert(0, "-quickautoclean")
                 # The multi-game Discord launcher needs a game-mode arg (e.g.
                 # -SSE / -FO4 / -SF1) to pick the game - it errors out without it.
@@ -637,7 +648,7 @@ class XEditView(QWidget):
                     extra_args.extend(user_args)
 
                 # Registry seed + plugins.txt / My Games links + viewsettings
-                # seed + WinXP compat flag (see Utils.xedit_tools).
+                # seed + WinXP compat flag (see Utils.bethesda.xedit).
                 #
                 # The viewsettings filename xEdit reads is keyed to the GAME
                 # mode, not the launcher exe.  The Nexus builds are per-game so
@@ -663,7 +674,8 @@ class XEditView(QWidget):
                           f"{' '.join(extra_args)}")
                 safe_emit(self._run_started_sig)
                 run_tool_logged(proton_script, exe, env, log_fn=_wlog,
-                                extra_args=extra_args, label=name, game=game)
+                                extra_args=extra_args, label=name, game=game,
+                                owner=self)
 
                 shutdown_prefix_wineserver(proton_script, compat_data,
                                            log_fn=_wlog)
@@ -738,7 +750,7 @@ class XEditView(QWidget):
         """QAC run page: let the user launch the tool interactively (pick a
         plugin each time) or clean every dirty plugin in one pass. Nothing
         launches until they choose."""
-        from Utils.xedit_tools import collect_dirty_plugins
+        from Utils.bethesda.xedit import collect_dirty_plugins
         dirty = collect_dirty_plugins(self._game)
         n = len(dirty)
         if n:
@@ -774,7 +786,7 @@ class XEditView(QWidget):
             self._set_status(self._run_status,
                              self.tr("{0} was not found.").format(self._exe_name), err_text())
             return
-        from Utils.xedit_tools import collect_dirty_plugins
+        from Utils.bethesda.xedit import collect_dirty_plugins
         plugins = [name for name, _ in collect_dirty_plugins(game)]
         if not plugins:
             self._set_status(self._run_status,
@@ -793,12 +805,12 @@ class XEditView(QWidget):
         proton_name, prefix_mode = self._proton_name, self._prefix_mode
 
         def worker():
-            from Utils.exe_launch import (
+            from Utils.executables.launch import (
                 PREFIX_MODE_GAME, resolve_tool_prefix, run_tool_logged,
                 shutdown_prefix_wineserver,
             )
-            from Utils.wine_paths import to_wine_path
-            from Utils.xedit_tools import (
+            from Utils.wine.paths import to_wine_path
+            from Utils.bethesda.xedit import (
                 begin_xedit_vfs_session, finalize_xedit_saves,
                 persist_xedit_vfs_changes, prepare_xedit_prefix,
                 restore_after_xedit,
@@ -837,9 +849,10 @@ class XEditView(QWidget):
                 # the plugin filename (positional) is the one to clean. The QAC
                 # exe already forces IKnowWhatImDoing + autosave, so no prompt.
                 base_args = [data_arg, "-autoload", "-autoexit"]
-                # The Discord build's QuickAutoClean is the same launcher with a
-                # -quickautoclean switch (the Nexus builds ship a separate exe).
-                if self._qac and self._discord:
+                if self._use_64bit:
+                    scripts = to_wine_path(exe.parent.parent / "Edit Scripts", pfx)
+                    base_args.append(f'-s:{scripts}\\')
+                if self._qac and (self._discord or self._use_64bit):
                     base_args.insert(0, "-quickautoclean")
                 # The multi-game Discord launcher needs a game-mode arg to pick
                 # the game (e.g. -SSE / -FO4 / -SF1) or it errors out.
@@ -869,7 +882,8 @@ class XEditView(QWidget):
                               f"({i}/{total})")
                     run_tool_logged(proton_script, exe, env, log_fn=_wlog,
                                     extra_args=base_args + [plugin],
-                                    label=f"{name} [{plugin}]", game=game)
+                                    label=f"{name} [{plugin}]", game=game,
+                                    owner=self)
                     # Finalise this plugin's <name>.save.<ts> temp before the
                     # next launch reloads Data/ (QAC queues the rename to run on
                     # shutdown, but we relaunch into the same prefix).

@@ -14,8 +14,8 @@ import stat
 
 from Games.base_game import BaseGame, WizardTool
 from Utils.vfs import ProfileVFSGameMixin
-from Utils.deploy import LinkMode, deploy_core, deploy_custom_rules, deploy_filemap, load_per_mod_strip_prefixes, load_separator_deploy_paths, expand_separator_deploy_paths, expand_separator_link_modes, expand_separator_raw_deploy, cleanup_custom_deploy_dirs, move_to_core, restore_custom_rules, restore_data_core
-from Utils.modlist import read_modlist
+from Utils.deployment import LinkMode, deploy_core, deploy_custom_rules, deploy_filemap, load_per_mod_strip_prefixes, load_separator_deploy_paths, expand_separator_deploy_paths, expand_separator_link_modes, expand_separator_raw_deploy, cleanup_custom_deploy_dirs, move_to_core, restore_custom_rules, restore_data_core
+from Utils.mods.modlist import read_modlist
 from Utils.config_paths import get_profiles_dir
 
 _PROFILES_DIR = get_profiles_dir()
@@ -145,7 +145,7 @@ class Subnautica(ProfileVFSGameMixin, BaseGame):
 
     def _vfs_native_game_exe(self) -> Path | None:
         """The selected native game executable, or ``None`` for Wine builds."""
-        from Utils.exe_launch import resolve_game_exe
+        from Utils.executables.launch import resolve_game_exe
 
         resolved = resolve_game_exe(self)
         if (resolved is not None
@@ -163,7 +163,7 @@ class Subnautica(ProfileVFSGameMixin, BaseGame):
         game_root = self.get_game_path()
         if game_root is None:
             return None
-        from Utils.deploy import _resolve_nocase
+        from Utils.deployment import _resolve_nocase
         for name in getattr(self, "exe_name_alts", None) or ():
             if Path(name).suffix.lower() in (".exe", ".bat"):
                 continue
@@ -323,9 +323,9 @@ class Subnautica(ProfileVFSGameMixin, BaseGame):
 
     @property
     def custom_routing_rules(self) -> list:
-        from Utils.deploy import CustomRule
+        from Utils.deployment import CustomRule
         return [
-            CustomRule(dest="", filenames=[
+            CustomRule(rule_id='bepinex:c5ac3c0461d4', dest="", filenames=[
                 "winhttp.dll",
                 "version.dll",
                 "run_bepinex.sh",
@@ -338,20 +338,20 @@ class Subnautica(ProfileVFSGameMixin, BaseGame):
                 "start_game_bepinex.sh",
                 "start_server_bepinex.sh",
             ], flatten=True, loose_only=True),
-            CustomRule(dest="BepInEx", folders=[
+            CustomRule(rule_id='bepinex:56637062ff68', dest="BepInEx", folders=[
                 "config",
                 "core",
                 "patchers",
                 "plugins",
                 "monomod",
             ], flatten=True, loose_only=True),
-            CustomRule(dest="BepInEx/monomod", extensions=[
+            CustomRule(rule_id='bepinex:b880f96be52b', dest="BepInEx/monomod", extensions=[
                 ".mm.dll"
             ], loose_only=True),
-            CustomRule(dest="BepInEx/plugins", folders=[
+            CustomRule(rule_id='bepinex:be0dbc271ad4', dest="BepInEx/plugins", folders=[
                 "Tobey"
             ], flatten=True, loose_only=True),
-            CustomRule(dest="", folders=[
+            CustomRule(rule_id='bepinex:0dd73f0a55b1', dest="", folders=[
                 "qmods",
                 "doorstop_libs",
                 "dotnet",
@@ -434,7 +434,8 @@ class Subnautica(ProfileVFSGameMixin, BaseGame):
         staging     = self.get_effective_mod_staging_path()
         core        = self.mods_dir + "_Core"
 
-        if not filemap.is_file():
+        from Utils.filegraph.deploy import input_ready
+        if not input_ready():
             raise RuntimeError(
                 f"filemap.txt not found: {filemap}\n"
                 "Run 'Build Filemap' before deploying."
@@ -468,7 +469,7 @@ class Subnautica(ProfileVFSGameMixin, BaseGame):
         per_mod_modes = expand_separator_link_modes(_sep_deploy, _sep_entries) or None
         per_mod_raw = expand_separator_raw_deploy(_sep_deploy, _sep_entries) or None
 
-        custom_rules = self.custom_routing_rules
+        custom_rules = self.effective_custom_routing_rules
         custom_exclude: set[str] = set()
         if custom_rules:
             _log("Step 2a: Routing BepInEx root files via custom rules ...")
@@ -482,6 +483,7 @@ class Subnautica(ProfileVFSGameMixin, BaseGame):
                 log_fn=_log,
                 progress_fn=progress_fn,
                 raw_mods=per_mod_raw,
+                prefix_root=self.get_prefix_path(),
             )
 
         _log(f"Step 2: Transferring mod files into {plugins_dir} ({mode.name}) ...")
@@ -524,16 +526,16 @@ class Subnautica(ProfileVFSGameMixin, BaseGame):
         
         _profile_dir = self._active_profile_dir
         _entries = read_modlist(_profile_dir / "modlist.txt") if _profile_dir else []
-        cleanup_custom_deploy_dirs(_profile_dir, _entries, log_fn=_log)
+        cleanup_custom_deploy_dirs(_profile_dir, _entries, log_fn=_log, game=self)
 
-        custom_rules = self.custom_routing_rules
-        if custom_rules and self._game_path:
+        if self._game_path:
             _log("Restore: removing custom-routed BepInEx root files ...")
             restore_custom_rules(
                 self.get_effective_filemap_path(),
                 self._game_path,
-                rules=custom_rules,
+                rules=[],
                 log_fn=_log,
+                prefix_root=self.get_prefix_path(),
             )
 
         # Restore must follow what is actually deployed, not the current
@@ -549,7 +551,10 @@ class Subnautica(ProfileVFSGameMixin, BaseGame):
 
         if core_dir.is_dir():
             _log(f"Restore: clearing {plugins_dir.name}/ and moving {core}/ back ...")
-            restored = restore_data_core(plugins_dir, core_dir=core_dir, overwrite_dir=self.get_effective_overwrite_path(), log_fn=_log)
+            restored = restore_data_core(
+                plugins_dir, core_dir=core_dir,
+                overwrite_dir=self.get_effective_overwrite_path(),
+                log_fn=_log, game=self, profile_dir=self._active_profile_dir)
             _log(f"  Restored {restored} file(s). {core}/ removed.")
 
         # Sweep runtime files generated outside plugins/ (BepInEx/config, caches,

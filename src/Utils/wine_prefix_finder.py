@@ -221,7 +221,7 @@ def _find_steam_prefix(
 ) -> PrefixInfo | None:
     """Find prefix via Steam compatdata."""
     try:
-        from Utils.steam_finder import (
+        from Utils.launchers.steam import (
             find_prefix as _find_steam_prefix,
             find_proton_for_game,
         )
@@ -252,7 +252,7 @@ def _find_steam_prefix(
 def _find_lutris_prefix(exe_names: list[str]) -> PrefixInfo | None:
     """Find prefix via Lutris game matching."""
     try:
-        from Utils.lutris_finder import find_lutris_game_info_by_exe
+        from Utils.launchers.lutris import find_lutris_game_info_by_exe
 
         for exe in exe_names:
             if not exe:
@@ -278,7 +278,7 @@ def _find_lutris_prefix(exe_names: list[str]) -> PrefixInfo | None:
 def _find_heroic_prefix(app_names: list[str]) -> PrefixInfo | None:
     """Find prefix via Heroic Games Launcher."""
     try:
-        from Utils.heroic_finder import (
+        from Utils.launchers.heroic import (
             find_heroic_prefix,
             find_heroic_proton_for_prefix,
         )
@@ -308,7 +308,7 @@ def _find_heroic_prefix(app_names: list[str]) -> PrefixInfo | None:
 def _find_faugus_prefix(exe_names: list[str]) -> PrefixInfo | None:
     """Find prefix via Faugus Launcher."""
     try:
-        from Utils.faugus_finder import find_faugus_game_info_by_exe
+        from Utils.launchers.faugus import find_faugus_game_info_by_exe
 
         for exe in exe_names:
             if not exe:
@@ -333,7 +333,7 @@ def _find_faugus_prefix(exe_names: list[str]) -> PrefixInfo | None:
 def _find_shortcut_prefix(exe_names: list[str]) -> PrefixInfo | None:
     """Find prefix via Steam non-Steam shortcuts."""
     try:
-        from Utils.steam_shortcuts import find_shortcut_game_info_by_exe
+        from Utils.launchers.steam_shortcuts import find_shortcut_game_info_by_exe
 
         for exe in exe_names:
             if not exe:
@@ -487,7 +487,7 @@ def identify_prefix(prefix_path: str | Path) -> PrefixInfo | None:
 
     # Heroic: check if path is under a known Heroic prefix dir
     try:
-        from Utils.heroic_finder import find_heroic_prefix
+        from Utils.launchers.heroic import find_heroic_prefix
         # Heroic prefixes are usually under ~/Games/Heroic/Prefixes/
         # or a custom defaultWinePrefix
     except Exception:
@@ -495,7 +495,7 @@ def identify_prefix(prefix_path: str | Path) -> PrefixInfo | None:
 
     # Faugus
     try:
-        from Utils.faugus_finder import is_faugus_prefix
+        from Utils.launchers.faugus import is_faugus_prefix
         if is_faugus_prefix(p):
             return PrefixInfo(
                 prefix=p,
@@ -507,7 +507,7 @@ def identify_prefix(prefix_path: str | Path) -> PrefixInfo | None:
 
     # Lutris fallback (no lutris.json but proper prefix layout)
     try:
-        from Utils.lutris_finder import is_lutris_prefix
+        from Utils.launchers.lutris import is_lutris_prefix
         if is_lutris_prefix(p):
             return PrefixInfo(
                 prefix=p,
@@ -588,7 +588,7 @@ def find_tool_prefix(
 ) -> Path | None:
     """Find the prefix for a wizard tool based on the selected prefix mode.
 
-    Mirrors the logic in Utils.exe_launch but returns Path | None without
+    Mirrors the logic in Utils.executables.launch but returns Path | None without
     mutating anything. Used by WineStepWidget to show prefix status.
 
     Args:
@@ -606,7 +606,7 @@ def find_tool_prefix(
         return Path(pfx) if pfx else None
 
     try:
-        from Utils.exe_launch import (
+        from Utils.executables.launch import (
             PREFIX_MODE_SHARED, PREFIX_MODE_ISOLATED,
             shared_prefix_dir,
         )
@@ -618,7 +618,7 @@ def find_tool_prefix(
 
     # Isolated: prefix_<runner_name>/ next to the tool exe
     try:
-        from Utils.xedit_tools import tool_exe_path
+        from Utils.bethesda.xedit import tool_exe_path
         exe = tool_exe_path(game, tool_exe_name, "")
         return exe.parent / f"prefix_{runner_name}"
     except Exception:
@@ -672,7 +672,7 @@ def resolve_wine_runner_env(
     """Resolve a *runner name* to ``(wine_binary, env)`` for any platform.
 
     This is the macOS entry point that the Linux-only resolvers in
-    :mod:`Utils.exe_launch` / :mod:`Utils.protontricks` fall back to when
+    :mod:`Utils.executables.launch` / :mod:`Utils.wine.protontricks` fall back to when
     ``find_steam_root_for_proton_script`` returns ``None``. On Linux it is not
     used (those resolvers already handle Proton directly), so this never
     changes Linux behaviour.

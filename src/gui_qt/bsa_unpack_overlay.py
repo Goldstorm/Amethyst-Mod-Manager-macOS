@@ -6,7 +6,7 @@ selected mod together with every sibling archive (``Foo.bsa``, ``Foo - Main.ba2`
 that whole group in one go. Archives with no matching plugin get a trailing
 "(no matching plugin)" group.
 
-Grouping/size/count come from ``Utils.bsa_pack_ops.collect_unpack_groups`` (shared
+Grouping/size/count come from ``Utils.bsa.pack.collect_unpack_groups`` (shared
 with Tk). ``on_done(list[Path])`` is called with the chosen group's archives; the
 overlay closes itself. Dimmed child overlay via gui_qt/overlay_base.py with a
 scroll body (like ``download_locations_overlay.py``).
@@ -21,9 +21,9 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame, QScrollArea,
 )
 
-import Utils.bsa_pack_ops as ops
+import Utils.bsa.pack as ops
 from gui_qt.overlay_base import OverlayBase
-from gui_qt.theme_qt import active_palette, _c
+from gui_qt.theme_qt import active_palette, close_button, _c
 
 
 class BsaUnpackOverlay(OverlayBase):
@@ -79,9 +79,7 @@ class BsaUnpackOverlay(OverlayBase):
 
         bar = QHBoxLayout()
         bar.addStretch(1)
-        close = QPushButton(self.tr("Close"))
-        close.setObjectName("FormButton")
-        close.setCursor(Qt.PointingHandCursor)
+        close = close_button(self.tr("Close"), pal=p)
         close.clicked.connect(lambda: self._finish(None))
         bar.addWidget(close)
         v.addLayout(bar)

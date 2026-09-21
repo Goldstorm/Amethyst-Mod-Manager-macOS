@@ -1,5 +1,5 @@
 """Qt Text Files tab - lists config/text files from mods, profile, game folder and
-My Games, grouped by source. Reuses Utils.text_files for discovery + content
+My Games, grouped by source. Reuses Utils.text.files for discovery + content
 search. Built lazily (only scans when the sub-tab is shown - the recursive game /
 My-Games scans are expensive). Clicking a file opens the scoped text editor.
 """
@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QTreeView, QAbstractItemView,
 )
 
-import Utils.text_files as tf
+import Utils.text.files as tf
 from gui_qt.safe_emit import safe_emit
 from gui_qt.text_files_model import (
     TextFilesModel, _TextNode, COL_NAME, COL_SOURCE,
@@ -23,6 +23,8 @@ from gui_qt.text_files_model import (
 
 class TextFilesView(QWidget):
     """The Text Files tab. configure() once, then mark_dirty()/refresh()."""
+
+    _EXTERNAL_CACHE_SECONDS = 30
 
     filetypes_changed = Signal()
     content_status_changed = Signal(object)   # current content keyword | None
@@ -33,10 +35,10 @@ class TextFilesView(QWidget):
         super().__init__(parent)
         self.game = None
         self.profile_dir: Path | None = None
-        self.filemap_path: Path | None = None
-        self.staging_root: Path | None = None
+        self._snapshot = None
         self.on_open_file = None        # callback(full_path, rel_path)
         self._dirty = True
+        self._refresh_external = True
         self._is_visible = False
         self._scan_gen = 0              # bumped per scan → drops stale results
         self._scanning = False
@@ -60,24 +62,33 @@ class TextFilesView(QWidget):
             self._loading_overlay.hide_overlay()
 
     # -- context ------------------------------------------------------------
-    def configure(self, game, profile_dir, filemap_path, staging_root):
+    def configure(self, game, profile_dir):
         self.game = game
         self.profile_dir = profile_dir
-        self.filemap_path = filemap_path
-        self.staging_root = staging_root
+        self._snapshot = None
         self._dirty = True
+        self._refresh_external = True
         # A profile/game switch invalidates any active content search.
         self._content_matches = None
         self._content_keyword = None
         self.content_status_changed.emit(None)
 
+    def set_snapshot(self, snapshot):
+        self._snapshot = snapshot
+        self._dirty = True
+        if self._is_visible:
+            self.refresh()
+
     def set_visible_tab(self, visible: bool):
+        if self._is_visible and not visible:
+            self._dirty = True
         self._is_visible = visible
         if visible and self._dirty:
             self.refresh()
 
     def mark_dirty(self):
         self._dirty = True
+        self._refresh_external = True
         if self._is_visible:
             self.refresh()
 
@@ -145,8 +156,9 @@ class TextFilesView(QWidget):
         gen = self._scan_gen
         game = self.game
         profile_dir = self.profile_dir
-        filemap_path = self.filemap_path
-        staging_root = self.staging_root
+        snapshot = self._snapshot
+        refresh_external = self._refresh_external
+        self._refresh_external = False
         keyword = self._content_keyword if self._content_matches is not None else None
         self._scanning = True
         self.scan_status_changed.emit(True)
@@ -154,7 +166,9 @@ class TextFilesView(QWidget):
         def worker():
             try:
                 entries = tf.discover_text_files(
-                    game, profile_dir, filemap_path, staging_root)
+                    game, profile_dir, snapshot=snapshot,
+                    external_cache_seconds=self._EXTERNAL_CACHE_SECONDS,
+                    refresh_external=refresh_external)
                 # A new scan invalidates the content-match set (paths may have
                 # changed) - recompute it here, still off the UI thread.
                 matches = (tf.content_search(entries, keyword)
@@ -192,10 +206,10 @@ class TextFilesView(QWidget):
                        if Path(e[0]).suffix.lower() not in self._exc_exts]
         if self._inc_srcs:
             entries = [e for e in entries
-                       if tf.entry_source(e[1]) in self._inc_srcs]
+                       if tf.entry_source(e[1], e[0]) in self._inc_srcs]
         if self._exc_srcs:
             entries = [e for e in entries
-                       if tf.entry_source(e[1]) not in self._exc_srcs]
+                       if tf.entry_source(e[1], e[0]) not in self._exc_srcs]
         if self._search_exts:
             exts = self._search_exts
             entries = [e for e in entries
@@ -266,7 +280,7 @@ class TextFilesView(QWidget):
         folders: dict[tuple[str, str], _TextNode] = {}
 
         for rel, mod, full in entries:
-            src = tf.entry_source(mod)
+            src = tf.entry_source(mod, rel)
             snode = src_nodes.get(src)
             if snode is None:
                 snode = _TextNode(labels.get(src, src), is_dir=True, parent=root)
@@ -297,6 +311,7 @@ class TextFilesView(QWidget):
                 ("src_profile", "Profile", True),
                 ("src_game", "Game folder", True),
                 ("src_mygames", "My Games", True),
+                ("src_logs", "Logs", True),
             ]},
             {"title": "By file type", "type": "dynamic", "id": "filetypes"},
         ]
@@ -304,7 +319,8 @@ class TextFilesView(QWidget):
     def apply_filter_state(self, state: dict):
         # Source tri-state checks → include/exclude source keys.
         key_map = {"src_mod": "mod", "src_profile": "profile",
-                   "src_game": "game", "src_mygames": "mygames"}
+                   "src_game": "game", "src_mygames": "mygames",
+                   "src_logs": "logs"}
         self._inc_srcs = {key_map[k] for k, v in key_map.items()
                           if state.get(k) == 1}
         self._exc_srcs = {key_map[k] for k, v in key_map.items()
@@ -321,7 +337,7 @@ class TextFilesView(QWidget):
 
     # -- search -------------------------------------------------------------
     def _on_search(self, text: str):
-        from Utils.file_search import parse_file_query
+        from Utils.text.search import parse_file_query
         needle, self._search_exts = parse_file_query(text)
         self._search = needle
         t = getattr(self, "_search_timer", None)

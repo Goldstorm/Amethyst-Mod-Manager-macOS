@@ -1,6 +1,6 @@
 """Post-deploy launcher-wrapper instructions.
 
-The launch handoff is produced by ``Utils.launch_handoff`` and may contain one
+The launch handoff is produced by ``Utils.launchers.handoff`` and may contain one
 field (Steam/Lutris/Faugus) or Heroic's separate executable and arguments.
 """
 
@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
 )
 
 from gui_qt.overlay_base import OverlayBase
-from gui_qt.theme_qt import active_palette, _c
+from gui_qt.theme_qt import active_palette, close_button, _c
 
 
 class LaunchHandoffOverlay(OverlayBase):
@@ -39,9 +39,9 @@ class LaunchHandoffOverlay(OverlayBase):
         v.addWidget(title)
 
         sub = QLabel(self.tr(
-            "This deployment uses an external loader or virtual filesystem, "
-            "so the launcher must start the game through Amethyst. Press Play "
-            "in Amethyst, or configure {0} as follows:\n\n{1}"
+            "This game uses an external loader or virtual filesystem. Press "
+            "Play in Amethyst, or configure {0} to launch the deployed setup "
+            "as follows:\n\n{1}"
         ).format(handoff.launcher_name, handoff.instructions))
         sub.setStyleSheet(f"color:{_c(p,'TEXT_DIM')}; font-size:13px;")
         sub.setWordWrap(True)
@@ -86,9 +86,7 @@ class LaunchHandoffOverlay(OverlayBase):
 
         bar = QHBoxLayout()
         bar.addStretch(1)
-        close = QPushButton(self.tr("Close"))
-        close.setObjectName("PrimaryButton")
-        close.setCursor(Qt.PointingHandCursor)
+        close = close_button(self.tr("Close"), pal=p)
         close.clicked.connect(self._close)
         bar.addWidget(close)
         v.addLayout(bar)

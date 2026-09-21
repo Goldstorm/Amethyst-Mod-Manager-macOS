@@ -6,11 +6,11 @@ from collections import deque
 from datetime import datetime
 from weakref import ref, WeakSet
 
-from PySide6.QtCore import Qt, QObject, QPoint, QSize, Signal, QTimer
+from PySide6.QtCore import Qt, QEvent, QObject, QPoint, QSize, Signal, QTimer
 from PySide6.QtGui import QAction, QColor, QPainter
 from PySide6.QtWidgets import (
-    QFrame, QHBoxLayout, QLabel, QMenu, QProgressBar, QPushButton, QScrollArea,
-    QTabWidget, QToolButton, QVBoxLayout, QWidget, QWidgetAction,
+    QApplication, QFrame, QHBoxLayout, QLabel, QMenu, QProgressBar, QPushButton,
+    QScrollArea, QTabWidget, QToolButton, QVBoxLayout, QWidget, QWidgetAction,
 )
 
 from gui_qt.icons import icon
@@ -89,7 +89,7 @@ class _ProgressRow(QFrame):
             self._bar.setRange(0, bar_total)
             self._bar.setValue(bar_done)
             if entry.get("bytes_mode"):
-                from Utils.cache_tools import format_size
+                from Utils.downloads.cache import format_size
                 self._count.setText(self.tr("{0} / {1}").format(
                     format_size(min(done, total)), format_size(total)))
             else:
@@ -152,8 +152,15 @@ class _NotificationMirrorButton(QToolButton):
         self.setCursor(Qt.PointingHandCursor)
         self.setFixedSize(btn_h, btn_h)
         self.setToolTip(self.tr("Notifications"))
-        self.clicked.connect(lambda: source._toggle_menu(self))
+        # Routed through self._source (not the ctor arg) so rebind() re-aims
+        # the click without having to reconnect the signal.
+        self.clicked.connect(lambda: self._source._toggle_menu(self))
         self.refresh_theme(active_palette())
+
+    def rebind(self, source: "NotificationButton") -> None:
+        """Back this mirror with a different button (the old one was replaced)."""
+        self._source = source
+        self.update()
 
     def sizeHint(self) -> QSize:
         # setFixedSize() clamps resizes but leaves sizeHint() at the style's
@@ -270,6 +277,7 @@ class NotificationButton(QToolButton):
         self._progress_rows: dict[str, _ProgressRow] = {}
         self._history_scroll = None
         self._history_action = None
+        self._menu_filter_installed = False
         self._mirrors: WeakSet = WeakSet()
         pal = active_palette()
         self.setIcon(icon("notification.png", icon_px,
@@ -299,6 +307,17 @@ class NotificationButton(QToolButton):
         mirror = _NotificationMirrorButton(self, btn_h, icon_px)
         self._mirrors.add(mirror)
         return _TabNotificationStrip(mirror, parent)
+
+    def adopt_mirrors(self, previous: "NotificationButton") -> None:
+        """Re-point *previous*'s mirrors at this button."""
+        # The toolbar can be rebuilt in place (moved to a side bar), which
+        # replaces this button while the tab-row mirror outlives it. Left
+        # attached to the discarded button the mirror stops getting badge
+        # updates and its menu is backed by a dead widget.
+        for mirror in list(previous._mirrors):
+            mirror.rebind(self)
+            self._mirrors.add(mirror)
+        previous._mirrors.clear()
 
     # -- badge ---------------------------------------------------------------
     def _on_entry_added(self):
@@ -348,9 +367,75 @@ class NotificationButton(QToolButton):
             return
         self.open_menu(anchor)
 
+    def eventFilter(self, obj, event):
+        menu = self._active_menu
+        if menu is not None and menu.isVisible():
+            event_type = event.type()
+            if event_type == QEvent.MouseButtonPress:
+                global_pos = event.globalPosition().toPoint()
+                if not menu.rect().contains(menu.mapFromGlobal(global_pos)):
+                    menu.close()
+                    if self._notification_button_at(global_pos):
+                        return True
+            elif event_type == QEvent.KeyPress and event.key() == Qt.Key_Escape:
+                menu.close()
+                return True
+            elif event_type in (QEvent.WindowDeactivate,
+                                 QEvent.ApplicationDeactivate):
+                menu.close()
+            elif event_type == QEvent.Resize and obj is menu.parentWidget():
+                QTimer.singleShot(0, self._place_menu)
+        return super().eventFilter(obj, event)
+
+    def _notification_button_at(self, global_pos: QPoint) -> bool:
+        for button in (self, *list(self._mirrors)):
+            if button.isVisible() and button.rect().contains(
+                    button.mapFromGlobal(global_pos)):
+                return True
+        return False
+
+    def _set_menu_filter(self, enabled: bool) -> None:
+        app = QApplication.instance()
+        if app is None or enabled == self._menu_filter_installed:
+            return
+        if enabled:
+            app.installEventFilter(self)
+        else:
+            app.removeEventFilter(self)
+        self._menu_filter_installed = enabled
+
+    @staticmethod
+    def _menu_origin(anchor: QWidget, size: QSize) -> QPoint:
+        """Top-left for the menu: below-left of *anchor*, flipped to stay on
+        screen (a left-hand side bar has no room to its left)."""
+        rect = anchor.rect()
+        below_left = anchor.mapToGlobal(rect.bottomRight())
+        screen = anchor.screen()
+        if screen is None:
+            return QPoint(max(below_left.x() - size.width(), 0), below_left.y())
+        area = screen.availableGeometry()
+        x = below_left.x() - size.width()
+        if x < area.left():
+            # Not enough room to the left - hang it off the anchor's right edge
+            # instead, and only then clamp (a menu wider than the screen).
+            x = anchor.mapToGlobal(rect.topLeft()).x()
+            x = min(x, area.right() - size.width())
+            x = max(x, area.left())
+        y = below_left.y()
+        if y + size.height() > area.bottom():
+            # Drop the menu above the button rather than run off the bottom.
+            above = anchor.mapToGlobal(rect.topLeft()).y() - size.height()
+            y = above if above >= area.top() else max(area.bottom() - size.height(),
+                                                      area.top())
+        return QPoint(x, y)
+
     def open_menu(self, anchor: QWidget | None = None):
         """Open the live notification menu without blocking the caller."""
         if self._active_menu is not None:
+            return
+        window = (anchor or self).window()
+        if (window is None or not window.isVisible() or window.isMinimized()
+                or not window.isActiveWindow()):
             return
         if anchor is None or not anchor.isVisible():
             if self.isVisible():
@@ -358,12 +443,15 @@ class NotificationButton(QToolButton):
             else:
                 anchor = next(
                     (m for m in list(self._mirrors) if m.isVisible()), self)
-        menu = self._build_menu()
+        menu = self._build_menu(window)
+        # A normal QMenu is a mouse-grabbing popup, so Qt consumes the outside
+        # click that dismisses it. As an in-window menu, the application filter
+        # can close it while the same event continues to the intended widget.
+        menu.setWindowFlags(Qt.Widget)
         menu.adjustSize()
-        anchor_pos = anchor.mapToGlobal(anchor.rect().bottomRight())
-        x = max(anchor_pos.x() - menu.sizeHint().width(), 0)
         self._active_menu = menu
         self._menu_anchor = ref(anchor)
+        self._set_menu_filter(True)
 
         def _closed(m=menu):
             if self._active_menu is m:
@@ -376,23 +464,33 @@ class NotificationButton(QToolButton):
                 self._progress_rows = {}
                 self._history_scroll = None
                 self._history_action = None
+                self._set_menu_filter(False)
             m.deleteLater()
 
         menu.aboutToHide.connect(_closed)
-        menu.popup(QPoint(x, anchor_pos.y()))
-        # Re-anchor off the laid-out width now that popup() has shown it, so the
+        menu.show()
+        menu.raise_()
+        # Re-anchor off the laid-out width now that the menu has been shown, so the
         # initial placement can't disagree with later re-anchoring.
         self._place_menu()
 
     def _place_menu(self) -> None:
-        """Keep the open menu's top-right corner under the button."""
+        """Keep the open menu anchored to the button as its size changes."""
         menu = self._active_menu
         anchor = self._menu_anchor() if self._menu_anchor is not None else None
         if menu is None or not menu.isVisible() or anchor is None \
                 or not anchor.isVisible():
             return
-        corner = anchor.mapToGlobal(anchor.rect().bottomRight())
-        menu.move(QPoint(max(corner.x() - menu.width(), 0), corner.y()))
+        # Same rule as the initial popup - re-anchoring must not undo the flip
+        # that keeps the menu on screen beside a side bar.
+        parent = menu.parentWidget()
+        if parent is None:
+            return
+        pos = parent.mapFromGlobal(self._menu_origin(anchor, menu.size()))
+        pos.setX(max(0, min(pos.x(), parent.width() - menu.width())))
+        pos.setY(max(0, min(pos.y(), parent.height() - menu.height())))
+        menu.move(pos)
+        menu.raise_()
 
     def set_progress(self, key: str, done: int, total: int,
                      phase: str | None = None, title: str | None = None,
@@ -551,13 +649,13 @@ class NotificationButton(QToolButton):
             self._history_action.setVisible(False)
             self._history_action.setVisible(True)
 
-    def _build_menu(self) -> QMenu:
+    def _build_menu(self, parent: QWidget) -> QMenu:
         """Fresh right-aligned menu: newest-first rows + a Clear-all action.
         Also clears the unread dot (built = seen)."""
         self._mark_read()
         self._history_scroll = None
         self._history_action = None
-        menu = QMenu(self)
+        menu = QMenu(parent)
         progress = QWidgetAction(menu)
         progress.setDefaultWidget(self._progress_widget())
         menu.addAction(progress)
@@ -579,6 +677,7 @@ class NotificationButton(QToolButton):
         clear = QAction(self.tr("Clear all"), menu)
         clear.setEnabled(bool(entries))
         clear.triggered.connect(self._history.clear)
+        clear.triggered.connect(menu.close)
         menu.addAction(clear)
         return menu
 

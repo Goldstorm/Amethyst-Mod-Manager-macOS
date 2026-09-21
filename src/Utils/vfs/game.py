@@ -14,6 +14,7 @@ from pathlib import Path
 class ProfileVFSGameMixin:
     """Opt-in settings, deployment, and launch hooks for ``Utils.vfs``."""
 
+    supports_vfs_deploy = True
     supports_profile_vfs = True
     launch_passthrough_supported = True
     # Compatibility for launch-option integrations written before launcher-
@@ -35,6 +36,10 @@ class ProfileVFSGameMixin:
     def get_vfs_data_root(self) -> Path | None:
         """Primary deployment directory inside :meth:`get_vfs_game_root`."""
         return self.get_mod_data_path()
+
+    def get_vfs_launch_bind_root(self) -> Path | None:
+        """Process-visible root used for legacy short-path VFS launches."""
+        return self.get_vfs_game_root()
 
     def vfs_relative_path(self, relative: str | Path) -> Path:
         """Translate a handler-relative path to the outer VFS root."""
@@ -118,7 +123,8 @@ class ProfileVFSGameMixin:
         )
 
     def _vfs_script_extender(self) -> str:
-        if (not getattr(self, "script_extender_swap", False)
+        if (not getattr(self, "supports_script_extender_swap", True)
+                or not getattr(self, "script_extender_swap", False)
                 or not self.vfs_prefers_script_extender):
             return ""
         try:
@@ -127,6 +133,9 @@ class ProfileVFSGameMixin:
             return self._script_extender_exe
         except Exception:
             return ""
+
+    def _vfs_direct_launch_exe(self) -> str:
+        return ""
 
     def get_vfs_launch_exe(self) -> Path | None:
         """Executable seen inside the active profile's private game view."""
@@ -140,6 +149,11 @@ class ProfileVFSGameMixin:
             if not relative:
                 return None
             return virtual_file_path(self, relative)
+
+        direct = self._vfs_direct_launch_exe()
+        candidate = _virtual_candidate(direct)
+        if candidate is not None:
+            return candidate
 
         extender = self._vfs_script_extender()
         candidate = _virtual_candidate(extender)
@@ -167,7 +181,7 @@ class ProfileVFSGameMixin:
         # executable is relative to the outer install. Reuse the normal
         # recursive resolver, then ensure the result belongs to this view.
         try:
-            from Utils.exe_launch import resolve_game_exe
+            from Utils.executables.launch import resolve_game_exe
             resolved = resolve_game_exe(self)
             if resolved is not None:
                 relative = resolved.resolve(strict=False).relative_to(game_root)
@@ -224,13 +238,17 @@ class ProfileVFSGameMixin:
             defaults = getattr(self, "default_launch_args", []) or []
         command.extend(str(arg) for arg in defaults if str(arg) not in command)
 
-        extender = self._vfs_script_extender()
-        if extender:
-            command = prefer_virtual_executable(self, command, extender)
+        direct = self._vfs_direct_launch_exe()
+        if direct and virtual_file(self, direct):
+            command = prefer_virtual_executable(self, command, direct)
         else:
-            preferred = getattr(self, "preferred_launch_exe", "") or ""
-            if preferred and virtual_file(self, preferred):
-                command = prefer_virtual_executable(self, command, preferred)
+            extender = self._vfs_script_extender()
+            if extender:
+                command = prefer_virtual_executable(self, command, extender)
+            else:
+                preferred = getattr(self, "preferred_launch_exe", "") or ""
+                if preferred and virtual_file(self, preferred):
+                    command = prefer_virtual_executable(self, command, preferred)
         return command
 
     def get_vfs_passthrough_command(self, vanilla_command: list[str]) -> list[str]:
@@ -254,7 +272,7 @@ class ProfileVFSGameMixin:
     def _deploy_vfs(self, *, profile: str, filemap: Path, staging: Path,
                     log_fn, progress_fn=None) -> None:
         """Build a private game view and run compatible handler hooks."""
-        from Utils.deploy import (
+        from Utils.deployment import (
             expand_separator_deploy_paths,
             expand_separator_link_modes,
             expand_separator_raw_deploy,
@@ -262,8 +280,8 @@ class ProfileVFSGameMixin:
             load_per_mod_strip_prefixes,
             load_separator_deploy_paths,
         )
-        from Utils.mod_files import excluded_raw_by_mod
-        from Utils.modlist import read_modlist
+        from Utils.mods.files import excluded_raw_by_mod
+        from Utils.mods.modlist import read_modlist
         from Utils.vfs import build_layers
 
         profile_dir = self.get_profile_root() / "profiles" / profile
@@ -334,12 +352,13 @@ class ProfileVFSGameMixin:
             # build. UE5 supplies its own richer transactional callback.
             if not callable(getattr(self, "_vfs_populate_data_layer", None)):
                 try:
-                    from Utils.deploy import cleanup_custom_deploy_dirs
+                    from Utils.deployment import cleanup_custom_deploy_dirs
                     cleanup_custom_deploy_dirs(
                         profile_dir,
                         sep_entries,
                         log_fn=log_fn,
                         filemap_path=filemap,
+                        game=self,
                     )
                 except Exception as cleanup_exc:
                     log_fn(
@@ -347,7 +366,7 @@ class ProfileVFSGameMixin:
                         f"targets: {cleanup_exc}"
                     )
                 try:
-                    from Utils.deploy import restore_custom_rules
+                    from Utils.deployment import restore_custom_rules
                     game_root_getter = getattr(self, "get_vfs_game_root", None)
                     game_root = (
                         game_root_getter()

@@ -26,12 +26,13 @@ import os
 import shlex
 import shutil
 import subprocess
+import threading
 from pathlib import Path, PureWindowsPath
 from typing import Iterable
 
-from Utils import perftrace
+from Utils.diagnostics import performance as perftrace
 from Utils.atomic_write import write_atomic_text
-from Utils.deploy import (
+from Utils.deployment import (
     LinkMode,
     compute_rule_claims,
     deploy_custom_rules,
@@ -39,13 +40,14 @@ from Utils.deploy import (
     deploy_root_flagged_mods,
     deploy_root_folder,
 )
-from Utils.deploy_shared import (
+from Utils.deployment.shared import (
     RestoreIncompleteError,
     _do_link_ex,
     _resolve_nocase,
     _resolve_root_path,
 )
-from Utils.deploy_shared import (
+from Utils.deployment.shared import (
+    OVERWRITE_LOG_NAME,
     _move_runtime_files,
     _write_deploy_snapshot,
     create_probe_stub_dirs,
@@ -73,15 +75,82 @@ _CUSTOM_RULE_ARTIFACTS = (
     "custom_rules_deployed.txt",
     "custom_rules_backup",
     "custom_rules_prefix_backup",
+    "custom_rules_roots.json",
 )
 _CUSTOM_DEPLOY_ARTIFACTS = (
     "custom_deploy_log.txt",
     "custom_deploy_backup",
 )
 
+_helper_inventory_cache: str | None = None
+_helper_inventory_lock = threading.Lock()
+
 
 def _inside_flatpak() -> bool:
     return Path("/.flatpak-info").exists()
+
+
+def _output_tail(text: str, limit: int = 600) -> str:
+    clean = " | ".join(line.strip() for line in text.splitlines() if line.strip())
+    return clean if len(clean) <= limit else clean[-limit:]
+
+
+def _helper_inventory() -> str:
+    global _helper_inventory_cache
+    with _helper_inventory_lock:
+        if _helper_inventory_cache is not None:
+            return _helper_inventory_cache
+        names = ("bwrap", "fuse-overlayfs", "fusermount3", "mountpoint", "flock")
+        details = []
+        if _inside_flatpak():
+            if not shutil.which("flatpak-spawn"):
+                _helper_inventory_cache = (
+                    "execution=Flatpak sandbox; flatpak-spawn=missing")
+                return _helper_inventory_cache
+            script = (
+                'for name in "$@"; do path=$(command -v "$name" 2>/dev/null || true); '
+                'if [ -z "$path" ]; then printf "%s=missing\\n" "$name"; continue; fi; '
+                'version=$("$path" --version 2>&1 | head -n 1); '
+                'printf "%s=%s [%s]\\n" "$name" "$path" "$version"; done; '
+                'if [ -r /dev/fuse ] && [ -w /dev/fuse ]; then echo "/dev/fuse=rw"; '
+                'else echo "/dev/fuse=unavailable"; fi'
+            )
+            try:
+                probe = subprocess.run(
+                    ["flatpak-spawn", "--host", "/bin/sh", "-c", script,
+                     "amethyst-vfs-inventory", *names],
+                    text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    timeout=8, check=False)
+                details.append("execution=Flatpak host")
+                details.extend(line.strip() for line in (probe.stdout or "").splitlines()
+                               if line.strip())
+                if probe.returncode != 0:
+                    details.append(f"inventory rc={probe.returncode}")
+            except (OSError, subprocess.SubprocessError) as exc:
+                details.append(f"host inventory failed: {exc}")
+        else:
+            details.append("execution=native/AppImage")
+            for name in names:
+                path = shutil.which(name)
+                if path is None:
+                    details.append(f"{name}=missing")
+                    continue
+                version = ""
+                try:
+                    probe = subprocess.run(
+                        [path, "--version"], text=True, stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT, timeout=2, check=False)
+                    version = next(iter((probe.stdout or "").splitlines()), "").strip()
+                    version = version[:300]
+                except (OSError, subprocess.SubprocessError):
+                    pass
+                details.append(f"{name}={path}" + (f" [{version}]" if version else ""))
+            fuse = Path("/dev/fuse")
+            details.append("/dev/fuse=" + (
+                "rw" if fuse.exists() and os.access(fuse, os.R_OK | os.W_OK)
+                else "unavailable"))
+        _helper_inventory_cache = "; ".join(details)
+        return _helper_inventory_cache
 
 
 def _profile_dir(game, profile: str | None = None) -> Path:
@@ -130,14 +199,16 @@ def pending_path(game, profile: str | None = None) -> Path:
 
 
 def has_deployment_state(game, profile: str | None = None) -> bool:
-    """Whether a published or interrupted profile VFS deployment exists."""
+    """Whether published, interrupted, or retained profile VFS state exists."""
     state = state_dir(game, profile)
     # Keep an invalid state root discoverable so Restore reports the safety
     # problem instead of silently treating the profile as undeployed.
     if state.is_symlink():
         return True
     return (manifest_path(game, profile).is_file()
-            or pending_path(game, profile).is_file())
+            or pending_path(game, profile).is_file()
+            or (_uses_root_folder_runtime(game)
+                and _legacy_shadow_upper(state)))
 
 
 def deployment_state_profiles(game) -> tuple[str, ...]:
@@ -168,6 +239,12 @@ def deployment_state_profiles(game) -> tuple[str, ...]:
         for name in (MANIFEST_NAME, PENDING_NAME):
             try:
                 stamps.append((state / name).stat().st_mtime_ns)
+            except OSError:
+                pass
+        if _uses_root_folder_runtime(game) and _legacy_shadow_upper(state):
+            try:
+                log_path = state / "root-upper" / OVERWRITE_LOG_NAME
+                stamps.append(log_path.stat().st_mtime_ns)
             except OSError:
                 pass
         if stamps:
@@ -289,7 +366,9 @@ def _bubblewrap_help() -> tuple[bool, str, str]:
         return False, f"bubblewrap could not be queried: {exc}", ""
     help_text = probe.stdout or ""
     if probe.returncode != 0:
-        return False, "bubblewrap returned an error during its capability check", help_text
+        detail = _output_tail(help_text)
+        reason = f"bubblewrap capability check exited {probe.returncode}"
+        return False, f"{reason}: {detail}" if detail else reason, help_text
     return True, "", help_text
 
 
@@ -319,11 +398,16 @@ def fuse_overlay_status() -> tuple[bool, str]:
     if _inside_flatpak():
         if not shutil.which("flatpak-spawn"):
             return False, "Flatpak host spawning is unavailable"
-        checks = " && ".join(f"command -v {name} >/dev/null" for name in required)
-        checks += " && test -r /dev/fuse && test -w /dev/fuse"
+        checks = (
+            'for name in "$@"; do command -v "$name" >/dev/null 2>&1 '
+            '|| echo "missing:$name"; done; '
+            'if ! test -r /dev/fuse || ! test -w /dev/fuse; '
+            'then echo "fuse:unavailable"; fi'
+        )
         try:
             probe = subprocess.run(
-                ["flatpak-spawn", "--host", "/bin/sh", "-c", checks],
+                ["flatpak-spawn", "--host", "/bin/sh", "-c", checks,
+                 "amethyst-vfs-probe", *required],
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -332,10 +416,17 @@ def fuse_overlay_status() -> tuple[bool, str]:
             )
         except (OSError, subprocess.SubprocessError) as exc:
             return False, f"host FUSE tools could not be queried: {exc}"
+        output = (probe.stdout or "").strip()
         if probe.returncode != 0:
-            return False, (
-                "the host needs bwrap, fuse-overlayfs, fuse3 and access to /dev/fuse"
-            )
+            detail = _output_tail(output)
+            return False, (f"host capability probe exited {probe.returncode}: {detail}"
+                           if detail else f"host capability probe exited {probe.returncode}")
+        problems = [line.removeprefix("missing:") for line in output.splitlines()
+                    if line.startswith("missing:")]
+        if problems:
+            return False, "required host tool(s) not found: " + ", ".join(problems)
+        if "fuse:unavailable" in output.splitlines():
+            return False, "/dev/fuse is unavailable to the host process"
         return True, ""
 
     missing = [name for name in required if shutil.which(name) is None]
@@ -403,18 +494,14 @@ def _mapped_separator_dirs(per_mod_deploy: dict[str, Path], game_root: Path,
     return mapped, external
 
 
-def _overwrite_entries(filemap: Path) -> set[str]:
+def _overwrite_entries() -> set[str]:
     """Paths supplied by [Overwrite], which is mounted as Data's upper layer."""
-    out: set[str] = set()
-    with filemap.open(encoding="utf-8", errors="surrogateescape") as handle:
-        for line in handle:
-            line = line.rstrip("\n")
-            if "\t" not in line:
-                continue
-            rel, owner = line.split("\t", 1)
-            if owner == "[Overwrite]":
-                out.add(rel.replace("\\", "/").lower())
-    return out
+    from Utils.filegraph.deploy import legacy_rows
+    return {
+        rel.replace("\\", "/").lower()
+        for rel, owner in legacy_rows()
+        if owner == "[Overwrite]"
+    }
 
 
 def _reject_symlink_payload(layer: Path) -> None:
@@ -494,6 +581,7 @@ def _materialize_tree(
     replace: bool,
     move: bool = False,
     exclude: set[str] | None = None,
+    no_symlink_files: frozenset[str] = frozenset(),
 ) -> tuple[int, int, int]:
     """Merge *source* into a physical shadow tree.
 
@@ -554,7 +642,8 @@ def _materialize_tree(
                     continue
                 _remove_path(dst)
 
-            if src.is_symlink():
+            allow_symlink = rel.as_posix().lower() not in no_symlink_files
+            if src.is_symlink() and allow_symlink:
                 os.symlink(os.readlink(src), dst)
                 symlinked += 1
                 if move:
@@ -567,7 +656,8 @@ def _materialize_tree(
                 continue
 
             actual_mode, transfer_error = _do_link_ex(
-                str(src), str(dst), LinkMode.HARDLINK)
+                str(src), str(dst), LinkMode.HARDLINK,
+                allow_symlink=allow_symlink)
             if transfer_error is not None:
                 raise transfer_error
             if actual_mode is LinkMode.SYMLINK:
@@ -580,6 +670,36 @@ def _materialize_tree(
     if move:
         _remove_tree(source)
     return linked, symlinked, copied
+
+
+def _links_into_root(view: Path, game_root: Path) -> int:
+    """Count links whose lexical target is hidden by a root bind."""
+    root_text = os.path.normpath(str(game_root.resolve(strict=False)))
+    count = 0
+    for dirpath, dirnames, filenames in os.walk(view, followlinks=False):
+        base = Path(dirpath)
+        link_names = [
+            name for name in dirnames
+            if (base / name).is_symlink()
+        ]
+        for name in (*link_names, *filenames):
+            path = base / name
+            if not path.is_symlink():
+                continue
+            try:
+                raw_target = os.readlink(path)
+            except OSError:
+                continue
+            target = os.path.normpath(
+                raw_target if os.path.isabs(raw_target)
+                else os.path.join(dirpath, raw_target)
+            )
+            try:
+                if os.path.commonpath((root_text, target)) == root_text:
+                    count += 1
+            except ValueError:
+                continue
+    return count
 
 
 def _move_disjoint_subtrees(source: Path, destination: Path) -> int:
@@ -857,22 +977,35 @@ def effective_tool_data_root(game) -> Path:
 
 
 def _capture_shadow_runtime(game, payload: dict, state: Path,
-                            log_fn=None) -> int:
+                            log_fn=None, *, retain_root: bool = True) -> int:
     """Move files created in a published shadow view into profile storage."""
     if payload.get("backend") != BACKEND_SHADOW:
         return 0
     (view, view_data, data_rel, _game_root, _data_root,
      root_upper, data_upper) = _validated_shadow_paths(
         game, payload, state, use_recorded_roots=True)
-    if not view.is_dir() or not view_data.is_dir():
-        return 0
 
     _log = log_fn or (lambda _message: None)
+    root_destination = (
+        _root_runtime_destination(game, state, root_upper)
+        if retain_root else root_upper
+    )
+    promoted = (
+        _promote_shadow_root_upper(root_upper, root_destination)
+        if retain_root else 0
+    )
+    if promoted:
+        _log(
+            f"VFS: moved {promoted} retained root file(s) into Root_Folder/."
+        )
+    if not view.is_dir() or not view_data.is_dir():
+        return 0
     moved_data = _move_runtime_files(
         view_data,
         state / DATA_SNAPSHOT_NAME,
         data_upper,
         log_fn=_log,
+        apply_global_ignore=False,
     )
     if not data_rel.parts:
         if moved_data:
@@ -884,14 +1017,56 @@ def _capture_shadow_runtime(game, payload: dict, state: Path,
     moved_root = _move_runtime_files(
         view,
         state / ROOT_SNAPSHOT_NAME,
-        root_upper,
+        root_destination,
         log_fn=_log,
         exclude_dirs=(data_rel.as_posix(),),
+        apply_global_ignore=False,
     )
     moved = moved_data + moved_root
     if moved:
         _log(f"VFS: captured {moved} runtime-created file(s) from the shadow view.")
     return moved
+
+
+def _uses_root_folder_runtime(game) -> bool:
+    if getattr(game, "vfs_root_payload_targets_data", False):
+        return False
+    enabled = getattr(game, "root_folder_deploy_enabled", True)
+    if callable(enabled):
+        enabled = enabled()
+    return bool(enabled) and callable(
+        getattr(game, "get_effective_root_folder_path", None))
+
+
+def _legacy_shadow_upper(state: Path) -> bool:
+    root_upper = state / "root-upper"
+    return (not root_upper.is_symlink()
+            and (root_upper / OVERWRITE_LOG_NAME).is_file())
+
+
+def _root_runtime_destination(game, state: Path, root_upper: Path) -> Path:
+    if not _uses_root_folder_runtime(game):
+        return root_upper
+    try:
+        destination = Path(game.get_effective_root_folder_path())
+        destination.resolve(strict=False).relative_to(
+            state.resolve(strict=False))
+    except ValueError:
+        return destination
+    except (OSError, TypeError):
+        pass
+    return root_upper
+
+
+def _promote_shadow_root_upper(
+    root_upper: Path, destination: Path,
+) -> int:
+    if (destination.resolve(strict=False) == root_upper.resolve(strict=False)
+            or not root_upper.is_dir() or root_upper.is_symlink()):
+        return 0
+
+    return sum(_materialize_tree(
+        root_upper, destination, replace=False, move=True))
 
 
 def _snapshot_shadow_view(
@@ -1266,9 +1441,10 @@ def build_layers(
 
     metadata_dir = filemap.parent
     populate_data_layer = getattr(game, "_vfs_populate_data_layer", None)
+    from Utils.games.routing_rules import get_rules
     custom_rules = (
         [] if callable(populate_data_layer)
-        else list(getattr(game, "custom_routing_rules", None) or [])
+        else list(get_rules(game))
     )
     game_rules = [rule for rule in custom_rules if not rule.to_prefix]
     prefix_rules = [rule for rule in custom_rules if rule.to_prefix]
@@ -1293,14 +1469,12 @@ def build_layers(
         prefix_rules and game.get_prefix_path() is None)
     routing_entries: list[tuple[str, str]] = []
     if needs_claim_partition or needs_prefix_probe:
-        with filemap.open(encoding="utf-8", errors="surrogateescape") as handle:
-            for line in handle:
-                line = line.rstrip("\n")
-                if "\t" not in line:
-                    continue
-                relative, mod_name = line.split("\t", 1)
-                if not raw_mods or mod_name not in raw_mods:
-                    routing_entries.append((relative, mod_name))
+        from Utils.filegraph.deploy import legacy_rows
+        routing_entries = [
+            (relative, mod_name)
+            for relative, mod_name in legacy_rows()
+            if not raw_mods or mod_name not in raw_mods
+        ]
         game_claims, prefix_claims = compute_rule_claims(
             routing_entries, custom_rules)
 
@@ -1328,11 +1502,10 @@ def build_layers(
         # physical prefix-route journal and destroy its recoverable backup.
         routing_metadata = build / "routing-metadata"
         routing_metadata.mkdir()
-        routing_filemap = routing_metadata / "filemap.txt"
-        shutil.copy2(filemap, routing_filemap)
+        routing_state = routing_metadata / "catalog-input"
         try:
             custom_exclude |= deploy_custom_rules(
-                routing_filemap, routed_layer, staging,
+                routing_state, routed_layer, staging,
                 rules=game_rules,
                 mode=LinkMode.HARDLINK,
                 strip_prefixes=game.mod_folder_strip_prefixes,
@@ -1385,7 +1558,7 @@ def build_layers(
     # destination is remapped are the exception: they must pass through
     # deploy_filemap so the source remains at its original overwrite path but
     # appears at the handler-defined destination in the shadow.
-    overwrite_entries = _overwrite_entries(filemap)
+    overwrite_entries = _overwrite_entries()
     routed_overwrite_entries = custom_exclude & overwrite_entries
     path_remap = dict(getattr(game, "mod_deploy_path_remap", None) or {})
     remap_prefixes = tuple(
@@ -1468,20 +1641,23 @@ def build_layers(
     # overwrite/delete recovery state belonging to a coexisting physical
     # deployment in filemap.parent.
     root_metadata = build / "root-metadata"
+    no_symlink_files = getattr(game, "root_deploy_no_symlink_files", frozenset())
     try:
         if root_folder_enabled:
             linked_root += deploy_root_folder(
                 game.get_effective_root_folder_path(), root_payload,
                 mode=LinkMode.HARDLINK, log_fn=_log,
-                metadata_dir=root_metadata)
+                metadata_dir=root_metadata,
+                no_symlink_files=no_symlink_files)
         linked_root += deploy_root_flagged_mods(
-            filemap.parent / "filemap_root.txt", root_payload, staging,
+            root_metadata / "catalog-input", root_payload, staging,
             mode=LinkMode.HARDLINK,
             strip_prefixes=game.mod_folder_strip_prefixes,
             per_mod_strip_prefixes=per_mod_strip,
             excluded_raw=excluded_raw or None,
             log_fn=_log,
             metadata_dir=root_metadata,
+            no_symlink_files=no_symlink_files,
         )
     finally:
         # This directory is wholly synthetic; remove it as one unit. It may
@@ -1507,13 +1683,15 @@ def build_layers(
     shadow_build.mkdir(parents=True)
     with perftrace.span("vfs: materialize base game"):
         base_counts = _materialize_tree(
-            game_root, shadow_build, replace=False)
+            game_root, shadow_build, replace=False,
+            no_symlink_files=no_symlink_files)
     shadow_data = shadow_build.joinpath(*data_rel.parts)
     shadow_data.mkdir(parents=True, exist_ok=True)
     with perftrace.span("vfs: merge resolved layers"):
         _move_materialized_tree(root_layer, shadow_build, replace=True)
         _move_materialized_tree(data_layer, shadow_data, replace=True)
-        _materialize_tree(root_upper, shadow_build, replace=True)
+        _materialize_tree(root_upper, shadow_build, replace=True,
+                          no_symlink_files=no_symlink_files)
         upper_exclude = (
             file_exclude_normalized
             | routed_overwrite_entries
@@ -1570,6 +1748,16 @@ def build_layers(
         if alias_count:
             _log(f"  VFS case aliases: {alias_count} symlink(s) created.")
 
+    bind_hidden_links = _links_into_root(shadow_build, game_root)
+    if (bind_hidden_links
+            and getattr(game, "vfs_bind_launch_at_game_root", False)):
+        _log(
+            "  VFS: the private view contains "
+            f"{bind_hidden_links} base-game symlink(s) that cannot be used "
+            "with a bind over the original game path; direct shadow launch "
+            "will be used."
+        )
+
     # Keep this marker across publication and every fallible game-specific
     # post-view hook. It is written only after the replacement is completely
     # materialized, so an earlier build failure leaves a previously finalized
@@ -1611,6 +1799,7 @@ def build_layers(
         "data_layer": str(shadow.joinpath(*data_rel.parts)),
         "root_upper": str(root_upper),
         "data_upper": str(data_upper.resolve()),
+        "bind_hidden_source_symlinks": bind_hidden_links,
     }
 
     def _publish_manifest() -> None:
@@ -1717,7 +1906,7 @@ def _forward_flatpak_host_environment(
     """Forward launch context through an existing host portal in place."""
     if not wrapper or Path(wrapper[0]).name != "flatpak-spawn":
         return
-    from Utils.flatpak_env import flatpak_forward_env_args
+    from Utils.flatpak.env import flatpak_forward_env_args
     index = 1
     while index < len(wrapper) and wrapper[index].startswith("-"):
         index += 1
@@ -1772,6 +1961,34 @@ def _retarget_shadow_paths(command: list[str], game_root: Path,
         if launch_cwd is None and shadow_candidate.is_file():
             launch_cwd = shadow_candidate.parent
     return direct, replaced, launch_cwd
+
+
+def _retarget_bound_paths(command: list[str], game_root: Path,
+                          view: Path, bind_root: Path) -> tuple[list[str], bool]:
+    """Rewrite game-root arguments to their path below a bound VFS root."""
+    direct = list(command)
+    replaced = False
+    resolved_root = game_root.resolve(strict=False)
+    resolved_view = view.resolve(strict=False)
+    for index, token in enumerate(direct):
+        candidate = Path(token)
+        if not candidate.is_absolute():
+            continue
+        try:
+            relative = candidate.resolve(strict=False).relative_to(
+                resolved_root)
+        except (OSError, ValueError):
+            continue
+        shadow_candidate = resolved_view / relative
+        if not shadow_candidate.exists():
+            resolved_shadow = _resolve_nocase(view, relative.as_posix())
+            if resolved_shadow is None:
+                continue
+            shadow_candidate = resolved_shadow
+        shadow_relative = shadow_candidate.relative_to(resolved_view)
+        direct[index] = str(bind_root.joinpath(*shadow_relative.parts))
+        replaced = True
+    return direct, replaced
 
 
 def sandbox_passthrough_command(
@@ -1894,7 +2111,7 @@ def _direct_shadow_umu_command(command: list[str], game_root: Path,
 
 
 def _steam_runtime_shadow_env(source: dict[str, str], game_root: Path,
-                              view: Path) -> dict[str, str]:
+                              view: Path, *extra_mounts: Path) -> dict[str, str]:
     """Return pressure-vessel path variables for a direct shadow launch."""
     mounts: list[str] = []
     for mount in source.get("STEAM_COMPAT_MOUNTS", "").split(":"):
@@ -1902,7 +2119,9 @@ def _steam_runtime_shadow_env(source: dict[str, str], game_root: Path,
             mounts.append(mount)
     # Keep the physical install visible for any absolute paths stored by the
     # game while making the complete profile view the runtime's install root.
-    for mount in (str(game_root), str(view)):
+    for mount in (
+        str(game_root), str(view), *(str(path) for path in extra_mounts),
+    ):
         if mount not in mounts:
             mounts.append(mount)
     return {
@@ -1948,7 +2167,7 @@ def _direct_shadow_steam_runtime_command(
 
 def _bound_shadow_steam_runtime_command(
         command: list[str], game_root: Path, view: Path,
-        env: dict[str, str] | None) -> list[str] | None:
+        env: dict[str, str] | None, bind_root: Path) -> list[str] | None:
     """Bind the view at the short game path *inside* pressure-vessel.
 
     Skyrim needs its configured install path to remain visible because deeply
@@ -1959,19 +2178,24 @@ def _bound_shadow_steam_runtime_command(
     ``srt-bwrap`` specifically for this environment, so make the final bind
     the command executed by the runtime and start Proton inside that bind.
     """
+    bound_command = command
+    if bind_root != game_root:
+        bound_command, _replaced = _retarget_bound_paths(
+            command, game_root, view, bind_root)
+
     runtime_index = next(
-        (index for index, token in enumerate(command)
+        (index for index, token in enumerate(bound_command)
          if Path(token).name == "_v2-entry-point"),
         None,
     )
     if runtime_index is None:
         return None
     try:
-        separator_index = command.index("--", runtime_index + 1)
+        separator_index = bound_command.index("--", runtime_index + 1)
     except ValueError:
         return None
 
-    runtime_root = Path(command[runtime_index]).parent
+    runtime_root = Path(bound_command[runtime_index]).parent
     runtime_bwrap = (
         runtime_root / "pressure-vessel" / "libexec"
         / "steam-runtime-tools-0" / "srt-bwrap"
@@ -1983,11 +2207,9 @@ def _bound_shadow_steam_runtime_command(
         )
 
     source_env = env if env is not None else os.environ
-    shadow_env = _steam_runtime_shadow_env(source_env, game_root, view)
-    # Unlike direct-shadow mode, pressure-vessel must continue reporting the
-    # configured short install path. The nested bind supplies the private view
-    # at precisely that destination.
-    shadow_env["STEAM_COMPAT_INSTALL_PATH"] = str(game_root)
+    shadow_env = _steam_runtime_shadow_env(
+        source_env, game_root, view, bind_root)
+    shadow_env["STEAM_COMPAT_INSTALL_PATH"] = str(bind_root)
     if env is not None:
         env.update(shadow_env)
 
@@ -1996,12 +2218,14 @@ def _bound_shadow_steam_runtime_command(
         "--die-with-parent",
         "--dev-bind", "/", "/",
         "--bind", str(view), str(game_root),
-        "--",
     ]
+    if bind_root != game_root:
+        inner_bind.extend(["--bind", str(view), str(bind_root)])
+    inner_bind.extend(["--chdir", str(bind_root), "--"])
     direct = [
-        *command[:separator_index + 1],
+        *bound_command[:separator_index + 1],
         *inner_bind,
-        *command[separator_index + 1:],
+        *bound_command[separator_index + 1:],
     ]
     # A manager-Play Proton command already starts with flatpak-spawn --host,
     # while a native Steam Launch Options command does not: Steam is on the
@@ -2019,7 +2243,7 @@ def _bound_shadow_steam_runtime_command(
     forwarded_env = dict(source_env)
     forwarded_env.update(shadow_env)
     _forward_flatpak_host_environment(
-        wrapper, forwarded_env, directory=game_root)
+        wrapper, forwarded_env, directory=bind_root)
     runtime_index = next(
         index for index, token in enumerate(host_command)
         if Path(token).name == "_v2-entry-point"
@@ -2051,8 +2275,8 @@ def _direct_shadow_opt_in_command(command: list[str], game_root: Path,
     return [*wrapper, *host_command]
 
 
-def wrap_command(game, command: list[str],
-                 env: dict[str, str] | None = None) -> list[str]:
+def wrap_command(game, command: list[str], env: dict[str, str] | None = None,
+                 log_fn=None) -> list[str]:
     """Wrap *command* in the deployed profile's private game view."""
     if not command:
         raise RuntimeError("No launch command was supplied to the profile VFS.")
@@ -2060,6 +2284,26 @@ def wrap_command(game, command: list[str],
     payload = _load_manifest(game)
     state = manifest_path(game).parent
     backend = payload.get("backend", BACKEND_KERNEL)
+
+    if log_fn is None:
+        try:
+            from Utils.app_log import app_log
+            log_fn = app_log
+        except Exception:
+            log_fn = lambda _message: None
+
+    def routed(route: str, wrapped: list[str], *, helpers: bool = False) -> list[str]:
+        try:
+            from Utils.processes.watch import format_command
+            location = "Flatpak host" if _inside_flatpak() else "native/AppImage"
+            log_fn(
+                f"VFS launch: backend={backend}, route={route}, execution={location}.")
+            log_fn(f"VFS launch wrapper: {format_command(wrapped)}")
+            if helpers:
+                log_fn(f"VFS helper inventory: {_helper_inventory()}")
+        except Exception:
+            pass
+        return wrapped
 
     if backend == BACKEND_SHADOW:
         (view, view_data, _data_rel, game_root, data_root,
@@ -2074,37 +2318,74 @@ def wrap_command(game, command: list[str],
                 raise RuntimeError(f"Profile VFS {label} is missing: {path}")
         bind_at_game_root = bool(
             getattr(game, "vfs_bind_launch_at_game_root", False))
-        if bind_at_game_root:
+        bind_root = game_root
+        bind_root_getter = getattr(game, "get_vfs_launch_bind_root", None)
+        if bind_at_game_root and callable(bind_root_getter):
+            candidate = bind_root_getter()
+            if candidate is not None and Path(candidate).is_dir():
+                bind_root = Path(candidate).resolve(strict=False)
+        hidden_link_value = payload.get("bind_hidden_source_symlinks")
+        if isinstance(hidden_link_value, int) and hidden_link_value >= 0:
+            bind_hidden_links = hidden_link_value
+        else:
+            bind_hidden_links = _links_into_root(view, game_root)
+        if bind_root != game_root:
+            bind_hidden_links += _links_into_root(view, bind_root)
+        bind_is_safe = bind_hidden_links == 0
+        if bind_at_game_root and bind_root != game_root:
+            log_fn(
+                "VFS launch: using short process-visible root "
+                f"{bind_root} for {game_root}."
+            )
+        if bind_at_game_root and not bind_is_safe:
+            log_fn(
+                "VFS launch: the short-path bind would hide the source of "
+                f"{bind_hidden_links} base-game symlink(s); using the direct "
+                "profile view instead. Keep the game and profile on the same "
+                "filesystem to retain short-path binding."
+            )
+        if bind_at_game_root and bind_is_safe:
             bound_runtime = _bound_shadow_steam_runtime_command(
-                command, game_root, view, env)
+                command, game_root, view, env, bind_root)
             if bound_runtime is not None:
-                return bound_runtime
-        if not bind_at_game_root:
+                return routed("shadow Steam Runtime bind", bound_runtime)
+        if not bind_at_game_root or not bind_is_safe:
             direct_umu = _direct_shadow_umu_command(
                 command, game_root, view, env)
             if direct_umu is not None:
-                return direct_umu
+                return routed("direct shadow UMU", direct_umu)
             direct_runtime = _direct_shadow_steam_runtime_command(
                 command, game_root, view, env)
             if direct_runtime is not None:
-                return direct_runtime
-        if (not bind_at_game_root
-                and getattr(game, "vfs_direct_shadow_launch", False)):
-            return _direct_shadow_opt_in_command(
-                command, game_root, view, env)
+                return routed("direct shadow Steam Runtime", direct_runtime)
+        if ((not bind_at_game_root
+                and getattr(game, "vfs_direct_shadow_launch", False))
+                or not bind_is_safe):
+            if _inside_flatpak() and _uses_umu(command):
+                raise RuntimeError(
+                    "Profile VFS cannot safely bind this cross-filesystem "
+                    "shadow view over the game path, and direct UMU launches "
+                    "are unavailable from the Amethyst Flatpak. Move this "
+                    "game's profile/staging directory onto the game "
+                    "filesystem, then redeploy."
+                )
+            return routed(
+                ("direct shadow cross-filesystem fallback"
+                 if not bind_is_safe else "direct shadow opt-in"),
+                _direct_shadow_opt_in_command(command, game_root, view, env))
         ok, reason = _bubblewrap_status()
         if not ok:
             raise RuntimeError(f"Profile VFS is unavailable: {reason}.")
         wrapper, host_command = _place_wrapper_on_host(
             [_bubblewrap_binary() or "bwrap"], command)
-        return [
+        return routed("bubblewrap shadow bind", [
             *wrapper,
             "--die-with-parent",
             "--dev-bind", "/", "/",
             "--bind", str(view), str(game_root),
             "--",
             *host_command,
-        ]
+        ], helpers=True)
 
     keys = (
         "game_root", "data_root", "root_layer", "data_layer",
@@ -2146,7 +2427,7 @@ def wrap_command(game, command: list[str],
             ],
             command,
         )
-        return [*wrapper, *host_command]
+        return routed("fuse-overlayfs", [*wrapper, *host_command], helpers=True)
 
     if backend != BACKEND_KERNEL:
         raise RuntimeError(
@@ -2160,7 +2441,7 @@ def wrap_command(game, command: list[str],
     wrapper, host_command = _place_wrapper_on_host(
         [_bubblewrap_binary() or "bwrap"], command)
 
-    return [
+    return routed("bubblewrap kernel OverlayFS", [
         *wrapper,
         "--die-with-parent",
         "--dev-bind", "/", "/",
@@ -2174,7 +2455,7 @@ def wrap_command(game, command: list[str],
         str(paths["data_root"]),
         "--",
         *host_command,
-    ]
+    ], helpers=True)
 
 
 def _mapped_virtual_relative(game, relative: str | Path) -> Path:
@@ -2337,7 +2618,10 @@ def cleanup_deployment(game, *, preserve_upper: bool = True, log_fn=None) -> Non
         try:
             payload = json.loads(manifest.read_text(encoding="utf-8"))
             if isinstance(payload, dict):
-                _capture_shadow_runtime(game, payload, state, log_fn=_log)
+                _capture_shadow_runtime(
+                    game, payload, state, log_fn=_log,
+                    retain_root=preserve_upper,
+                )
         except (OSError, ValueError, RuntimeError) as exc:
             _log(f"  WARN: could not capture the VFS shadow view: {exc}")
     elif manifest.is_file():
@@ -2345,6 +2629,16 @@ def cleanup_deployment(game, *, preserve_upper: bool = True, log_fn=None) -> Non
             "VFS: removing an unfinalized view without capturing partial "
             "deploy output."
         )
+    if (preserve_upper and _uses_root_folder_runtime(game)
+            and _legacy_shadow_upper(state)):
+        root_upper = state / "root-upper"
+        root_destination = _root_runtime_destination(game, state, root_upper)
+        promoted = _promote_shadow_root_upper(root_upper, root_destination)
+        if promoted:
+            _log(
+                f"VFS: moved {promoted} retained root file(s) into "
+                "Root_Folder/."
+            )
     for name in (
         MANIFEST_NAME, RUNTIME_NAME, "runtime.lock", "lower", "lower.build",
         "root-work", "data-work", SHADOW_NAME, SHADOW_BUILD_NAME,

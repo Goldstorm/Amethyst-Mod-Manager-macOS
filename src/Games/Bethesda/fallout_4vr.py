@@ -20,6 +20,10 @@ class Fallout_4VR(Fallout_3):
     synthesis_registry_name = "Fallout 4 VR"
 
     @property
+    def prefix_health_extras(self) -> list[str]:
+        return [*super().prefix_health_extras, "vcrun2012"]
+
+    @property
     def reshade_dll(self) -> str:
         return "dxgi.dll"
 
@@ -46,6 +50,7 @@ class Fallout_4VR(Fallout_3):
                 description="Download and run Wrye Bash.",
                 dialog_class_path="wizards.wrye_bash.WryeBashWizard",
             ),
+            self._xlodgen_wizard_tool("fo4vr"),
             *self._xedit_wizard_tools(
                 build="FO4VREdit", id_suffix="fo4vr", qac=False,
                 nexus_url="https://www.nexusmods.com/fallout4/mods/2737?tab=files",
@@ -75,12 +80,12 @@ class Fallout_4VR(Fallout_3):
     
     @property
     def custom_routing_rules(self) -> list:
-        from Utils.deploy import CustomRule
+        from Utils.deployment import CustomRule
         return [
-            CustomRule(dest="", filenames=["f4sevr_steam_loader.dll"], flatten=True, loose_only=True),
-            CustomRule(dest="", filenames=["f4sevr_loader.exe"], flatten=True, loose_only=True),
-            CustomRule(dest="", folders=["Data"], flatten=True, loose_only=True),
-            CustomRule(dest="", filenames=["f4sevr*.dll"], flatten=True, loose_only=True),
+            CustomRule(rule_id='fallout_4vr:ec8d844f04f5', dest="", filenames=["f4sevr_steam_loader.dll"], flatten=True, loose_only=True),
+            CustomRule(rule_id='fallout_4vr:84b3774b3d1b', dest="", filenames=["f4sevr_loader.exe"], flatten=True, loose_only=True),
+            CustomRule(rule_id='fallout_4vr:42b2892ccb1f', dest="", folders=["Data"], flatten=True, loose_only=True),
+            CustomRule(rule_id='fallout_4vr:f303019012fc', dest="", filenames=["f4sevr*.dll"], flatten=True, loose_only=True),
             self._saves_routing_rule([".fos"]),
                 ]
 
@@ -110,3 +115,7 @@ class Fallout_4VR(Fallout_3):
     @property
     def _script_extender_exe(self) -> str:
         return "f4sevr_loader.exe"
+
+    @property
+    def _script_extender_runtime_ini(self) -> Path:
+        return Path("Data/F4SE/f4sevr.ini")

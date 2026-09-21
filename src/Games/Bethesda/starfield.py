@@ -12,6 +12,7 @@ from Games.Bethesda.bethesda_ini import _read_ini_key, _set_ini_key
 
 class Starfield(Fallout_3):
 
+    case_alias_links_default = False
     plugins_use_star_prefix = True
     plugins_include_vanilla = False
     supports_esl_flag = True
@@ -105,11 +106,11 @@ class Starfield(Fallout_3):
 
     @property
     def custom_routing_rules(self) -> list:
-        from Utils.deploy import CustomRule
+        from Utils.deployment import CustomRule
         return [
-            CustomRule(dest="", filenames=["sfse_loader.exe"], flatten=True, loose_only=True),
-            CustomRule(dest="", filenames=["sfse*.dll"], flatten=True, loose_only=True),
-            CustomRule(dest="", folders=["Data"], flatten=True, loose_only=True),
+            CustomRule(rule_id='starfield:c7b7b8282f1c', dest="", filenames=["sfse_loader.exe"], flatten=True, loose_only=True),
+            CustomRule(rule_id='starfield:66f38608023e', dest="", filenames=["sfse*.dll"], flatten=True, loose_only=True),
+            CustomRule(rule_id='starfield:42b2892ccb1f', dest="", folders=["Data"], flatten=True, loose_only=True),
             self._saves_routing_rule([".sfs"]),
         ]
 
@@ -136,7 +137,7 @@ class Starfield(Fallout_3):
 
     def _starfield_custom_ini_paths(self) -> list[Path]:
         """Return the StarfieldCustom.ini path in each managed My Games dir."""
-        return [d / self._CUSTOM_INI_FILENAME
+        return [self._resolve_ini_path(d, self._CUSTOM_INI_FILENAME)
                 for d in {p.parent for p in self._get_archive_ini_paths()}]
 
     def apply_archive_invalidation(self, log_fn) -> None:
@@ -191,7 +192,7 @@ class Starfield(Fallout_3):
         profile's plugins.txt is left untouched so blueprints stay visible
         in the load-order UI.
         """
-        from Utils.plugin_parser import is_blueprint_flagged
+        from Utils.plugins.parser import is_blueprint_flagged
         from Utils.plugins import read_plugins
 
         _log = log_fn

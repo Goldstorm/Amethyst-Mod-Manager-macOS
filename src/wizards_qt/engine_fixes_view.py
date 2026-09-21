@@ -3,7 +3,7 @@
 A modlist-panel-scoped tab: a scrollable grid form of every EngineFixes.toml
 key with a typed value control (bool → two radios, else line edit) and a dim
 description.  Save renders the values into the managed 'EngineFixes toml' mod
-(schema/parse/render in Utils/engine_fixes_config.py); Reset restores the
+(schema/parse/render in Utils/bethesda/engine_fixes.py); Reset restores the
 built-in defaults.  No per-key enable checkbox (toml keys are always present).
 """
 
@@ -17,9 +17,9 @@ from PySide6.QtWidgets import (
     QRadioButton, QScrollArea, QVBoxLayout, QWidget,
 )
 
-from gui_qt.theme_qt import active_palette, _c
+from gui_qt.theme_qt import active_palette, close_button, _c
 from wizards_qt._view_base import GREEN, RED, WizardViewBase
-import Utils.engine_fixes_config as cfg
+import Utils.bethesda.engine_fixes as cfg
 
 if TYPE_CHECKING:
     from Games.base_game import BaseGame
@@ -82,8 +82,7 @@ class EngineFixesView(WizardViewBase):
         bar = QWidget()
         bh = QHBoxLayout(bar); bh.setContentsMargins(0, 4, 0, 0); bh.setSpacing(8)
         bh.addStretch(1)
-        close = QPushButton(self.tr("Close"))
-        close.setCursor(Qt.PointingHandCursor)
+        close = close_button(self.tr("Close"))
         close.clicked.connect(self._finish)
         bh.addWidget(close)
         reset = QPushButton(self.tr("Reset to defaults"))

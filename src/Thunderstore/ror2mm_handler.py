@@ -248,9 +248,10 @@ class Ror2mmHandler:
                 path.write_text(cls._desktop_contents(), encoding="utf-8")
                 os.chmod(path, 0o755)
                 written = True
-                _handler_log(f"Wrote ror2mm .desktop: {path}")
+                _handler_log(f"Wrote {cls._SCHEME} .desktop: {path}")
             except OSError as exc:
-                _handler_log(f"Could not write ror2mm .desktop {path}: {exc}")
+                _handler_log(
+                    f"Could not write {cls._SCHEME} .desktop {path}: {exc}")
 
         if not written:
             return False
@@ -271,10 +272,11 @@ class Ror2mmHandler:
                  f"x-scheme-handler/{cls._SCHEME}"],
                 check=False, capture_output=True, timeout=15)
         except (OSError, subprocess.SubprocessError) as exc:
-            _handler_log(f"xdg-mime registration for ror2mm:// failed: {exc}")
+            _handler_log(
+                f"xdg-mime registration for {cls._SCHEME}:// failed: {exc}")
 
         cls._write_mimeapps_association()
-        _handler_log("Registered ror2mm:// handler")
+        _handler_log(f"Registered {cls._SCHEME}:// handler")
         return True
 
     @classmethod
@@ -298,7 +300,8 @@ class Ror2mmHandler:
                 updated = cls._patch_mimeapps_content(existing)
                 if updated != existing:
                     path.write_text(updated, encoding="utf-8")
-                    _handler_log(f"Updated ror2mm:// association in {path}")
+                    _handler_log(
+                        f"Updated {cls._SCHEME}:// association in {path}")
             except OSError as exc:
                 _handler_log(f"Could not update {path}: {exc}")
 
@@ -369,3 +372,53 @@ class Ror2mmHandler:
                 new_lines.insert(insert_at, f"{key}={value}")
 
         return "\n".join(new_lines) + ("\n" if new_lines else "")
+
+    @classmethod
+    def registration_is_current(cls) -> bool:
+        """Return whether ror2mm already resolves to this running install."""
+        import subprocess
+
+        from Nexus.nxm_handler import NxmHandler
+
+        try:
+            expected = cls._desktop_contents()
+            checked_desktop = False
+            for path in cls._desktop_paths():
+                # register() skips only a missing Flatpak exports directory;
+                # every other returned location is expected to contain the
+                # current install's entry after a successful registration.
+                if "flatpak" in str(path) and not path.parent.exists():
+                    continue
+                checked_desktop = True
+                if (not path.is_file()
+                        or path.read_text(encoding="utf-8") != expected):
+                    return False
+            if not checked_desktop:
+                return False
+
+            mimeapps_paths = NxmHandler._mimeapps_paths()
+            canonical = mimeapps_paths[0]
+            for path in mimeapps_paths:
+                if path != canonical and not path.exists():
+                    continue
+                if not path.is_file():
+                    return False
+                content = path.read_text(encoding="utf-8")
+                if cls._patch_mimeapps_content(content) != content:
+                    return False
+        except OSError:
+            return False
+
+        try:
+            result = subprocess.run(
+                ["xdg-mime", "query", "default",
+                 f"x-scheme-handler/{cls._SCHEME}"],
+                check=False,
+                capture_output=True,
+                timeout=10,
+            )
+            return (result.returncode == 0
+                    and result.stdout.decode(errors="replace").strip()
+                    == cls._DESKTOP_FILE_NAME)
+        except (OSError, subprocess.SubprocessError):
+            return False

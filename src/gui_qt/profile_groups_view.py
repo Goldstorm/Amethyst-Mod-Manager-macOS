@@ -1,12 +1,12 @@
 """Profile Groups - a modlist-scoped tab for creating and managing groups
 (named, ordered combinations of profiles that deploy together as one merged
-profile - see Utils/profile_groups.py).
+profile - see Utils/profiles/groups.py).
 
 Layout: a list of existing groups (expandable member panel with priority
 reorder / add / remove), then a create panel: group name + an ordered member
 checklist where CHECK ORDER = priority order (a live preview shows it).
 Shared-pool profiles are listed disabled with an inline "Convert…" action
-(Utils/profile_convert.py) since group members must be profile-specific.
+(Utils/profiles/convert.py) since group members must be profile-specific.
 """
 
 from __future__ import annotations
@@ -21,12 +21,13 @@ from PySide6.QtWidgets import (
 )
 
 from gui_qt.safe_emit import safe_emit
+from gui_qt.i18n import profile_display
 from gui_qt.theme_qt import (
-    _c, active_palette, bind_theme_icon, contrast_text, danger_close_button,
+    _c, active_palette, bind_theme_icon, contrast_text, close_button,
 )
-from Utils import profile_groups as pg
-from Utils.profile_groups import GroupValidationError
-from Utils.profile_state import profile_uses_specific_mods
+from Utils.profiles import groups as pg
+from Utils.profiles.groups import GroupValidationError
+from Utils.profiles.state import profile_uses_specific_mods
 
 
 class ProfileGroupsView(QWidget):
@@ -87,7 +88,7 @@ class ProfileGroupsView(QWidget):
         hb = QHBoxLayout(bar); hb.setContentsMargins(12, 8, 12, 8)
         title = QLabel(self.tr("Profile Groups")); title.setObjectName("PGTitle")
         hb.addWidget(title); hb.addStretch(1)
-        close = danger_close_button(pal=p)
+        close = close_button(pal=p)
         close.clicked.connect(self._close)
         hb.addWidget(close)
         root.addWidget(bar)
@@ -109,7 +110,7 @@ class ProfileGroupsView(QWidget):
         return self._game.get_profile_root() / "profiles"
 
     def _profile_names(self) -> list[str]:
-        from Utils.game_helpers import _profiles_for_game
+        from Utils.games.registry import _profiles_for_game
         return _profiles_for_game(self._game.name)
 
     def _groups(self) -> list[str]:
@@ -234,7 +235,8 @@ class ProfileGroupsView(QWidget):
             num.setStyleSheet(f"color:{_c(p, 'TEXT_DIM')}; min-width: 18px;")
             row.addWidget(num)
             missing = not (self._profiles_dir() / member).is_dir()
-            lbl = QLabel(member + (self.tr("  (missing)") if missing else ""))
+            lbl = QLabel(profile_display(member)
+                         + (self.tr("  (missing)") if missing else ""))
             lbl.setStyleSheet(f"color:{_c(p, 'TEXT_MAIN')};")
             row.addWidget(lbl, 1)
             # Theme-tinted arrow.png chevrons (the glyph font has no ▲/▼ here).
@@ -267,13 +269,15 @@ class ProfileGroupsView(QWidget):
         if addable:
             row = QHBoxLayout(); row.setSpacing(6)
             combo = QComboBox()
-            combo.addItems(addable)
+            # Folder name as item data - _add_member takes a real profile name.
+            for _m in addable:
+                combo.addItem(profile_display(_m), _m)
             row.addWidget(combo, 1)
             add = QPushButton(self.tr("+ Add member"))
             add.setObjectName("FormButton")
             add.setCursor(Qt.PointingHandCursor)
             add.clicked.connect(lambda _=False, g=group_name, cb=combo:
-                                self._add_member(g, cb.currentText()))
+                                self._add_member(g, cb.currentData()))
             row.addWidget(add)
             pl.addLayout(row)
         return panel
@@ -303,7 +307,7 @@ class ProfileGroupsView(QWidget):
             hint.setObjectName("PGHint"); hint.setWordWrap(True)
             pl.addWidget(hint)
         for name in eligible:
-            cb = QCheckBox(name)
+            cb = QCheckBox(profile_display(name))
             cb.setChecked(name in self._create_order)
             cb.toggled.connect(lambda on, n=name: self._on_create_check(n, on))
             self._create_checks[name] = cb
@@ -334,7 +338,7 @@ class ProfileGroupsView(QWidget):
             hint2.setObjectName("PGHint"); hint2.setWordWrap(True)
             pl.addWidget(hint2)
             for name in contributors:
-                cb = QCheckBox(name)
+                cb = QCheckBox(profile_display(name))
                 cb.setChecked(True)
                 self._ow_checks[name] = cb
                 pl.addWidget(cb)
@@ -351,7 +355,7 @@ class ProfileGroupsView(QWidget):
     def _build_shared_row(self, name: str, p) -> QFrame:
         row = QFrame(); row.setObjectName("GroupRow")
         rl = QHBoxLayout(row); rl.setContentsMargins(10, 4, 10, 4); rl.setSpacing(8)
-        lbl = QLabel(name)
+        lbl = QLabel(profile_display(name))
         lbl.setStyleSheet(f"color:{_c(p, 'TEXT_DIM')};")
         rl.addWidget(lbl, 1)
         conv = QPushButton(self.tr("Converting…") if self._converting == name
@@ -563,7 +567,7 @@ class ProfileGroupsView(QWidget):
             def worker():
                 ok2 = True
                 try:
-                    from Utils.profile_convert import convert_profile_to_specific
+                    from Utils.profiles.convert import convert_profile_to_specific
                     convert_profile_to_specific(game, pdir, log_fn=self._log)
                 except Exception as exc:
                     ok2 = False

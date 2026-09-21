@@ -1,26 +1,24 @@
 app-id: io.github.Amethyst.ModManager
 runtime: org.kde.Platform
-runtime-version: "6.9"
+runtime-version: "6.11"
 sdk: org.kde.Sdk
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable
 # PySide6 comes prebuilt from the PySide BaseApp (Flathub-standard for
 # PySide apps); Qt itself is shared from the KDE runtime.
 base: io.qt.PySide.BaseApp
-base-version: "6.9"
+base-version: "6.11"
 
-# 32-bit support for running Proton's bundled `wine` binary (ELF i386) during
-# Synthesis prefix setup. Without these, exec'ing wine fails with ENOENT - the
-# kernel reports the missing 32-bit ld-linux.so.2 interpreter as the error.
-# NOTE: version 24.08 matches KDE 6.9's freedesktop base (was 25.08 on GNOME 50).
 add-extensions:
+  # 32-bit support for running Proton's bundled `wine` binary (ELF i386).
+  # Version 25.08 matches KDE 6.11's Freedesktop base.
   org.freedesktop.Platform.Compat.i386:
     directory: lib/i386-linux-gnu
-    version: "24.08"
+    version: "25.08"
   org.freedesktop.Platform.GL32:
     directory: lib/i386-linux-gnu/GL
     version: "1.4"
-    versions: 24.08;1.4
+    versions: 25.08;1.4
     subdirectories: true
     no-autodownload: false
     autodelete: false
@@ -30,8 +28,8 @@ command: amethyst-mod-manager
 
 build-options:
   env:
-    # cleanup-BaseApp.sh knobs - the app only uses QtCore/QtGui/QtWidgets,
-    # so strip the QtWebEngine stack the BaseApp inherits.
+    # cleanup-BaseApp.sh knobs - strip the QtWebEngine stack the BaseApp
+    # inherits. Qt Multimedia is retained for Mod Files media previews.
     BASEAPP_REMOVE_WEBENGINE: "true"
     BASEAPP_DISABLE_NUMPY: "true"
 
@@ -39,12 +37,14 @@ build-options:
 # - network: Nexus API send/receive, version checks, downloads
 # - x11 + wayland sockets: Qt picks Wayland natively when the session offers
 #   it and falls back to X11 otherwise.
+# - pulseaudio: audio preview playback
 # - dri: GPU rendering
 # - home: mod staging (user-configurable path, e.g. anywhere in ~/), game paths, Steam libraries.
 #   NOTE: app config does NOT live in ~/.config here - flatpak redirects
 #   XDG_CONFIG_HOME, so it lands in ~/.var/app/<app-id>/config/AmethystModManager
 #   (separate from a native/AppImage install's ~/.config/AmethystModManager).
 # - run/media, media, mnt: Steam libraries on SD cards and removable drives (Steam Deck, etc.)
+# - var/mnt: mount point on Fedora Atomic / Bazzite, where /mnt is a symlink to /var/mnt
 # - ~/.var/app/com.valvesoftware.Steam: Steam Flatpak data (home excludes ~/.var/app)
 # - ~/.var/app/com.heroicgameslauncher.hgl: Heroic Flatpak
 # - ~/.var/app/net.lutris.Lutris: Lutris Flatpak (pga.db, game configs, wine runners)
@@ -54,16 +54,33 @@ finish-args:
   - --share=network
   - --socket=x11
   - --socket=wayland
+  - --socket=pulseaudio
   - --device=dri
   - --share=ipc
   - --filesystem=home
   - --filesystem=/run/media
   - --filesystem=/media
   - --filesystem=/mnt
+  - --filesystem=/var/mnt
   - --filesystem=~/.var/app/com.valvesoftware.Steam
   - --filesystem=~/.var/app/com.heroicgameslauncher.hgl
   - --filesystem=~/.var/app/net.lutris.Lutris
   - --filesystem=~/.var/app/io.github.Faugus.faugus-launcher
+  # Discord Rich Presence sockets (used only when enabled in Settings).
+  - --filesystem=xdg-run/discord-ipc-0
+  - --filesystem=xdg-run/discord-ipc-1
+  - --filesystem=xdg-run/discord-ipc-2
+  - --filesystem=xdg-run/discord-ipc-3
+  - --filesystem=xdg-run/discord-ipc-4
+  - --filesystem=xdg-run/discord-ipc-5
+  - --filesystem=xdg-run/discord-ipc-6
+  - --filesystem=xdg-run/discord-ipc-7
+  - --filesystem=xdg-run/discord-ipc-8
+  - --filesystem=xdg-run/discord-ipc-9
+  - --filesystem=xdg-run/app/com.discordapp.Discord
+  - --filesystem=xdg-run/app/com.discordapp.DiscordCanary
+  - --filesystem=xdg-run/app/com.discordapp.DiscordPTB
+  - --filesystem=xdg-run/app/dev.vencord.Vesktop
   - --talk-name=org.freedesktop.secrets
   - --talk-name=org.freedesktop.Flatpak
   # Wine (Synthesis prefix setup) installs its own seccomp filter and runs
@@ -72,7 +89,7 @@ finish-args:
   - --env=MOD_MANAGER_GAMES=/app/share/amethyst-mod-manager/Games
   - --env=XDG_DATA_DIRS=/app/share:/usr/share
   - --env=QT_QPA_PLATFORM=xcb
-  # Unconditional, so the xcb above is always OURS: Utils.xdg.host_env() reads
+  # Unconditional, so the xcb above is always OURS: Utils.environment.xdg.host_env() reads
   # this marker and scrubs QT_QPA_PLATFORM from every program we launch. A
   # child that cannot reach an X server (the OpenMW flatpak ships
   # fallback-x11, so on Wayland its sandbox has no X socket) aborts during Qt
@@ -93,6 +110,7 @@ cleanup-commands:
 modules:
   # Python Dependencies (PySide6 excluded - provided by the BaseApp)
   - pypi-dependencies.yaml
+  - maturin.yaml
 
   - name: sevenzip
     buildsystem: simple
@@ -107,8 +125,24 @@ modules:
         sha256: ed087f83ee789c1ea5f39c464c55a5c9d4008deb0efe900814f2df262b82c36e
         strip-components: 0
 
+  - name: vgmstream
+    buildsystem: simple
+    only-arches:
+      - x86_64
+    build-commands:
+      - install -Dm755 vgmstream-cli /app/bin/vgmstream-cli
+      - install -Dm644 vgmstream-COPYING /app/share/licenses/vgmstream/COPYING
+    sources:
+      - type: archive
+        url: https://github.com/vgmstream/vgmstream/releases/download/r2117/vgmstream-linux.zip
+        sha256: 2f98c77f756079f63fbd119939067f1ed461d77e70993bc4cc372736d859c84a
+      - type: file
+        url: https://raw.githubusercontent.com/vgmstream/vgmstream/r2117/COPYING
+        sha256: fcc26d35c4c4365e31f21734f846e4ee362ff0b57ba696085605a7b4768d8763
+        dest-filename: vgmstream-COPYING
+
   # cabextract is needed by winetricks (vcredist/d3dcompiler installs).
-  # Bundling it means Utils/protontricks.py finds it on PATH and never falls
+  # Bundling it means Utils/wine/protontricks.py finds it on PATH and never falls
   # back to downloading a rolling Arch binary that may not match our glibc.
   - name: cabextract
     buildsystem: autotools

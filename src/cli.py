@@ -10,6 +10,7 @@ Usage:
     python cli.py launch <game> [--profile <name>] [--no-deploy]
     python cli.py restore <game>
     python cli.py clear-credentials
+    python cli.py export-filemap <game> <profile_name> [--output-dir DIR] [--refresh]
 
 <game> can be the game's game_id (e.g. 'skyrim_se'), its full display name
 (e.g. 'Skyrim Special Edition'), or a Steam app ID.  Matching is
@@ -96,7 +97,7 @@ def cmd_deploy(games: dict, key: str, profile: str):
             file=sys.stderr)
         sys.exit(1)
 
-    from Utils.deploy_pipeline import run_deploy_pipeline
+    from Utils.deployment.pipeline import run_deploy_pipeline
 
     profile_dir = game.get_profile_root() / "profiles" / profile
     if not profile_dir.is_dir():
@@ -161,7 +162,7 @@ def cmd_launch(games: dict, key: str, profile: "str | None" = None,
         """Return launcher argv on the side of the sandbox that owns it."""
         if os.environ.get("FLATPAK_ID") != "io.github.Amethyst.ModManager":
             return list(command)
-        from Utils.flatpak_env import flatpak_forward_env_args
+        from Utils.flatpak.env import flatpak_forward_env_args
         portal = ["flatpak-spawn", "--host"]
         try:
             game_root = game.get_game_path()
@@ -254,7 +255,7 @@ def cmd_launch(games: dict, key: str, profile: "str | None" = None,
         sys.exit(1)
 
     if deploy:
-        from Utils.deploy_pipeline import run_deploy_pipeline
+        from Utils.deployment.pipeline import run_deploy_pipeline
         _launch_log(f"Deploying {game.name} / {profile} ...")
         if not run_deploy_pipeline(game, profile, log_fn=_launch_log):
             print("Error: deploy failed - refusing to launch.", file=sys.stderr)
@@ -343,16 +344,18 @@ def cmd_restore(games: dict, key: str):
             file=sys.stderr)
         sys.exit(1)
 
-    from Utils.deploy import restore_root_folder_for_game
+    from Utils.deployment import restore_root_folder_for_game
 
     game_root = game.get_game_path()
     profile_root = game.get_profile_root()
 
     last_deployed = game.get_last_deployed_profile()
+    recovery_profile_dir = (
+        profile_root / "profiles" / (last_deployed or "default")
+    )
     if last_deployed:
-        game.set_active_profile_dir(profile_root / "profiles" / last_deployed)
-        # Reload so the last-deployed profile's path overrides drive the
-        # restore.
+        game.set_active_profile_dir(recovery_profile_dir)
+        # Reload so the last-deployed profile's path overrides drive the restore.
         game.load_paths()
         game_root = game.get_game_path()
 
@@ -368,7 +371,51 @@ def cmd_restore(games: dict, key: str):
             game_root=game_root, log_fn=_log,
         )
 
+    from Utils.deployment.pipeline import finalize_filegraph_recovery
+    finalize_filegraph_recovery(
+        game, recovery_profile_dir, log_fn=_log)
+
     _log(f"Restore complete: {game.name}")
+
+
+def cmd_export_filemap(games: dict, key: str, profile: str, *,
+                       output_dir: "str | None" = None,
+                       refresh: bool = False):
+    """Write compatibility maps from one reconciled filegraph generation."""
+    from pathlib import Path
+
+    game = _find_game(games, key)
+    if game is None:
+        print(f"Error: game '{key}' not found.", file=sys.stderr)
+        sys.exit(1)
+    profile_dir = game.get_profile_root() / "profiles" / profile
+    if not profile_dir.is_dir():
+        print(f"Error: profile '{profile}' does not exist at {profile_dir}",
+              file=sys.stderr)
+        sys.exit(1)
+
+    game.set_active_profile_dir(profile_dir)
+    game.load_paths()
+    from Utils.filegraph.service import FileGraphService
+    library = FileGraphService.open_library(game, profile_dir, log_fn=_log)
+    try:
+        status = library.status()
+        if refresh:
+            status = library.refresh(profile_dir)
+        elif not status.ready:
+            raise RuntimeError(
+                "the filegraph catalog is not ready; open this profile in "
+                "Amethyst first or rerun with --refresh")
+        session = library.open_profile(profile_dir)
+        session.reconcile(operation_hint={"kind": "full"})
+        destination = (Path(output_dir) if output_dir else
+                       game.get_effective_filemap_path().parent)
+        normal, root = session.export_legacy_maps(destination)
+    except Exception as exc:
+        print(f"Error: could not export filemap: {exc}", file=sys.stderr)
+        sys.exit(1)
+    _log(f"Exported {normal}")
+    _log(f"Exported {root}")
 
 
 def main():
@@ -410,9 +457,16 @@ def main():
         "restore", help="Restore the game directory (undo last deploy)")
     rp.add_argument("game", help="game_id or display name (case-insensitive)")
 
-    subparsers.add_parser(
-        "clear-credentials",
-        help="Remove stored Nexus Mods API key and OAuth tokens")
+    ep = subparsers.add_parser(
+        "export-filemap", help="Export legacy maps from the filegraph catalog")
+    ep.add_argument("game", help="game_id or display name (case-insensitive)")
+    ep.add_argument("profile", help="Profile name")
+    ep.add_argument("--output-dir", default=None,
+                    help="Destination directory (default: former map directory)")
+    ep.add_argument("--refresh", action="store_true",
+                    help="Refresh raw manifests before exporting")
+
+    subparsers.add_parser("clear-credentials", help="Remove stored Nexus Mods API key and OAuth tokens")
 
     # Launcher wrappers append the vanilla launch command after ``--`` (Steam
     # gets it from %command%; Heroic/Lutris/Faugus append it implicitly).
@@ -429,7 +483,7 @@ def main():
         cmd_clear_credentials()
         return
 
-    from Utils.game_loader import discover_games
+    from Utils.games.discovery import discover_games
     games = discover_games()
 
     if args.command == "list-games":
@@ -444,6 +498,10 @@ def main():
                    sandbox_bridge=args.sandbox_bridge)
     elif args.command == "restore":
         cmd_restore(games, args.game)
+    elif args.command == "export-filemap":
+        cmd_export_filemap(
+            games, args.game, args.profile,
+            output_dir=args.output_dir, refresh=args.refresh)
 
 
 if __name__ == "__main__":

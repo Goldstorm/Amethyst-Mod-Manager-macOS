@@ -1,22 +1,4 @@
-"""Collection install-mode overlays (Qt port of gui/collection_install_dialogs.py).
-
-Shown BEFORE the download/install pipeline to choose how to install a collection:
-
-  * ModeOverlay     - "Create a new profile" (default) vs "Append to existing
-                      profile" (with a profile dropdown + Overwrite/Skip options).
-  * ContinueOverlay - shown when this exact collection+revision is already in a
-                      profile; a single "Continue Install" action.
-
-Borderless in-window overlays via gui_qt/overlay_base.py. All widgets are built
-ONCE with real parents (no per-item unparented widgets that could flash as
-blank top-level windows - see the collection install-overlay fix).
-
-``on_done(result)`` is called with the SAME tuple shape the neutral wiring expects:
-  ("new", None, False, False)
-  ("append", profile_name, overwrite_existing, skip_existing)
-  ("continue", profile_name, False, False)
-  None                                                     - cancelled
-"""
+"""Collection installation mode overlays."""
 
 from __future__ import annotations
 
@@ -27,6 +9,8 @@ from PySide6.QtWidgets import (
 )
 
 from gui_qt.overlay_base import OverlayBase
+from Utils.collections.options import CollectionInstallOptions
+from gui_qt.i18n import profile_display
 from gui_qt.theme_qt import active_palette, _c
 
 
@@ -99,7 +83,13 @@ class ModeOverlay(_BaseModeOverlay):
             v.addWidget(self._append_radio)
             # Append controls (indented) - enabled only when Append is selected.
             self._profile_combo = QComboBox(self._card)
-            self._profile_combo.addItems(self._profiles or [self.tr("(no profiles)")])
+            # Show the translated name, carry the FOLDER name as item data - the
+            # pick is read back with currentData() and used as a profile name.
+            if self._profiles:
+                for _p in self._profiles:
+                    self._profile_combo.addItem(profile_display(_p), _p)
+            else:
+                self._profile_combo.addItem(self.tr("(no profiles)"), None)
             v.addWidget(self._profile_combo)
             self._overwrite_cb = QCheckBox(self.tr("Overwrite existing mods"), self._card)
             v.addWidget(self._overwrite_cb)
@@ -138,17 +128,17 @@ class ModeOverlay(_BaseModeOverlay):
         if self._force_new or self._append_radio is None \
                 or self._new_radio.isChecked() \
                 or not self._append_radio.isChecked():
-            self._finish(("new", None, False, False))
+            self._finish(CollectionInstallOptions())
             return
         # Append
         if not self._profiles:
             return
-        profile = self._profile_combo.currentText()
-        if not profile or profile == "(no profiles)":
+        profile = self._profile_combo.currentData()
+        if not profile:
             return
-        self._finish(("append", profile,
-                      self._overwrite_cb.isChecked(),
-                      self._skip_cb.isChecked()))
+        self._finish(CollectionInstallOptions(
+            mode="append", target=profile, overwrite_existing=self._overwrite_cb.isChecked(),
+            skip_existing=self._skip_cb.isChecked()))
 
 
 class ContinueOverlay(_BaseModeOverlay):
@@ -192,6 +182,6 @@ class ContinueOverlay(_BaseModeOverlay):
         cont.setObjectName("PrimaryButton")
         cont.setCursor(Qt.PointingHandCursor)
         cont.clicked.connect(
-            lambda: self._finish(("continue", self._profile_name, False, False)))
+            lambda: self._finish(CollectionInstallOptions(mode="continue", target=self._profile_name)))
         bar.addWidget(cont)
         v.addLayout(bar)

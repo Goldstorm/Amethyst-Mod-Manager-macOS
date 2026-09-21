@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from os.path import splitext
 from pathlib import Path
 
-from Utils.filemap import (
+from Utils.filegraph.constants import (
     OVERWRITE_NAME, ROOT_FOLDER_NAME,
     CONFLICT_NONE, CONFLICT_WINS, CONFLICT_LOSES, CONFLICT_PARTIAL, CONFLICT_FULL,
 )
@@ -85,6 +85,9 @@ class FilterData:
     modified_mf_mods: set[str] = field(default_factory=set)
     category_names: dict[str, str] = field(default_factory=dict)        # mod -> cat
     author_names: dict[str, str] = field(default_factory=dict)          # mod -> uploader
+    source_locations: dict[str, frozenset[str]] = field(default_factory=dict)
+    nexus_mod_ids: dict[str, int] = field(default_factory=dict)
+    nexus_file_ids: dict[str, int] = field(default_factory=dict)
     # filetype membership is computed lazily from the index per query.
     filetype_counts: dict[str, int] = field(default_factory=dict)
     mod_filetypes: dict[str, set[str]] = field(default_factory=dict)    # mod -> {ext}
@@ -181,6 +184,7 @@ def search_hidden_rows(entries, query: str, data: "FilterData | None" = None) ->
     """Rows to HIDE for the modlist search box.
 
     Plain text matches the mod name (case-insensitive substring, Tk parity).
+    A numeric text query also exactly matches a Nexus mod ID or file ID.
     A whitespace-separated term starting with `!` is a filter token resolved
     against *data* (a live FilterData); `!.dds` = filetype, `!patches` = a
     category, `!update`/`!winning`/… = status keywords. All tokens AND with each
@@ -205,7 +209,18 @@ def search_hidden_rows(entries, query: str, data: "FilterData | None" = None) ->
 
     preds = [_token_predicate(tok, data) for tok in tokens]
     if needle:
-        preds.append(lambda e, _n=needle: _n in e.display_name.lower())
+        if needle.isdecimal():
+            mod_ids = data.nexus_mod_ids
+            file_ids = data.nexus_file_ids
+            preds.append(
+                lambda e, _n=needle: (
+                    _n in e.display_name.lower()
+                    or str(mod_ids.get(e.name, "")) == _n
+                    or str(file_ids.get(e.name, "")) == _n
+                )
+            )
+        else:
+            preds.append(lambda e, _n=needle: _n in e.display_name.lower())
 
     def _match(e) -> bool:
         return all(p(e) for p in preds)
@@ -505,6 +520,25 @@ def compute_hidden_rows(entries, state: dict, data: FilterData) -> set[int]:
             return (auths.get(e.name, "") or "") in exc_auth
         keep = _apply_exclude(entries, keep, _auth_ex)
 
+    # Step: source location. One mod may carry metadata for multiple services;
+    # those sources form a union, while an empty set belongs to "none".
+    sources = data.source_locations
+    inc_src = state.get("sources") or frozenset()
+    exc_src = state.get("sources_exclude") or frozenset()
+
+    def _mod_sources(e):
+        return sources.get(e.name) or frozenset(("none",))
+
+    if inc_src:
+        def _src_in(e):
+            return bool(_mod_sources(e) & inc_src)
+        keep = _apply_include(
+            entries, keep, _src_in,
+            lambda i: _sep_block_has(entries, i, _src_in))
+    if exc_src:
+        keep = _apply_exclude(
+            entries, keep, lambda e: bool(_mod_sources(e) & exc_src))
+
     # Step: filetype include/exclude.
     inc_ft = state.get("filetypes") or frozenset()
     exc_ft = state.get("filetypes_exclude") or frozenset()
@@ -571,85 +605,8 @@ def _any_active(state: dict) -> bool:
         return True
     if state.get("authors") or state.get("authors_exclude"):
         return True
+    if state.get("sources") or state.get("sources_exclude"):
+        return True
     if state.get("filetypes") or state.get("filetypes_exclude"):
         return True
     return False
-
-
-# --------------------------------------------------------------------------
-# Data builders (read the persisted backend indexes - same sources as Tk)
-# --------------------------------------------------------------------------
-def _read_mod_index(staging_parent: Path) -> dict:
-    """{mod: (normal, root)} from modindex.bin, or {}."""
-    idx = staging_parent / "modindex.bin"
-    if not idx.is_file():
-        return {}
-    try:
-        from Utils.filemap import read_mod_index
-        return read_mod_index(idx) or {}
-    except Exception:
-        return {}
-
-
-def build_index_data(staging_parent: Path) -> tuple[dict, dict, set]:
-    """From modindex.bin build (filetype_counts, mod_filetypes, mods_with_pbr).
-    One pass over the index so the panel is cheap to populate."""
-    counts: dict[str, int] = {}
-    mod_ft: dict[str, set[str]] = {}
-    pbr: set[str] = set()
-    for mod, (normal, root) in _read_mod_index(staging_parent).items():
-        exts: set[str] = set()
-        has_pbr = False
-        for rel_key in (*normal, *root):
-            ext = splitext(rel_key)[1]
-            if ext:
-                counts[ext] = counts.get(ext, 0) + 1
-                exts.add(ext)
-            if not has_pbr and rel_key.endswith(".dds"):
-                stem = rel_key[:-4]
-                if any(stem.endswith(suf) for suf in _PGPATCHER_TEX_SUFFIXES):
-                    has_pbr = True
-        if exts:
-            mod_ft[mod] = exts
-        if has_pbr:
-            pbr.add(mod)
-    return counts, mod_ft, pbr
-
-
-def build_mods_with_bsa(staging_parent: Path) -> set[str]:
-    """Mods that contain at least one BSA/BA2 with files (from bsa_index.bin)."""
-    idx = staging_parent / "bsa_index.bin"
-    if not idx.is_file():
-        return set()
-    try:
-        from Utils.bsa_filemap import read_bsa_index
-        index = read_bsa_index(idx) or {}
-    except Exception:
-        return set()
-    return {name for name, archives in index.items()
-            if any(paths for _bsa, _mt, paths in archives)}
-
-
-def build_mods_with_plugins(staging_parent: Path, plugin_exts) -> set[str]:
-    """Mods that win at least one plugin, from filemap.txt."""
-    fm = staging_parent / "filemap.txt"
-    if not fm.is_file():
-        return set()
-    exts = tuple(e.lower() for e in (plugin_exts or ()))
-    if not exts:
-        exts = (".esp", ".esm", ".esl")
-    out: set[str] = set()
-    try:
-        # surrogateescape: filemap.txt carries filesystem-derived relative
-        # paths whose non-UTF-8 bytes decode to surrogate code points - a plain
-        # utf-8 read raises UnicodeDecodeError/EncodeError on them.
-        for line in fm.read_text(encoding="utf-8",
-                                 errors="surrogateescape").splitlines():
-            if "\t" not in line:
-                continue
-            rel_key, mod = line.split("\t", 1)
-            if rel_key.rsplit("/", 1)[-1].lower().endswith(exts):
-                out.add(mod)
-    except Exception:
-        return set()
-    return out

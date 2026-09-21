@@ -6,9 +6,12 @@ TkStyleHeader owns column resizing; column state persists via column_state.
 
 from __future__ import annotations
 
+from time import perf_counter
+
 # Crash-proof diagnostic prints (Flatpak stdout can raise BrokenPipeError and
 # kill worker threads). See Utils.app_log.safe_print.
 from Utils.app_log import safe_print as print  # noqa: A004
+from Utils.diagnostics import performance as perftrace
 
 from PySide6.QtCore import Qt, QTimer, QRect, QPoint, QCoreApplication, QEvent
 from PySide6.QtGui import QPainter, QColor, QPen, QAction
@@ -20,11 +23,13 @@ from PySide6.QtWidgets import (
 from gui_qt.modlist_model import (
     ModListModel, COLUMNS, COL_NAME, COL_CATEGORY, COL_PRIORITY, COL_FLAGS,
     COL_CONFLICTS, COL_INSTALLED, COL_VERSION, COL_AUTHOR, COL_SIZE,
-    HighlightRole,
+    COL_NEXUS_MOD_ID, COL_NEXUS_FILE_ID, COL_CONTENT,
+    FlagsRole, HighlightRole,
 )
-from gui_qt.modlist_delegate import ModRowDelegate, SEP_H
+from gui_qt.modlist_delegate import ModRowDelegate, ROW_H, SEP_H
 from gui_qt import column_state
 from gui_qt.modlist_header import TkStyleHeader
+from gui_qt.shortcuts import binding_matches_mouse
 from gui_qt.theme_qt import bind_theme, _c
 
 
@@ -46,11 +51,13 @@ class _StayOpenMenu(QMenu):
 COL_DEFAULTS = {
     COL_CATEGORY: 120, COL_FLAGS: 70, COL_CONFLICTS: 95, COL_INSTALLED: 100,
     COL_VERSION: 90, COL_AUTHOR: 110, COL_PRIORITY: 75, COL_SIZE: 85,
+    COL_NEXUS_MOD_ID: 105, COL_NEXUS_FILE_ID: 105, COL_CONTENT: 200,
 }
 COL_MINS = {
     COL_NAME: 120, COL_CATEGORY: 90, COL_FLAGS: 60, COL_CONFLICTS: 90,
     COL_INSTALLED: 90, COL_VERSION: 80, COL_AUTHOR: 80, COL_PRIORITY: 70,
     COL_SIZE: 70,
+    COL_NEXUS_MOD_ID: 90, COL_NEXUS_FILE_ID: 90, COL_CONTENT: 90,
 }
 NAME_MIN = COL_MINS[COL_NAME]
 
@@ -58,10 +65,32 @@ NAME_MIN = COL_MINS[COL_NAME]
 # utf-8). Dropping them on the modlist installs at the drop position.
 ARCHIVE_DROP_MIME = "application/x-amethyst-archive-paths"
 
-# Columns shown by default on a fresh INI (no persisted state). Tk parity:
-# Category, Installed, Size are hidden until the user enables them; Author
-# (Nexus uploader) is likewise opt-in.
-_FIRST_RUN_HIDDEN = {COL_CATEGORY, COL_INSTALLED, COL_AUTHOR, COL_SIZE}
+# Columns hidden by default on a fresh INI. Category, Installed, Size, Author,
+# and the Nexus identity columns remain opt-in.
+_FIRST_RUN_HIDDEN = {
+    COL_CATEGORY, COL_INSTALLED, COL_AUTHOR, COL_SIZE,
+    COL_NEXUS_MOD_ID, COL_NEXUS_FILE_ID, COL_CONTENT,
+}
+
+# Order the column show/hide menu lists its entries in. COLUMNS itself is
+# append-only (its indices are the persistence keys), so a new column always
+# lands last there - this decouples how the menu reads from how it's stored.
+# Any column missing here falls back to its COLUMNS position.
+_COL_MENU_ORDER = (
+    COL_CATEGORY, COL_FLAGS, COL_CONFLICTS, COL_INSTALLED, COL_VERSION,
+    COL_AUTHOR, COL_PRIORITY, COL_SIZE, COL_CONTENT,
+    COL_NEXUS_MOD_ID, COL_NEXUS_FILE_ID,
+)
+
+# Show the column list as one scrollable checklist past this many entries, so
+# the quick filters and "Clear all filters" below it stay on screen (same trick
+# the game selector uses once its game list outgrows the menu).
+_COL_SCROLL_AFTER = 7
+
+# Same for the status filters, which are all listed rather than half-hidden in
+# a submenu. Separate knob: the two lists sit in one menu, so their heights are
+# tuned against each other, not shared.
+_FILTER_SCROLL_AFTER = 7
 
 # Header column → sort key (Tk _DATA_COL_SORT_KEYS; keys persisted by name via
 # column_state's sort_col, which stores the COLUMNS display name).
@@ -69,7 +98,8 @@ _COL_TO_SORTKEY = {
     COL_NAME: "name", COL_CATEGORY: "category", COL_FLAGS: "flags",
     COL_CONFLICTS: "conflicts", COL_INSTALLED: "installed",
     COL_VERSION: "version", COL_AUTHOR: "author", COL_PRIORITY: "priority",
-    COL_SIZE: "size",
+    COL_SIZE: "size", COL_NEXUS_MOD_ID: "nexus_mod_id",
+    COL_NEXUS_FILE_ID: "nexus_file_id", COL_CONTENT: "content",
 }
 
 
@@ -80,13 +110,18 @@ class ModListView(QTreeView):
         self.setItemDelegate(ModRowDelegate(self))
 
         self.setRootIsDecorated(False)        # flat list, not a tree
-        self.setUniformRowHeights(False)      # separators are taller
+        # Use Qt's large-list fast path while both delegate row sizes match.
+        self.setUniformRowHeights(ROW_H == SEP_H)
         self.setAlternatingRowColors(False)   # delegate paints zebra itself
         self.setMouseTracking(True)
         self.setExpandsOnDoubleClick(False)
         self.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self._perf_resize_paint_pending = False
+        # (row, column) of the clickable Version/Priority number under the
+        # cursor, so the delegate can tint that one cell's text like a link.
+        self._hover_action_cell: tuple[int, int] | None = None
 
         # Custom drag-reorder (NOT Qt InternalMove): we drive the reorder by
         # hand so separators (spanned rows) drag correctly and autoscroll near
@@ -105,12 +140,16 @@ class ModListView(QTreeView):
         self._drag_active = False
         self._press_row = -1
         self._press_pos = None
+        self._separator_control_press: tuple[int, str] | None = None
         # Shift-click range locking: remember the last separator row whose lock
         # box was clicked and whether that click locked (True) or unlocked it,
         # so a following shift-click applies the same action across the range.
         self._lock_anchor_row = -1
         self._lock_range_locking = True
         self._drop_slot = -1              # insertion row for the drop indicator
+        self._drop_group = None
+        self._drop_group_end = None
+        self._group_end_markers: dict[int, str] = {}
         self._DRAG_THRESHOLD = 6          # px before a press becomes a drag
 
         # Continuous autoscroll while dragging near an edge (Tk cadence).
@@ -134,6 +173,15 @@ class ModListView(QTreeView):
         self._filter_hidden: set[int] = set()
         self._search_hidden: set[int] = set()
         self._searching: bool = False
+        # Conflict results normally arrive as a full snapshot first, but a
+        # restored Filegraph profile can legitimately publish an incremental
+        # delta as its first UI update.  Keep the four partner maps valid from
+        # construction so that path does not abort the rest of snapshot
+        # publication (Plugins, Filters, Data, and FOMOD dependency state).
+        self._overrides: dict[str, set[str]] = {}
+        self._overridden_by: dict[str, set[str]] = {}
+        self._bsa_overrides: dict[str, set[str]] = {}
+        self._bsa_overridden_by: dict[str, set[str]] = {}
         # Last hidden-row set actually applied via setRowHidden - lets
         # apply_collapse touch only the delta. Row indices go stale on any
         # structural change, so drop the cache there.
@@ -144,6 +192,10 @@ class ModListView(QTreeView):
         for sig in (model.modelReset, model.rowsInserted, model.rowsRemoved,
                     model.rowsMoved, model.layoutChanged):
             sig.connect(_drop_applied)
+        for sig in (model.modelAboutToBeReset, model.layoutAboutToBeChanged,
+                    model.rowsAboutToBeInserted, model.rowsAboutToBeRemoved,
+                    model.rowsAboutToBeMoved):
+            sig.connect(self._end_drag)
         # A sort rebuild reorders rows in place (layoutChanged) - separator
         # spanning + collapse hiding are row-indexed, so re-apply both.
         # Connected AFTER _drop_applied so the hidden-set cache is clear first.
@@ -153,6 +205,7 @@ class ModListView(QTreeView):
         # layoutChanged - re-apply spanning so a new separator's lock box jumps
         # to the far right immediately instead of only after the next move.
         model.rowsInserted.connect(self._on_model_layout_changed)
+        model.groups_changed.connect(self._on_model_layout_changed)
         self.doubleClicked.connect(self._on_double_click)
 
         self._restoring = True
@@ -175,7 +228,7 @@ class ModListView(QTreeView):
         # rows stays pinned to the viewport top while its group scrolls under
         # it. Pixel-scrolling blits the viewport, which would smear the pinned
         # band - repaint the top strip on every scroll step.
-        self._sticky_press: int | None = None
+        self._sticky_press: tuple[int, str | None] | None = None
         sb = self.verticalScrollBar()
         self._last_vscroll = sb.value()
         sb.valueChanged.connect(self._on_vscroll)
@@ -186,6 +239,11 @@ class ModListView(QTreeView):
         install_marker_strip(self, HighlightRole)
         self._reposition_marker_strip()
         bind_theme(self, roles={"TEXT_MAIN"})
+
+    def set_hide_endorsed_flag(self, hidden: bool) -> None:
+        delegate = self.itemDelegate()
+        if isinstance(delegate, ModRowDelegate):
+            delegate.set_hide_endorsed_flag(hidden)
 
     def refresh_theme(self, palette: dict) -> None:
         btn = getattr(self, "_col_menu_btn", None)
@@ -205,6 +263,7 @@ class ModListView(QTreeView):
         spanning + hidden-row state is row-indexed and must be re-applied."""
         self._apply_separator_spanning()
         self.apply_collapse()
+        self.viewport().update()
 
     # ---- column-sort header clicks -----------------------------------------
     def _on_header_sort_clicked(self, logical: int):
@@ -307,6 +366,7 @@ class ModListView(QTreeView):
         # current tri-state so the menu shows the right check marks.
         self.on_quick_filter = None
         self.quick_filter_state = None
+        self.quick_filter_enabled = None
         # filters_active() -> bool and on_clear_filters() back the menu's
         # "Clear all filters" entry (both wired by the window).
         self.filters_active = None
@@ -340,22 +400,58 @@ class ModListView(QTreeView):
         a.toggled.connect(lambda checked, k=key: self._on_quick_filter(k, checked))
         menu.addAction(a)
 
-    def _show_column_menu(self):
-        menu = _StayOpenMenu(self)
-        for col, name in enumerate(COLUMNS):
-            if col == COL_NAME:
-                continue   # Name is always shown
+    def _column_menu_entries(self):
+        """(col, translated label, visible) for every toggleable column, in
+        _COL_MENU_ORDER. Name is omitted - it's always shown."""
+        rest = [c for c in range(len(COLUMNS))
+                if c != COL_NAME and c not in _COL_MENU_ORDER]
+        out = []
+        for col in list(_COL_MENU_ORDER) + rest:
+            if col == COL_NAME or col >= len(COLUMNS):
+                continue
             # Same translated label as the header (registered under ModListModel).
-            a = QAction(QCoreApplication.translate("ModListModel", name), menu)
-            a.setCheckable(True)
-            a.setChecked(not self.isColumnHidden(col))
-            a.toggled.connect(lambda checked, c=col: self._set_column_visible(c, checked))
-            menu.addAction(a)
-        # Quick modlist filters - a faster way to apply the "By status" filters
-        # from the Filters panel. These drive the same filter state, so the
-        # panel checkboxes stay in sync (the window wires on_quick_filter).
-        menu.addSeparator()
-        for key, label in (
+            out.append((col,
+                        QCoreApplication.translate("ModListModel", COLUMNS[col]),
+                        not self.isColumnHidden(col)))
+        return out
+
+    def _fill_column_checklist(self, menu, entries):
+        """Put the column toggles in one scrollable checklist so the filters
+        below them stay reachable. Reuses the filter menu's checklist widget -
+        same look, same click-anywhere-toggles behaviour, menu stays open."""
+        from PySide6.QtWidgets import QWidgetAction
+        from gui_qt.filter_menu_button import _CheckList, _checklist_qss
+
+        lst = _CheckList(menu, lambda col, on: self._set_column_visible(col, on))
+        lst.setStyleSheet(_checklist_qss())
+        for col, label, visible in entries:
+            lst.add_entry(col, label, visible)
+        row_h = lst.sizeHintForRow(0) or 22
+        lst.setFixedHeight(row_h * _COL_SCROLL_AFTER + 4)
+        sbar_w = lst.verticalScrollBar().sizeHint().width()
+        lst.setMinimumWidth(lst.sizeHintForColumn(0) + sbar_w + 40)
+        wa = QWidgetAction(menu)
+        wa.setDefaultWidget(lst)
+        menu.addAction(wa)
+
+    def _status_filter_entries(self):
+        """(key, translated label, active) for every "By status" filter.
+
+        The four most-used ones lead so the common case is reachable without
+        scrolling; the rest follow in STATUS_FILTERS order. Every filter is
+        listed - no submenu - because a scrollable list can hold them all.
+        """
+        from gui_qt.modlist_filter import STATUS_FILTERS
+        get = getattr(self, "quick_filter_state", None)
+        enabled = getattr(self, "quick_filter_enabled", None)
+
+        def _usable(key):
+            # A filter the active game can't answer (BSA archives on a game with
+            # no archive formats) would just hide every row - don't offer it.
+            return not callable(enabled) or enabled(key)
+        # Short labels for the promoted four (the panel's wordier names read
+        # badly at the top of a menu).
+        promoted = (
             ("filter_show_enabled", self.tr("Enabled")),
             ("filter_show_disabled", self.tr("Disabled")),
             ("filter_hide_separators", self.tr("Hide separators")),
@@ -363,35 +459,116 @@ class ModListView(QTreeView):
             # label) - reuse that entry rather than minting a ModListView copy.
             ("filter_has_updates",
              QCoreApplication.translate("FilterSidePanel", "Mods with updates")),
-        ):
-            self._add_quick_filter_action(menu, key, label)
-        # The remaining "By status" filters live in a submenu so the top level
-        # stays short. Same include-mode semantics as the quick filters above.
-        from gui_qt.modlist_filter import STATUS_FILTERS
-        _QUICK = {"filter_show_enabled", "filter_show_disabled",
-                  "filter_hide_separators", "filter_has_updates"}
-        more = _StayOpenMenu(self.tr("More status filters"), menu)
+        )
+        lead = {key for key, _label in promoted}
+        out = [(key, label, callable(get) and get(key) == 1)
+               for key, label in promoted if _usable(key)]
         for key, label in STATUS_FILTERS:
-            if key in _QUICK:
+            if key in lead or not _usable(key):
                 continue
             # STATUS_FILTERS labels are registered for translation under the
             # FilterSidePanel context (see filter_panel._TR_MARKERS).
-            self._add_quick_filter_action(
-                more, key, QCoreApplication.translate("FilterSidePanel", label))
-        menu.addMenu(more)
+            out.append((key,
+                        QCoreApplication.translate("FilterSidePanel", label),
+                        callable(get) and get(key) == 1))
+        return out
+
+    def _fill_filter_checklist(self, menu, entries):
+        """Put every status filter in one scrollable checklist, so they're all
+        visible without a submenu. Same widget as the column list above."""
+        from PySide6.QtWidgets import QWidgetAction
+        from gui_qt.filter_menu_button import _CheckList, _checklist_qss
+
+        lst = _CheckList(menu, lambda key, on: self._on_quick_filter(key, on))
+        lst.setStyleSheet(_checklist_qss())
+        for key, label, active in entries:
+            lst.add_entry(key, label, active)
+        # Kept so "Clear all filters" can untick the rows the user is still
+        # looking at - the menu doesn't close, so nothing else would.
+        self._filter_check_list = lst
+        row_h = lst.sizeHintForRow(0) or 22
+        lst.setFixedHeight(row_h * _FILTER_SCROLL_AFTER + 4)
+        sbar_w = lst.verticalScrollBar().sizeHint().width()
+        lst.setMinimumWidth(lst.sizeHintForColumn(0) + sbar_w + 40)
+        wa = QWidgetAction(menu)
+        wa.setDefaultWidget(lst)
+        menu.addAction(wa)
+
+    def _show_column_menu(self):
+        menu = _StayOpenMenu(self)
+        entries = self._column_menu_entries()
+        if len(entries) > _COL_SCROLL_AFTER:
+            self._fill_column_checklist(menu, entries)
+        else:
+            for col, label, visible in entries:
+                a = QAction(label, menu)
+                a.setCheckable(True)
+                a.setChecked(visible)
+                a.toggled.connect(
+                    lambda checked, c=col: self._set_column_visible(c, checked))
+                menu.addAction(a)
+        # Quick modlist filters - a faster way to apply the "By status" filters
+        # from the Filters panel. These drive the same filter state, so the
+        # panel checkboxes stay in sync (the window wires on_quick_filter).
+        menu.addSeparator()
+        entries = self._status_filter_entries()
+        if len(entries) > _FILTER_SCROLL_AFTER:
+            self._fill_filter_checklist(menu, entries)
+        else:
+            for key, label, _on in entries:
+                self._add_quick_filter_action(menu, key, label)
         # Same escape hatch the Filters panel header offers - reachable without
         # opening the panel. Greyed while nothing is filtered.
+        #
+        # The menu stays open across toggles, so its enabled state can't be
+        # decided once at build time: ticking a filter in the list above has to
+        # light it up immediately. _sync_clear_action re-reads filters_active()
+        # after every toggle (and clearing greys it back out).
         clear = QAction(self.tr("Clear all filters"), menu)
-        clear.setEnabled(callable(self.filters_active) and self.filters_active())
         clear.triggered.connect(self._on_clear_filters)
         menu.addAction(clear)
+        self._clear_action = clear
+        self._sync_clear_action()
         btn = self._col_menu_btn
         menu.exec(btn.mapToGlobal(btn.rect().bottomLeft()))
+        # The menu and its widgets die with exec() - drop the references so a
+        # later call can't touch deleted C++ objects.
+        self._clear_action = None
+        self._filter_check_list = None
+
+    def _sync_clear_action(self):
+        """Enable "Clear all filters" iff something is filtered right now.
+
+        Called after every in-menu toggle - the menu outlives each change, so a
+        build-time snapshot would leave the entry greyed out until reopened."""
+        act = getattr(self, "_clear_action", None)
+        if act is None:
+            return
+        try:
+            act.setEnabled(callable(self.filters_active) and self.filters_active())
+        except RuntimeError:
+            self._clear_action = None   # menu (and its actions) already gone
 
     def _on_clear_filters(self):
         cb = getattr(self, "on_clear_filters", None)
         if callable(cb):
             cb()
+        self._reset_filter_checks()
+        self._sync_clear_action()
+
+    def _reset_filter_checks(self):
+        """Untick every row of the open status-filter checklist.
+
+        Clearing happens while the menu is still on screen, so the rows would
+        otherwise keep showing ticks for filters that are no longer applied."""
+        lst = getattr(self, "_filter_check_list", None)
+        if lst is None:
+            return
+        try:
+            for row in range(lst.count()):
+                lst.item(row).setCheckState(Qt.Unchecked)
+        except RuntimeError:
+            self._filter_check_list = None   # menu already destroyed
 
     def _on_quick_filter(self, key: str, on: bool):
         # State 1 = include-mode (show only matching); 0 = off. Hide-separators
@@ -399,6 +576,10 @@ class ModListView(QTreeView):
         cb = getattr(self, "on_quick_filter", None)
         if callable(cb):
             cb(key, 1 if on else 0)
+        # The menu is still open - refresh "Clear all filters" so it becomes
+        # usable the moment a filter is applied (and greys out again on the
+        # last one being cleared).
+        self._sync_clear_action()
 
     def _set_column_visible(self, col: int, visible: bool):
         self.setColumnHidden(col, not visible)
@@ -412,6 +593,11 @@ class ModListView(QTreeView):
             if (col == COL_SIZE and not self.model()._sizes
                     and callable(getattr(self, "on_sizes_requested", None))):
                 self.on_sizes_requested()
+            # Same deal for Content: the badge scan only runs once the user
+            # actually reveals the column.
+            if (col == COL_CONTENT and not self.model()._content
+                    and callable(getattr(self, "on_content_requested", None))):
+                self.on_content_requested()
         self._fit_name_to_width()   # Name re-absorbs/releases the freed width
         self.viewport().update()
         self._schedule_save()
@@ -438,7 +624,7 @@ class ModListView(QTreeView):
         collapsed, locks, colors, deploy_paths = set(), {}, {}, {}
         if self.profile_dir is not None:
             try:
-                from Utils.profile_state import (
+                from Utils.profiles.state import (
                     read_collapsed_seps, read_separator_locks,
                     read_separator_colors, read_separator_deploy_paths)
                 collapsed = read_collapsed_seps(self.profile_dir)
@@ -466,11 +652,15 @@ class ModListView(QTreeView):
         """
         flt = self._filter_hidden
         srch = self._search_hidden
+        query_hidden = set(flt | srch if self._searching else flt)
+        for leader, rows in self.model()._group_rows().items():
+            if any(r not in query_hidden for r in rows):
+                query_hidden.discard(rows[0])
         if self._searching:
             # Search drives visibility; collapse is ignored so matches surface.
-            hidden = srch | flt
+            hidden = query_hidden
         else:
-            hidden = self.model().hidden_rows() | flt
+            hidden = self.model().hidden_rows() | query_hidden
         # Only touch rows whose visibility actually changes - setRowHidden is
         # per-row layout work, and this runs per search keystroke.
         prev = getattr(self, "_applied_hidden", None)
@@ -488,6 +678,10 @@ class ModListView(QTreeView):
         finally:
             self.setUpdatesEnabled(True)
         self._applied_hidden = hidden
+        self._sync_group_end_markers()
+        marker = getattr(self, "_marker_strip", None)
+        if marker is not None:
+            marker.invalidate_geometry()
 
     def set_filter_hidden(self, rows: set[int]) -> None:
         """Set the rows the filter panel wants hidden, then reapply visibility.
@@ -512,25 +706,23 @@ class ModListView(QTreeView):
     def _on_double_click(self, index):
         if not index.isValid():
             return
-        e = self.model().entry(index.row())
-        from gui_qt.modlist_model import _PINNED_NAMES
-        # A real (user) separator toggles collapse; the synthetic pinned
-        # Overwrite / Root_Folder separators open their folder like a mod.
-        if e.is_separator and e.name not in _PINNED_NAMES:
-            self._toggle_collapse_row(index.row())
+        # Real separators collapse/expand instead (mouseDoubleClickEvent runs
+        # that and never emits this signal). The synthetic pinned Overwrite /
+        # Root_Folder separators open their folder like a mod.
+        if self._is_real_separator(index.row()):
             return
         # Ignore double-clicks that land on the checkbox (the delegate toggles
         # enable there on single click; a double there is not an open request).
         if index.column() == COL_NAME:
             rect = self.visualRect(index)
-            box = QRect(rect.left() + 6, rect.top(), 26, rect.height())
+            box = self.itemDelegate()._checkbox_hit_rect(rect, index)
             pos = self.mapFromGlobal(self.cursor().pos())
             if box.contains(pos):
                 return
         folder = self._resolve_entry_folder(index.row())
         if folder is not None:
             try:
-                from Utils.xdg import xdg_open
+                from Utils.environment.xdg import xdg_open
                 from gui_qt.modlist_menu import _notify
                 # Surface opener failures - the whole chain can fail on the
                 # host side (no file-manager association) and would otherwise
@@ -567,6 +759,10 @@ class ModListView(QTreeView):
         return None
 
     def _toggle_collapse_row(self, row):
+        if self.model().is_group_leader(self.model().entry(row).name):
+            self.model().toggle_group(self.model().entry(row).name)
+            self.viewport().update()
+            return
         self.model().toggle_collapse(row)
         self.apply_collapse()
         self._save_separator_state()
@@ -609,7 +805,7 @@ class ModListView(QTreeView):
         if self.profile_dir is None:
             return
         try:
-            from Utils.profile_state import (
+            from Utils.profiles.state import (
                 write_collapsed_seps, write_separator_locks)
             m = self.model()
             write_collapsed_seps(self.profile_dir, m._collapsed)
@@ -689,18 +885,70 @@ class ModListView(QTreeView):
         self.viewport().update(0, 0, self.viewport().width(),
                                SEP_H + delta + 1)
 
-    def _sticky_click(self, row: int, band: QRect, pos: QPoint, shift: bool = False):
-        """A click on the pinned band acts like a click on the real separator
-        row: the lock box toggles the lock, anywhere else toggles collapse
-        (then scrolls the separator into view so the result is visible)."""
+    def _is_real_separator(self, row: int) -> bool:
+        """True for a user separator - the synthetic pinned ones don't count."""
+        m = self.model()
+        if not (0 <= row < m.rowCount()):
+            return False
+        from gui_qt.modlist_model import _PINNED_NAMES
+        e = m.entry(row)
+        return e.is_separator and e.name not in _PINNED_NAMES
+
+    def _separator_control_at(self, row: int, pos: QPoint,
+                              row_rect: QRect | None = None) -> str | None:
+        m = self.model()
+        if 0 <= row < m.rowCount() and m.is_group_leader(m.entry(row).name):
+            index = m.index(row, COL_NAME)
+            rect = self.visualRect(index)
+            if self.itemDelegate()._group_arrow_rect(rect).adjusted(-3, 0, 3, 0).contains(pos):
+                return "collapse"
+            return None
+        if not self._is_real_separator(row):
+            return None
+        if row_rect is None:
+            item_rect = self.visualRect(m.index(row, COL_NAME))
+            row_rect = QRect(0, item_rect.top(), self.viewport().width(),
+                             item_rect.height())
         delegate = self.itemDelegate()
-        lock = getattr(delegate, "_lock_rect", None)
-        if lock is not None and lock(band).contains(pos):
-            self._lock_box_click(row, shift)
-            return
-        self._toggle_collapse_row(row)
-        self.scrollTo(self.model().index(row, 0),
-                      QAbstractItemView.PositionAtTop)
+        if delegate._lock_rect(row_rect).contains(pos):
+            return "lock"
+        if delegate._arrow_hit_rect(row_rect).contains(pos):
+            return "collapse"
+        return None
+
+    def _select_separator_row(self, row: int, modifiers) -> None:
+        from PySide6.QtCore import QItemSelection, QItemSelectionModel
+
+        m = self.model()
+        sm = self.selectionModel()
+        idx = m.index(row, COL_NAME)
+        current = sm.currentIndex()
+        rows = QItemSelectionModel.Rows
+        if modifiers & Qt.ShiftModifier and current.isValid():
+            start, end = sorted((current.row(), row))
+            selection = QItemSelection(m.index(start, COL_NAME),
+                                       m.index(end, COL_NAME))
+            command = (QItemSelectionModel.Select
+                       if modifiers & Qt.ControlModifier
+                       else QItemSelectionModel.ClearAndSelect)
+            sm.select(selection, command | rows)
+        else:
+            command = (QItemSelectionModel.Toggle
+                       if modifiers & Qt.ControlModifier
+                       else QItemSelectionModel.ClearAndSelect)
+            sm.select(idx, command | rows)
+        sm.setCurrentIndex(idx, QItemSelectionModel.NoUpdate)
+
+    def _sticky_click(self, row: int, control: str | None, modifiers):
+        """Apply a click to the separator represented by the pinned band."""
+        if control == "lock":
+            self._lock_box_click(row, bool(modifiers & Qt.ShiftModifier))
+        elif control == "collapse":
+            self._toggle_collapse_row(row)
+            self.scrollTo(self.model().index(row, 0),
+                          QAbstractItemView.PositionAtTop)
+        else:
+            self._select_separator_row(row, modifiers)
 
     # ---- fill width: Name absorbs leftover on window resize ---------------
     def showEvent(self, event):
@@ -709,11 +957,46 @@ class ModListView(QTreeView):
         self._position_column_menu_button()
 
     def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self._fit_name_to_width()
-        self._position_column_menu_button()
-        if hasattr(self, "_marker_strip"):
-            self._reposition_marker_strip()
+        tracing = perftrace.is_enabled()
+        trace_started = perf_counter() if tracing else 0.0
+        viewport = self.viewport()
+        coalesce_paint = viewport.updatesEnabled()
+        if coalesce_paint:
+            viewport.setUpdatesEnabled(False)
+        try:
+            super().resizeEvent(event)
+            qt_finished = perf_counter() if tracing else 0.0
+            h = self.header()
+            widths_before = tuple(self.columnWidth(c)
+                                  for c in range(len(COLUMNS)))
+            # QTreeView otherwise queues another viewport update for the
+            # automatic section resize; the re-enable below already repaints it.
+            signals_were_blocked = h.blockSignals(True)
+            try:
+                self._fit_name_to_width()
+            finally:
+                h.blockSignals(signals_were_blocked)
+            if (widths_before != tuple(self.columnWidth(c)
+                                       for c in range(len(COLUMNS)))
+                    and hasattr(self, "_save_timer")):
+                self._schedule_save()
+            columns_finished = perf_counter() if tracing else 0.0
+            self._position_column_menu_button()
+            if hasattr(self, "_marker_strip"):
+                self._reposition_marker_strip()
+        finally:
+            if coalesce_paint:
+                if tracing:
+                    self._perf_resize_paint_pending = True
+                viewport.setUpdatesEnabled(True)
+        if tracing:
+            finished = perf_counter()
+            perftrace.mark("ui.resize.modlist.qt", qt_finished - trace_started)
+            perftrace.mark("ui.resize.modlist.columns",
+                           columns_finished - qt_finished)
+            perftrace.mark("ui.resize.modlist.overlays",
+                           finished - columns_finished)
+            perftrace.mark("ui.resize.modlist.total", finished - trace_started)
 
     def _fit_name_to_width(self):
         """Keep the table exactly filling the viewport on window resize.
@@ -762,6 +1045,26 @@ class ModListView(QTreeView):
         # Re-apply any active highlight against the fresh maps.
         self._refresh_self_highlights()
 
+    def apply_conflict_map_delta(
+        self, overrides, overridden_by, bsa_overrides, bsa_overridden_by,
+        changed_mods,
+    ) -> None:
+        """Copy partner sets only for mods named by a resolution delta."""
+        names = set(changed_mods or ())
+        for current, source in (
+            (self._overrides, overrides),
+            (self._overridden_by, overridden_by),
+            (self._bsa_overrides, bsa_overrides),
+            (self._bsa_overridden_by, bsa_overridden_by),
+        ):
+            for name in names:
+                partners = (source or {}).get(name)
+                if partners:
+                    current[name] = set(partners)
+                else:
+                    current.pop(name, None)
+        self._refresh_self_highlights()
+
     def selectAll(self) -> None:
         """Ctrl+A → select every *visible*, non-separator mod row. Qt's default
         selects the whole model (hidden rows + separators too), which is wrong
@@ -804,6 +1107,14 @@ class ModListView(QTreeView):
     def conflict_partners(self, names: set[str]) -> tuple[set[str], set[str]]:
         """For a set of mod names, return (higher, lower): the mods they beat
         (loose+BSA) and the mods that beat them, excluding the selection."""
+        # Conflict maps are replaced asynchronously after a toggle.  Filter
+        # both anchors and partners through the synchronous modlist state so a
+        # selected disabled mod cannot keep stale highlights during that gap.
+        # Overwrite is always active even though it is represented by a pinned
+        # separator rather than an enabled ModEntry.
+        from Utils.filegraph.constants import OVERWRITE_NAME
+        active = self.model().enabled_mod_names() | {OVERWRITE_NAME}
+        names = set(names) & active
         ov = getattr(self, "_overrides", {})
         ob = getattr(self, "_overridden_by", {})
         bov = getattr(self, "_bsa_overrides", {})
@@ -815,11 +1126,15 @@ class ModListView(QTreeView):
             lower |= ob.get(n, set()) | bob.get(n, set())
         higher -= names
         lower -= names
+        higher &= active
+        lower &= active
         return higher, lower
 
     def bsa_conflict_partners(self, names: set[str]) -> tuple[set[str], set[str]]:
         """Like conflict_partners but BSA-only - used to colour plugins (Tk only
         tints plugins for BSA conflicts, never loose-file ones)."""
+        active = self.model().enabled_mod_names()
+        names = set(names) & active
         bov = getattr(self, "_bsa_overrides", {})
         bob = getattr(self, "_bsa_overridden_by", {})
         higher: set[str] = set()
@@ -829,6 +1144,8 @@ class ModListView(QTreeView):
             lower |= bob.get(n, set())
         higher -= names
         lower -= names
+        higher &= active
+        lower &= active
         return higher, lower
 
     def _refresh_self_highlights(self):
@@ -858,6 +1175,52 @@ class ModListView(QTreeView):
                     break
 
     # ---- custom drag-reorder ---------------------------------------------
+    def _sync_group_end_markers(self):
+        markers = {}
+        if self._drag_active:
+            for leader, rows in self.model()._group_rows().items():
+                last = next((r for r in reversed(rows)
+                             if not self.isRowHidden(r, self.rootIndex())), None)
+                if last is not None:
+                    markers[last] = leader
+        if markers == self._group_end_markers:
+            return
+        anchor = self.indexAt(QPoint(0, 0))
+        top = self.visualRect(anchor).top() if anchor.isValid() else 0
+        self._group_end_markers = markers
+        self.setUniformRowHeights(not markers and ROW_H == SEP_H)
+        self.doItemsLayout()
+        if anchor.isValid():
+            bar = self.verticalScrollBar()
+            bar.setValue(bar.value() + self.visualRect(anchor).top() - top)
+        self.viewport().update()
+
+    def _group_end_rect(self, row):
+        rect = self.visualRect(self.model().index(row, COL_NAME))
+        if rect.isEmpty():
+            return QRect()
+        return QRect(0, rect.bottom() - SEP_H + 1, self.viewport().width(), SEP_H)
+
+    def _end_drag(self, *_args):
+        if not self._drag_active:
+            return
+        self._scroll_timer.stop()
+        self._drag_active = False
+        self._drag_rows = []
+        self._drop_slot = -1
+        self._drop_group = None
+        self._drop_group_end = None
+        self._press_row = -1
+        self._press_pos = None
+        self._separator_control_press = None
+        self._sync_group_end_markers()
+        self.unsetCursor()
+        self.viewport().update()
+
+    def hideEvent(self, event):
+        self._end_drag()
+        super().hideEvent(event)
+
     def _visible_rows(self) -> list[int]:
         """Rows currently visible (not hidden under a collapsed separator)."""
         m = self.model()
@@ -889,8 +1252,40 @@ class ModListView(QTreeView):
             carry = [r for r in sel
                      if m.entry(r).name not in _PINNED_NAMES
                      and not (not m.entry(r).is_separator and m.entry(r).locked)]
-            return carry or [row]
-        return [row]
+            return m.expand_group_selection(carry or [row])
+        return m.expand_group_selection([row])
+
+    def _open_source_page(self, row: int) -> None:
+        if not 0 <= row < self.model().rowCount():
+            return
+        entry = self.model().entry(row)
+        if entry.is_separator:
+            return
+        from gui_qt.modlist_menu import (
+            _is_thunderstore_mod, _modio_url, _open_on_modio,
+            _open_on_nexus, _open_on_thunderstore,
+        )
+        if _is_thunderstore_mod(self, entry.name):
+            _open_on_thunderstore(self, entry.name)
+        elif _modio_url(self, entry.name):
+            _open_on_modio(self, entry.name)
+        else:
+            _open_on_nexus(self, entry.name)
+
+    def keyPressEvent(self, event):
+        if self._drag_active and event.key() == Qt.Key_Escape:
+            self._end_drag()
+            event.accept()
+            return
+        # Ctrl+Up/Down extends the selection like Shift+Up/Down does. Qt's
+        # default only walks the current index, which is invisible here.
+        if event.modifiers() & Qt.ControlModifier and not (
+                event.modifiers() & Qt.ShiftModifier):
+            from gui_qt.shortcuts import ctrl_arrow_extend
+            if ctrl_arrow_extend(self, event.key()):
+                event.accept()
+                return
+        super().keyPressEvent(event)
 
     def mousePressEvent(self, event):
         # A press on the sticky separator band must not reach the row painted
@@ -899,39 +1294,31 @@ class ModListView(QTreeView):
             info = self._sticky_sep_info()
             if info is not None and info[1].contains(event.position().toPoint()):
                 if event.button() == Qt.LeftButton:
-                    self._sticky_press = info[0]
+                    control = self._separator_control_at(
+                        info[0], event.position().toPoint(), info[1])
+                    self._sticky_press = (info[0], control)
+                elif event.button() == Qt.RightButton:
+                    idx = self.model().index(info[0], COL_NAME)
+                    if not self.selectionModel().isSelected(idx):
+                        self._select_separator_row(info[0], Qt.NoModifier)
                 event.accept()
                 return
-        if event.button() == Qt.MiddleButton:
+        if binding_matches_mouse("open_mod_page", event):
             idx = self.indexAt(event.position().toPoint())
             if idx.isValid():
-                e = self.model().entry(idx.row())
-                if not e.is_separator:
-                    # Store-specific pages win over the Nexus fallback: a mod
-                    # installed from Thunderstore/mod.io has no Nexus page, and
-                    # a mod carrying both should open where it came from.
-                    from gui_qt.modlist_menu import (
-                        _is_thunderstore_mod, _modio_url, _open_on_modio,
-                        _open_on_nexus, _open_on_thunderstore)
-                    if _is_thunderstore_mod(self, e.name):
-                        _open_on_thunderstore(self, e.name)
-                    elif _modio_url(self, e.name):
-                        _open_on_modio(self, e.name)
-                    else:
-                        _open_on_nexus(self, e.name)
+                self._open_source_page(idx.row())
+            event.accept()
             return
         if event.button() == Qt.LeftButton:
+            self._separator_control_press = None
             idx = self.indexAt(event.position().toPoint())
             self._press_row = idx.row() if idx.isValid() else -1
             self._press_pos = event.position().toPoint()
-            # A real (collapsible) separator is never selectable: clicking one
-            # only expands/collapses it (handled by the delegate on release).
-            # Skip the base press so Qt doesn't change the selection - but keep
-            # _press_row/_press_pos above so a press-and-drag still reorders it.
             if idx.isValid():
-                e = self.model().entry(idx.row())
-                from gui_qt.modlist_model import _PINNED_NAMES
-                if e.is_separator and e.name not in _PINNED_NAMES:
+                control = self._separator_control_at(
+                    idx.row(), event.position().toPoint())
+                if control is not None:
+                    self._separator_control_press = (idx.row(), control)
                     event.accept()
                     return
         super().mousePressEvent(event)
@@ -944,10 +1331,85 @@ class ModListView(QTreeView):
             if info is not None and info[1].contains(event.position().toPoint()):
                 event.accept()
                 return
+        # A double-click anywhere else on a real separator collapses/expands it.
+        # The arrow and lock box keep their single-click behaviour, so a double
+        # there must not toggle a second time.
+        if event.button() == Qt.LeftButton:
+            pos = event.position().toPoint()
+            idx = self.indexAt(pos)
+            if (idx.isValid() and self.model().is_group_leader(self.model().entry(idx.row()).name)
+                    and self._separator_control_at(idx.row(), pos) == "collapse"):
+                self._separator_control_press = None
+                event.accept()
+                return
+            if idx.isValid() and self._is_real_separator(idx.row()):
+                self._separator_control_press = None
+                if self._separator_control_at(idx.row(), pos) is None:
+                    self._toggle_collapse_row(idx.row())
+                event.accept()
+                return
         super().mouseDoubleClickEvent(event)
+
+    def _update_action_cursor(self, pos):
+        over = False
+        cell = None
+        try:
+            idx = self.indexAt(pos)
+            if idx.isValid():
+                entry = self.model().entry(idx.row())
+                delegate = self.itemDelegate()
+                rect = self.visualRect(idx)
+                summary = self.model().is_group_collapsed(entry.name)
+                if (idx.column() == COL_NAME and self.model().is_group_leader(entry.name)):
+                    over = delegate._group_arrow_rect(rect).contains(pos)
+                elif (not entry.is_separator and not summary and idx.column() == COL_FLAGS
+                        and callable(getattr(self, "on_flag_clicked", None))):
+                    bits = idx.data(FlagsRole) or 0
+                    over = bool(delegate._hit_clickable_flag_bit(
+                        pos, rect, bits))
+                elif (not entry.is_separator and not summary
+                      and idx.column() == COL_CONFLICTS
+                      and callable(getattr(self, "on_show_conflicts", None))):
+                    over = delegate._hit_conflict_icon(pos, rect, idx)
+                elif (not entry.is_separator
+                      and idx.column() == COL_VERSION):
+                    over = delegate._hit_centered_text(pos, rect, idx)
+                    if over:
+                        cell = (idx.row(), idx.column())
+                elif (not entry.is_separator
+                      and idx.column() == COL_PRIORITY
+                      and not entry.locked):
+                    over = delegate._hit_centered_text(pos, rect, idx)
+                    if over:
+                        cell = (idx.row(), idx.column())
+        except Exception:
+            over = False
+            cell = None
+        self._set_hover_action_cell(cell)
+        if over:
+            self.viewport().setCursor(Qt.PointingHandCursor)
+        else:
+            self.viewport().unsetCursor()
+
+    def _set_hover_action_cell(self, cell):
+        """Track the hovered Version/Priority number, repainting what changed."""
+        if cell == self._hover_action_cell:
+            return
+        old, self._hover_action_cell = self._hover_action_cell, cell
+        m = self.model()
+        for c in (old, cell):
+            if c is not None:
+                idx = m.index(c[0], c[1])
+                if idx.isValid():
+                    self.viewport().update(self.visualRect(idx))
+
+    def leaveEvent(self, event):
+        self._set_hover_action_cell(None)
+        super().leaveEvent(event)
 
     def mouseMoveEvent(self, event):
         if not (event.buttons() & Qt.LeftButton) or self._press_row < 0:
+            self._update_action_cursor(event.position().toPoint())
             super().mouseMoveEvent(event)
             return
         if not self._drag_active:
@@ -977,6 +1439,8 @@ class ModListView(QTreeView):
                 return
             self._drag_active = True
             self._drag_rows = block
+            self._sync_group_end_markers()
+            self.viewport().unsetCursor()
             self.setCursor(Qt.ClosedHandCursor)
         # Live drag: track cursor, compute drop slot, run autoscroll.
         self._last_mouse_y = event.position().toPoint().y()
@@ -987,38 +1451,36 @@ class ModListView(QTreeView):
 
     def mouseReleaseEvent(self, event):
         if self._drag_active:
-            self._scroll_timer.stop()
-            self._commit_drop()
-            self._drag_active = False
-            self._drag_rows = []
-            self._drop_slot = -1
-            self.unsetCursor()
-            self.viewport().update()
-            self._press_row = -1
+            try:
+                self._commit_drop()
+            finally:
+                self._end_drag()
             return
         # Release of a press that started on the sticky separator band.
         if self._sticky_press is not None:
-            row, self._sticky_press = self._sticky_press, None
+            (row, control), self._sticky_press = self._sticky_press, None
             info = self._sticky_sep_info()
             pos = event.position().toPoint()
             if (info is not None and info[0] == row
-                    and info[1].contains(pos)):
-                shift = bool(event.modifiers() & Qt.ShiftModifier)
-                self._sticky_click(row, info[1], pos, shift)
+                    and info[1].contains(pos)
+                    and self._separator_control_at(row, pos, info[1]) == control):
+                self._sticky_click(row, control, event.modifiers())
             self._press_row = -1
             event.accept()
             return
-        # A click (no drag) on a real separator toggles its collapse (arrow or
-        # anywhere on the band) or its lock (lock box). Its press was consumed
-        # in mousePressEvent so the base view never routes it to the delegate.
-        if event.button() == Qt.LeftButton and self._press_row >= 0:
-            row = self._press_row
+        if (event.button() == Qt.LeftButton
+                and self._separator_control_press is not None):
+            row, control = self._separator_control_press
+            self._separator_control_press = None
             self._press_row = -1
-            shift = bool(event.modifiers() & Qt.ShiftModifier)
-            if self._handle_separator_click(row, event.position().toPoint(),
-                                            shift):
-                event.accept()
-                return
+            if self._separator_control_at(row, event.position().toPoint()) == control:
+                if control == "lock":
+                    self._lock_box_click(
+                        row, bool(event.modifiers() & Qt.ShiftModifier))
+                else:
+                    self._toggle_collapse_row(row)
+            event.accept()
+            return
         self._press_row = -1
         super().mouseReleaseEvent(event)
 
@@ -1072,7 +1534,7 @@ class ModListView(QTreeView):
     def _name_tooltip(self, help_event) -> bool:
         """Show the hovered mod's description tooltip. Returns True if shown."""
         try:
-            from Utils.ui_config import load_show_summary_tooltips
+            from Utils.ui.config import load_show_summary_tooltips
             if not load_show_summary_tooltips():
                 return False
         except Exception:
@@ -1092,34 +1554,11 @@ class ModListView(QTreeView):
             return False
         if len(desc) > self._TOOLTIP_MAX_CHARS:
             desc = desc[:self._TOOLTIP_MAX_CHARS].rstrip() + "…"
-        import textwrap
-        wrapped = "\n".join(
-            textwrap.fill(line, width=self._TOOLTIP_WRAP_CHARS,
-                          break_long_words=False, break_on_hyphens=False)
-            for line in desc.splitlines()) or desc
+        from gui_qt.tooltips import wrap_tooltip
+        wrapped = wrap_tooltip(desc, self._TOOLTIP_WRAP_CHARS)
         # Pass the name-cell rect so Qt hides the tip once the cursor leaves it.
         QToolTip.showText(help_event.globalPos(), wrapped, self,
                           self.visualRect(idx))
-        return True
-
-    def _handle_separator_click(self, row: int, pos, shift: bool = False) -> bool:
-        """If *row* is a real (collapsible) separator, toggle its lock (when the
-        release is on the lock box) or its collapse (anywhere else on the band).
-        Returns True when handled."""
-        m = self.model()
-        if not (0 <= row < m.rowCount()):
-            return False
-        e = m.entry(row)
-        from gui_qt.modlist_model import _PINNED_NAMES
-        if not e.is_separator or e.name in _PINNED_NAMES:
-            return False
-        delegate = self.itemDelegate()
-        lock = getattr(delegate, "_lock_rect", None)
-        row_rect = self.visualRect(m.index(row, COL_NAME))
-        if lock is not None and lock(row_rect).contains(pos):
-            self._lock_box_click(row, shift)
-        else:
-            self._toggle_collapse_row(row)
         return True
 
     def _update_drop_slot(self, y: int):
@@ -1127,6 +1566,8 @@ class ModListView(QTreeView):
         Snaps to the gap nearest the cursor among visible rows."""
         m = self.model()
         n = m.rowCount()
+        self._drop_group = None
+        self._drop_group_end = None
         vis = self._visible_rows()
         if not vis:
             self._drop_slot = 0
@@ -1151,6 +1592,11 @@ class ModListView(QTreeView):
         if not onscreen:
             self._drop_slot = max(0, min(self._drop_slot, n))
             return
+        dragged = [m.entry(r) for r in self._drag_rows]
+        can_join = (bool(dragged) and all(not e.is_separator and not e.locked
+                                        for e in dragged))
+        dragged_names = {e.name for e in dragged}
+        hit_row = None
         first_r, first_rect = onscreen[0]
         last_r, last_rect = onscreen[-1]
         if y < first_rect.top():
@@ -1161,10 +1607,37 @@ class ModListView(QTreeView):
             slot = None
             for r, rect in onscreen:
                 if y < rect.bottom():        # seam belongs to the nearer row
+                    hit_row = r
+                    if r in self._group_end_markers:
+                        marker = self._group_end_rect(r)
+                        if y >= marker.top():
+                            leader = self._group_end_markers[r]
+                            inside = (can_join and leader not in dragged_names
+                                      and y < marker.center().y())
+                            self._drop_group = leader if inside else None
+                            self._drop_group_end = (r, inside)
+                            self._drop_slot = m.group_rows(leader)[-1] + 1
+                            return
+                        rect = rect.adjusted(0, 0, 0, -SEP_H)
                     slot = r if y < rect.center().y() else r + 1
                     break
             if slot is None:                 # defensive: treat as below last
                 slot = last_r + 1
+        if can_join and hit_row is not None:
+            entry = m.entry(hit_row)
+            leader = m.group_leader(entry.name)
+            if (leader and leader not in dragged_names
+                    and (entry.name != leader or slot > hit_row)):
+                self._drop_group = leader
+                rows = m.group_rows(leader)
+                slot = next((r for r in rows if r >= slot
+                             and not self.isRowHidden(r, self.rootIndex())), rows[-1] + 1)
+                if slot > rows[-1]:
+                    end_row = next(r for r, name in self._group_end_markers.items()
+                                   if name == leader)
+                    self._drop_group_end = (end_row, True)
+                self._drop_slot = slot
+                return
         # Clamp the indicator to the valid-drop range so the blue line never
         # renders at/below the Root Folder boundary (or above Overwrite). In
         # reverse mode boundaries flip in display space and move_block_display
@@ -1180,6 +1653,7 @@ class ModListView(QTreeView):
         if 0 < slot < n and self.isRowHidden(slot, self.rootIndex()):
             nxt = next((r for r in vis if r >= slot), None)
             slot = nxt if nxt is not None else n
+        slot = m.group_drop_slot(slot, self._drag_rows)
         self._drop_slot = slot
 
     def _commit_drop(self):
@@ -1188,12 +1662,11 @@ class ModListView(QTreeView):
         dest = self._drop_slot
         src = self._drag_rows
         m = self.model()
-        # Tk parity: every drag - a mod, a lone separator, or a locked
-        # separator carrying its block - drops exactly at the released slot,
-        # even mid-group (the host group splits there and its remaining mods
-        # fall under the dragged block). Only the Overwrite/Root boundaries
-        # clamp (movable_span in _update_drop_slot / move_block).
-        if m.reverse_mode_active:
+        if m._mod_groups:
+            hidden = {r for r in range(m.rowCount())
+                      if self.isRowHidden(r, self.rootIndex())}
+            m.move_group_drop(src, dest, self._drop_group, hidden)
+        elif m.reverse_mode_active:
             # Reverse-priority drag: resolve the drop in display space with the
             # Tk inverted-mode semantics, then the model uninverts + saves.
             hidden = {r for r in range(m.rowCount())
@@ -1285,13 +1758,33 @@ class ModListView(QTreeView):
             self.viewport().update()
 
     def paintEvent(self, event):
+        tracing = perftrace.is_enabled()
+        paint_started = perf_counter() if tracing else 0.0
         super().paintEvent(event)
+        if tracing:
+            elapsed = perf_counter() - paint_started
+            kind = ("full" if event.rect().contains(self.viewport().rect())
+                    else "partial")
+            perftrace.mark("ui.paint.modlist.viewport", elapsed)
+            perftrace.mark(f"ui.paint.modlist.{kind}", elapsed)
+            if kind == "full":
+                source = ("after_resize" if self._perf_resize_paint_pending
+                          else "other")
+                self._perf_resize_paint_pending = False
+                perftrace.mark(f"ui.paint.modlist.full.{source}", elapsed)
         # Sticky separator band (hidden during a drag - it would cover the
         # drop zone while autoscrolling toward the top). An external archive
         # drag (Downloads tab) paints the same indicator.
         dragging = self._drag_active or self._extern_drop
         if not dragging:
             self._paint_sticky_separator()
+        if self._group_end_markers:
+            p = QPainter(self.viewport())
+            for row in self._group_end_markers:
+                rect = self._group_end_rect(row)
+                if rect.intersects(self.viewport().rect()):
+                    self.itemDelegate().paint_drop_divider(p, rect)
+            p.end()
         if not dragging or self._drop_slot < 0:
             return
         m = self.model()
@@ -1307,7 +1800,11 @@ class ModListView(QTreeView):
                        and m.entry(self._drop_slot).name in _PINNED_NAMES)
         # Anchor the line to visible rows only: visualRect() of a hidden row
         # (collapsed block) is empty, which would paint the line at y=0.
-        if (not on_boundary and self._drop_slot < n
+        if self._drop_group_end is not None:
+            row, inside = self._drop_group_end
+            rect = self._group_end_rect(row)
+            y = rect.top() if inside else rect.bottom() + 1
+        elif (not on_boundary and self._drop_slot < n
                 and not self.isRowHidden(self._drop_slot, self.rootIndex())):
             y = self.visualRect(m.index(self._drop_slot, 0)).top()
         else:
@@ -1321,7 +1818,7 @@ class ModListView(QTreeView):
         pen = QPen(QColor(_c(active_palette(), "HIGHLIGHT_DRAG")))
         pen.setWidth(2)
         p.setPen(pen)
-        p.drawLine(0, y, self.viewport().width(), y)
+        p.drawLine(24 if self._drop_group else 0, y, self.viewport().width(), y)
         p.end()
 
     # ---- context menu -----------------------------------------------------
@@ -1354,8 +1851,8 @@ class ModListView(QTreeView):
     def _restore_column_state(self):
         st = column_state.load_state()
         if not (st["widths"] or st["order"] or st["hidden"] or st["sort_col"]):
-            # Fresh INI: apply Tk-parity first-run hidden columns (Category /
-            # Installed / Size). The user's later choices persist over this.
+            # Fresh INI: apply the first-run hidden columns. The user's later
+            # choices persist over this.
             for col in _FIRST_RUN_HIDDEN:
                 self.setColumnHidden(col, True)
             return

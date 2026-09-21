@@ -5,7 +5,7 @@ A modlist-panel-scoped tab, three pages:
   2. Generate - BOS/SkyPatcher mode radios + a scrollable checkbox list of
      eligible plugins (Select/Deselect all) + Generate.
   3. Done - summary + Open output folder.
-The scan/generate logic lives in Utils/skygen_core.py.
+The scan/generate logic lives in Utils/bethesda/skygen.py.
 """
 
 from __future__ import annotations
@@ -21,9 +21,9 @@ from PySide6.QtWidgets import (
 )
 
 from gui_qt.safe_emit import safe_emit
-from gui_qt.theme_qt import active_palette, _c
+from gui_qt.theme_qt import active_palette, close_button, _c
 from wizards_qt._view_base import GREEN, RED, WizardViewBase
-import Utils.skygen_core as core
+import Utils.bethesda.skygen as core
 
 if TYPE_CHECKING:
     from Games.base_game import BaseGame
@@ -272,14 +272,13 @@ class SkyGenView(WizardViewBase):
         open_btn.setCursor(Qt.PointingHandCursor)
         open_btn.clicked.connect(self._open_output)
         lay.addWidget(open_btn, 0, Qt.AlignHCenter)
-        done = self._green_btn(self.tr("Close"))
-        done.setEnabled(True)
-        done.clicked.connect(self._finish)
-        lay.addWidget(done, 0, Qt.AlignHCenter)
+        close = close_button(self.tr("Close"))
+        close.clicked.connect(self._finish)
+        lay.addWidget(close, 0, Qt.AlignHCenter)
         return page
 
     def _open_output(self):
         if self._out_dir is not None:
-            from Utils.xdg import xdg_open
+            from Utils.environment.xdg import xdg_open
             xdg_open(self._out_dir,
                      log_fn=lambda m: self._log(f"SkyGen: {m}"))

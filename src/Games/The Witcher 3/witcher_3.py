@@ -36,10 +36,10 @@ from pathlib import Path
 
 from Games.base_game import BaseGame
 from Utils.vfs import ProfileVFSGameMixin
-from Utils.deploy import LinkMode, cleanup_custom_deploy_dirs, load_per_mod_strip_prefixes, load_separator_deploy_paths, expand_separator_deploy_paths, expand_separator_raw_deploy, _resolve_nocase, _resolve_root_path, _write_deploy_snapshot, _move_runtime_files, _FILEMAP_SNAPSHOT_NAME
-from Utils.modlist import read_modlist
+from Utils.deployment import LinkMode, cleanup_custom_deploy_dirs, load_per_mod_strip_prefixes, load_separator_deploy_paths, expand_separator_deploy_paths, expand_separator_raw_deploy, _resolve_nocase, _resolve_root_path, _write_deploy_snapshot, _move_runtime_files, _FILEMAP_SNAPSHOT_NAME
+from Utils.mods.modlist import read_modlist
 from Utils.config_paths import get_profiles_dir
-from Utils.tw3_filelist import update_menu_filelists
+from Utils.witcher3.menu_filelists import update_menu_filelists
 
 _PROFILES_DIR = get_profiles_dir()
 
@@ -139,11 +139,17 @@ def _route_path(staged_rel: str) -> tuple[str, str]:
 # ---------------------------------------------------------------------------
 
 class Witcher3(ProfileVFSGameMixin, BaseGame):
+    profile_overridable_paths_extras = (*BaseGame.profile_overridable_paths_extras, "profile_ini_files")
 
     profile_overridable_settings = (
         *BaseGame.profile_overridable_settings,
         *ProfileVFSGameMixin.vfs_profile_setting_keys,
     )
+
+    @staticmethod
+    def filegraph_route_path(staged_rel: str) -> tuple[str, str]:
+        """Canonical conflict/deployment route used during candidate build."""
+        return _route_path(staged_rel)
 
     def __init__(self):
         self._game_path: Path | None = None
@@ -275,7 +281,8 @@ class Witcher3(ProfileVFSGameMixin, BaseGame):
         filemap   = self.get_effective_filemap_path()
         staging   = self.get_effective_mod_staging_path()
 
-        if not filemap.is_file():
+        from Utils.filegraph.deploy import input_ready
+        if not input_ready():
             raise RuntimeError(
                 f"filemap.txt not found: {filemap}\n"
                 "Run 'Build Filemap' before deploying."
@@ -289,6 +296,8 @@ class Witcher3(ProfileVFSGameMixin, BaseGame):
                 log_fn=_log,
                 progress_fn=progress_fn,
             )
+
+        custom_exclude = self._deploy_custom_routing_rules(mode, log_fn)
 
         profile_dir        = self.get_profile_root() / "profiles" / profile
         per_mod_strip      = load_per_mod_strip_prefixes(profile_dir)
@@ -328,15 +337,21 @@ class Witcher3(ProfileVFSGameMixin, BaseGame):
         # treat the first hardlink as a vanilla file.)
         _placed_this_run: set[str] = set()
 
-        lines = [
-            ln.rstrip("\n")
-            for ln in filemap.read_text(encoding="utf-8").splitlines()
-            if "\t" in ln
-        ]
+        from Utils.filegraph.deploy import entries as filegraph_entries, legacy_lines
+        lines = list(legacy_lines())
+        filegraph_sources = {
+            (entry.legacy_rel.lower(), entry.mod_name): entry.source_path
+            for entry in filegraph_entries()
+            if entry.legacy_rel and entry.source_path is not None
+        }
         total = len(lines)
 
         for i, line in enumerate(lines):
             staged_rel, mod_name = line.split("\t", 1)
+            if staged_rel.lower() in custom_exclude:
+                if progress_fn:
+                    progress_fn(i + 1, total)
+                continue
 
             base_dir = per_mod_deploy.get(mod_name, game_path)
             in_custom_dir = base_dir != game_path
@@ -351,12 +366,7 @@ class Witcher3(ProfileVFSGameMixin, BaseGame):
                 dest_dir  = (base_dir / dest_prefix) if dest_prefix else base_dir
                 dest_file = dest_dir / final_rel
 
-            src = self._find_staged_file(
-                staging, mod_name, staged_rel,
-                per_mod_strip.get(mod_name, []),
-                overwrite_dir,
-                nocase_cache,
-            )
+            src = filegraph_sources.get((staged_rel.lower(), mod_name))
             if src is None:
                 _log(f"  WARN: source not found for {staged_rel} ({mod_name})")
                 skipped += 1
@@ -466,6 +476,16 @@ class Witcher3(ProfileVFSGameMixin, BaseGame):
             _log(f"  WARN: could not write deploy snapshot: {exc}")
 
         update_menu_filelists(game_path, log_fn=_log)
+        self._symlink_profile_ini_files(profile, _log)
+
+    def _symlink_profile_ini_files(self, profile, log_fn):
+        from Utils.wabbajack.profile_config import link_settings
+        link_settings(self, profile, log_fn)
+
+    def _remove_profile_ini_symlinks(self, profile, log_fn):
+        from Utils.wabbajack.profile_config import restore_settings
+        if (self.get_profile_root() / "wabbajack-settings-links.json").is_file():
+            restore_settings(self, log_fn)
 
     def _find_staged_file(
         self,
@@ -580,33 +600,10 @@ class Witcher3(ProfileVFSGameMixin, BaseGame):
         Mods with "ignore deployment rules" set are left as-is since their
         staged paths are already their final destinations.
         """
-        if not filemap_path.is_file():
-            return
-
-        # Determine which mods have raw deploy enabled so we skip routing them.
-        _raw_mods: set[str] = set()
-        if self._active_profile_dir is not None:
-            try:
-                _sd = load_separator_deploy_paths(self._active_profile_dir)
-                _se = read_modlist(self._active_profile_dir / "modlist.txt") if _sd else []
-                _raw_mods = expand_separator_raw_deploy(_sd, _se)
-            except Exception:
-                pass
-
-        lines = filemap_path.read_text(encoding="utf-8").splitlines()
-        out: list[str] = []
-        for line in lines:
-            if "\t" not in line:
-                out.append(line)
-                continue
-            staged_rel, mod_name = line.split("\t", 1)
-            if mod_name in _raw_mods:
-                out.append(staged_rel + "\t" + mod_name)
-            else:
-                dest_prefix, final_rel = _route_path(staged_rel)
-                routed_rel = (dest_prefix + "/" + final_rel) if dest_prefix else final_rel
-                out.append(routed_rel + "\t" + mod_name)
-        filemap_path.write_text("\n".join(out), encoding="utf-8")
+        # Kept as a compatibility hook for callers outside this branch. The
+        # filegraph adapter applies `_route_path` before conflict/deploy
+        # identities are published, so runtime map rewriting is obsolete.
+        return None
 
     # -----------------------------------------------------------------------
     # Restore
@@ -621,7 +618,7 @@ class Witcher3(ProfileVFSGameMixin, BaseGame):
         profile_specific = False
         if self._active_profile_dir is not None:
             try:
-                from Utils.profile_state import profile_uses_specific_mods
+                from Utils.profiles.state import profile_uses_specific_mods
                 profile_specific = profile_uses_specific_mods(self._active_profile_dir)
             except Exception:
                 pass
@@ -639,7 +636,7 @@ class Witcher3(ProfileVFSGameMixin, BaseGame):
         """
         _log = log_fn or (lambda _: None)
         try:
-            from Utils.install_as_mod import index_installed_mod
+            from Utils.mods.install_as_mod import index_installed_mod
             index_installed_mod(self, "Merged_Mods", log_fn=_log)
         except Exception as exc:
             _log(f"WARN: could not re-index Merged_Mods: {exc}")
@@ -684,8 +681,11 @@ class Witcher3(ProfileVFSGameMixin, BaseGame):
         if self._game_path is None:
             raise RuntimeError("Game path is not configured.")
 
+        self._restore_custom_routing_rules(log_fn)
+
         game_path     = self._game_path
         manifest_path = self.get_profile_root() / _DEPLOYED_MANIFEST
+        self._remove_profile_ini_symlinks("", _log)
 
         # Separator targets outside the install remain physical under the
         # generic VFS builder and have their own transactional journal.
@@ -697,6 +697,7 @@ class Witcher3(ProfileVFSGameMixin, BaseGame):
         cleanup_custom_deploy_dirs(
             profile_dir, entries, log_fn=_log,
             filemap_path=self.get_effective_filemap_path(),
+            game=self,
         )
 
         # Restore follows the deployment state that exists, not today's VFS

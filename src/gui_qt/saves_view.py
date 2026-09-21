@@ -1,6 +1,6 @@
 """Saves -the plugins-panel sub-tab listing the game's save folders.
 
-Locations come from the Ludusavi manifest (Utils.save_paths); a Bethesda
+Locations come from the Ludusavi manifest (Utils.saves.paths); a Bethesda
 profile-saves folder is listed alongside them. Read-only.
 
 Like the other sub-tabs it builds lazily and scans on a daemon thread (save
@@ -29,9 +29,10 @@ from PySide6.QtWidgets import (
 from gui_qt.icons import icon
 from gui_qt.theme_qt import active_palette, bind_theme, _c
 from gui_qt.worker import run_in_worker
-from Utils.prefix_manager import fmt_size, get_dir_size
-from Utils.save_paths import matches_patterns, save_paths_for_game
-from Utils.xdg import xdg_open
+from gui_qt.i18n import profile_display
+from Utils.wine.manager import fmt_size, get_dir_size
+from Utils.saves.paths import matches_patterns, save_paths_for_game
+from Utils.environment.xdg import xdg_open
 
 # Entries listed per folder. A folder with more than this many children is
 # truncated -some games keep thousands of autosaves and the tree would stall
@@ -255,7 +256,7 @@ class SavesView(QWidget):
         bind_theme(self, roles={"TEXT_DIM", "ACCENT", "DROPDOWN_ARROW"})
         # Warm the manifest off-thread -app.py's _saves_supported() would
         # otherwise pay the ~70 ms first load on the UI thread mid game-switch.
-        from Utils.ludusavi_manifest import data_info
+        from Utils.saves.ludusavi import data_info
         run_in_worker(data_info, None, name="ludusavi-warm")
 
     def refresh_theme(self, p: dict) -> None:
@@ -495,7 +496,7 @@ class SavesView(QWidget):
         path = Path(raw)
         ext = path.suffix.lower()
         from gui_qt.image_preview import PREVIEW_EXTS
-        from Utils.text_files import TEXT_EXTENSIONS
+        from Utils.text.files import TEXT_EXTENSIONS
         if ext in PREVIEW_EXTS:
             cb = getattr(self, "on_open_image", None)
         elif ext in TEXT_EXTENSIONS:
@@ -738,7 +739,7 @@ class SavesView(QWidget):
 
     def _on_search(self, text: str):
         """Footer search box → needle + `!.ess`-style file-type tokens."""
-        from Utils.file_search import parse_file_query
+        from Utils.text.search import parse_file_query
         needle, self._search_exts = parse_file_query(text)
         self._search = needle
         if self._search_timer is None:
@@ -822,7 +823,7 @@ class SavesView(QWidget):
         # Extension only -the magic-byte check opens the file, and arrowing
         # down a list would then do a read per row on the UI thread. The worker
         # does the real check and hands back None if it isn't a save.
-        from Utils.save_header import SAVE_EXTS
+        from Utils.saves.header import SAVE_EXTS
         if path.suffix.lower() not in SAVE_EXTS:
             self._hide_preview()
             return
@@ -837,7 +838,7 @@ class SavesView(QWidget):
 
     @staticmethod
     def _preview_worker(gen: int, path: str) -> dict:
-        from Utils.save_header import parse_save
+        from Utils.saves.header import parse_save
         try:
             mtime = os.stat(path).st_mtime
         except OSError:
@@ -920,7 +921,7 @@ class SavesView(QWidget):
         getter = getattr(game, "_profile_saves_dir", None)
         if getter is None:
             return []
-        from Utils.game_helpers import _profiles_for_game
+        from Utils.games.registry import _profiles_for_game
         targets = []
         for name in _profiles_for_game(getattr(game, "name", "")):
             try:
@@ -992,7 +993,7 @@ class SavesView(QWidget):
         if len(targets) == 1:
             name, folder = targets[0]
             self._menu_action(
-                menu, self.tr("{0} ({1})").format(label, name),
+                menu, self.tr("{0} ({1})").format(label, profile_display(name)),
                 lambda: self._start_entry_transfer(path, folder, name, move),
                 enabled=self._can_transfer_to(path, folder))
             return None
@@ -1000,8 +1001,9 @@ class SavesView(QWidget):
         sub = QMenu(label, menu)
         menu.addMenu(sub)
         for name, folder in targets:
-            text = self.tr("{0} (current)").format(name) \
-                if name == self._profile_name else name
+            shown = profile_display(name)
+            text = self.tr("{0} (current)").format(shown) \
+                if name == self._profile_name else shown
             self._menu_action(
                 sub, text,
                 lambda f=folder, n=name: self._start_entry_transfer(path, f, n, move),
@@ -1054,7 +1056,7 @@ class SavesView(QWidget):
 
     def _entry_transfer_worker(self, src: Path, dest_dir: Path, profile: str,
                                move: bool, overwrite: bool) -> tuple[bool, str]:
-        from Utils.save_transfer import SaveTransferError, transfer_save_entry
+        from Utils.saves.transfer import SaveTransferError, transfer_save_entry
         try:
             count, size, dest = transfer_save_entry(
                 src, dest_dir, move=move, overwrite=overwrite,
@@ -1092,7 +1094,7 @@ class SavesView(QWidget):
                       error_result=(False, self.tr("Could not delete the save.")))
 
     def _delete_worker(self, path: Path) -> tuple[bool, str]:
-        from Utils.save_transfer import SaveTransferError, delete_save_entry
+        from Utils.saves.transfer import SaveTransferError, delete_save_entry
         try:
             count, size = delete_save_entry(path)
         except SaveTransferError as exc:
@@ -1141,7 +1143,7 @@ class SavesView(QWidget):
         """Ask where to write the zip; packing starts once a path comes back."""
         if not self.can_transfer():
             return
-        from Utils.portal_filechooser import pick_save_file
+        from Utils.ui.portal import pick_save_file
         from gui_qt.safe_emit import safe_emit
         pick_save_file(
             self.tr("Export saves"),
@@ -1165,7 +1167,7 @@ class SavesView(QWidget):
                       error_result=(False, self.tr("Export failed.")))
 
     def _export_worker(self, source: Path, dest: Path, patterns=()) -> tuple[bool, str]:
-        from Utils.save_transfer import SaveTransferError, export_saves
+        from Utils.saves.transfer import SaveTransferError, export_saves
         try:
             count, size = export_saves(source, dest, self._progress, patterns)
         except SaveTransferError as exc:
@@ -1180,7 +1182,7 @@ class SavesView(QWidget):
         """Ask for a zip; the confirm prompt and extraction follow."""
         if not self.can_transfer():
             return
-        from Utils.portal_filechooser import pick_file
+        from Utils.ui.portal import pick_file
         from gui_qt.safe_emit import safe_emit
         pick_file(
             self.tr("Import saves"),
@@ -1220,7 +1222,7 @@ class SavesView(QWidget):
                       error_result=(False, self.tr("Import failed.")))
 
     def _import_worker(self, src: Path, location: Path, patterns=()) -> tuple[bool, str]:
-        from Utils.save_transfer import SaveTransferError, import_saves
+        from Utils.saves.transfer import SaveTransferError, import_saves
         try:
             count, size, backup = import_saves(src, location, self._progress,
                                                patterns=patterns)

@@ -28,7 +28,9 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -61,6 +63,7 @@ _CREDENTIAL_HEADERS = ("APIKEY", "Authorization")
 V3_BASE = "https://api.nexusmods.com/v3"
 APP_NAME = "amethyst"
 APP_VERSION = __version__
+_SUPPORTED_COLLECTION_SCHEMA_ID = 1
 
 # How long to wait after a 429 before retrying (seconds)
 _RATE_LIMIT_BACKOFF = 2.0
@@ -218,6 +221,7 @@ class NexusModFile:
     version: str
     category_name: str       # "MAIN", "UPDATE", "OPTIONAL", "OLD_VERSION", "MISCELLANEOUS"
     file_name: str            # actual archive filename
+    category_id: int = 0
     size_in_bytes: int | None = None
     size_kb: int = 0
     mod_version: str = ""
@@ -447,6 +451,10 @@ class NexusCollectionMod:
     md5: str = ""           # collection.json mods[].source.md5 - used to verify cached archives
     domain_name: str = ""   # collection.json mods[].domainName - overrides collection-level domain
                             # (e.g. Skyrim mods inside an Enderal collection)
+    update_policy: str = "exact"
+    resolved_file_id: int = 0
+    resolved_nexus_file_name: str = ""
+    resolved_file_category: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -661,6 +669,8 @@ class NexusAPI:
         self._cached_user: "NexusUser | None" = None
         self._cached_user_ts: float = 0.0
         self._oauth_tokens = None
+        self._oauth_lock = threading.RLock()
+        self._graphql_slots = threading.BoundedSemaphore(4)
         self._game_id_cache: dict[str, int] = {}
         self._session = requests.Session()
         self._session.verify = resolve_ca_bundle() or True
@@ -696,6 +706,8 @@ class NexusAPI:
         instance._cached_user = None
         instance._cached_user_ts = 0.0
         instance._oauth_tokens = tokens
+        instance._oauth_lock = threading.RLock()
+        instance._graphql_slots = threading.BoundedSemaphore(4)
         instance._game_id_cache = {}
         instance._session = requests.Session()
         instance._session.verify = resolve_ca_bundle() or True
@@ -710,14 +722,15 @@ class NexusAPI:
 
     def _refresh_oauth_if_needed(self) -> None:
         """If this instance uses OAuth, refresh the access token if it is expiring soon and update the session header."""
-        tokens = getattr(self, "_oauth_tokens", None)
-        if tokens is None:
-            return
-        from Nexus.nexus_oauth import refresh_if_needed
-        new_tokens = refresh_if_needed(tokens)
-        if new_tokens.access_token != tokens.access_token:
-            self._oauth_tokens = new_tokens
-            self._session.headers["Authorization"] = f"Bearer {new_tokens.access_token}"
+        with self._oauth_lock:
+            tokens = self._oauth_tokens
+            if tokens is None:
+                return
+            from Nexus.nexus_oauth import refresh_if_needed
+            new_tokens = refresh_if_needed(tokens)
+            if new_tokens.access_token != tokens.access_token:
+                self._oauth_tokens = new_tokens
+                self._session.headers["Authorization"] = f"Bearer {new_tokens.access_token}"
 
     # -- low-level ----------------------------------------------------------
 
@@ -878,11 +891,17 @@ class NexusAPI:
     def _post_graphql(self, query: str, variables: dict | None = None,
                       op: str = "GraphQL",
                       retries: int = _MAX_RETRIES,
-                      base_url: str = GRAPHQL_BASE) -> requests.Response:
+                      base_url: str = GRAPHQL_BASE,
+                      session: requests.Session | None = None) -> requests.Response:
         """POST to a Nexus GraphQL endpoint (OAuth refresh + 429 retry)."""
         # Returns the raw response. Pass base_url=GRAPHQL_SEARCH_BASE for the
         # public mods-listing queries (see the constant's comment for why).
-        self._refresh_oauth_if_needed()
+        with self._oauth_lock:
+            self._refresh_oauth_if_needed()
+            if session is None:
+                session = self._session
+            elif session is not self._session:
+                session.headers.update(self._session.headers)
         payload: dict[str, Any] = {"query": query}
         if variables is not None:
             payload["variables"] = variables
@@ -893,9 +912,10 @@ class NexusAPI:
                    if base_url == GRAPHQL_SEARCH_BASE else None)
         for attempt in range(retries):
             try:
-                resp = self._session.post(base_url, json=payload,
-                                          headers=headers,
-                                          timeout=self._timeout)
+                with self._graphql_slots:
+                    resp = session.post(base_url, json=payload,
+                                        headers=headers,
+                                        timeout=self._timeout)
             except requests.ConnectionError as exc:
                 raise NexusAPIError(
                     f"Connection failed: {exc}", url=base_url) from exc
@@ -1525,6 +1545,7 @@ class NexusAPI:
                                 version=entry.get("version", "") or "",
                                 category_name=cat_name,
                                 file_name=entry.get("uri", "") or "",
+                                category_id=int(entry.get("categoryId") or 0),
                                 size_in_bytes=sz or None,
                                 size_kb=(sz // 1024) if sz else 0,
                                 mod_version="",
@@ -1545,6 +1566,7 @@ class NexusAPI:
                 version=f.get("version", ""),
                 category_name=f.get("category_name", ""),
                 file_name=f.get("file_name", ""),
+                category_id=int(f.get("category_id") or 0),
                 size_in_bytes=f.get("size_in_bytes"),
                 size_kb=f.get("size_kb", 0),
                 mod_version=f.get("mod_version", ""),
@@ -1561,6 +1583,12 @@ class NexusAPI:
             file_updates=data.get("file_updates", []),
         )
 
+    def get_mod_file_updates(self, game_domain: str, mod_id: int) -> list[dict]:
+        """Return the REST file-update chain for one Nexus mod."""
+        data = self._get(f"/games/{game_domain}/mods/{mod_id}/files")
+        updates = data.get("file_updates", [])
+        return updates if isinstance(updates, list) else []
+
     def get_file_info(self, game_domain: str, mod_id: int,
                       file_id: int) -> NexusModFile:
         """Get details about a specific file."""
@@ -1572,6 +1600,7 @@ class NexusAPI:
             version=f.get("version", ""),
             category_name=f.get("category_name", ""),
             file_name=f.get("file_name", ""),
+            category_id=int(f.get("category_id") or 0),
             size_in_bytes=f.get("size_in_bytes"),
             size_kb=f.get("size_kb", 0),
             mod_version=f.get("mod_version", ""),
@@ -1940,6 +1969,30 @@ class NexusAPI:
 
     _GRAPHQL_UPDATE_BATCH = 20  # legacyModsByDomain returns at most 20 nodes per request
 
+    def _map_graphql_batches(self, batches, fetch_batch) -> dict:
+        if not batches:
+            return {}
+
+        workers = min(4, len(batches))
+
+        def fetch_lane(lane):
+            results = {}
+            with requests.Session() as session:
+                session.verify = self._session.verify
+                for batch in lane:
+                    results.update(fetch_batch(batch, session))
+            return results
+
+        if workers == 1:
+            return fetch_lane(batches)
+        results = {}
+        with ThreadPoolExecutor(max_workers=workers,
+                                thread_name_prefix="nexus-update") as pool:
+            for result in pool.map(fetch_lane,
+                                   [batches[i::workers] for i in range(workers)]):
+                results.update(result)
+        return results
+
     def graphql_mod_update_info_batch(
         self,
         ids: list[tuple[str, int]],
@@ -1985,23 +2038,22 @@ class NexusAPI:
             }
         }
         """
-        results: dict[int, NexusModUpdateInfo] = {}
-        batch_size = self._GRAPHQL_UPDATE_BATCH
-        for i in range(0, len(ids), batch_size):
-            batch = ids[i: i + batch_size]
+        def fetch_batch(batch, session):
+            results: dict[int, NexusModUpdateInfo] = {}
             variables = {
                 "ids": [{"gameDomain": gd, "modId": mid} for gd, mid in batch]
             }
             try:
                 resp = self._post_graphql(query, variables,
-                                          op="GraphQL batchUpdateCheck")
+                                          op="GraphQL batchUpdateCheck",
+                                          session=session)
                 if not resp.ok:
                     app_log(f"GraphQL batch update check failed: {resp.status_code}")
-                    continue
+                    return results
                 data = resp.json()
                 if not isinstance(data, dict):
                     app_log("GraphQL batch update check: unexpected response format")
-                    continue
+                    return results
                 if "errors" in data:
                     app_log(f"GraphQL batch update check errors: {data['errors']}")
                 nodes = (
@@ -2059,7 +2111,12 @@ class NexusAPI:
                     )
             except Exception as exc:
                 app_log(f"GraphQL batch update check error: {exc}")
-        return results
+            return results
+
+        batch_size = self._GRAPHQL_UPDATE_BATCH
+        return self._map_graphql_batches(
+            [ids[i:i + batch_size] for i in range(0, len(ids), batch_size)],
+            fetch_batch)
 
     def graphql_mod_files_batch(
         self,
@@ -2082,11 +2139,8 @@ class NexusAPI:
             app_log(f"GraphQL modFilesBatch: could not resolve game ID for {game_domain!r}")
             return {}
 
-        results: dict[int, list[NexusModFile]] = {}
-        unique_mods = list(dict.fromkeys(mod_ids))
-        batch_size = self._GRAPHQL_FILE_BATCH
-        for i in range(0, len(unique_mods), batch_size):
-            batch = unique_mods[i: i + batch_size]
+        def fetch_batch(batch, session):
+            results: dict[int, list[NexusModFile]] = {}
             aliases = "\n".join(
                 f"    m{mid}: modFiles(gameId: {game_id}, modId: {mid}) {{\n"
                 f"        fileId name version description\n"
@@ -2097,10 +2151,11 @@ class NexusAPI:
             )
             query = f"query ModFilesBatch {{\n{aliases}\n}}"
             try:
-                resp = self._post_graphql(query, op="GraphQL modFilesBatch")
+                resp = self._post_graphql(query, op="GraphQL modFilesBatch",
+                                          session=session)
                 if not resp.ok:
                     app_log(f"GraphQL modFilesBatch failed: {resp.status_code}")
-                    continue
+                    return results
                 payload = resp.json()
                 if "errors" in payload:
                     app_log(f"GraphQL modFilesBatch errors: {payload['errors']}")
@@ -2138,6 +2193,7 @@ class NexusAPI:
                             version=entry.get("version", "") or "",
                             category_name=cat_name,
                             file_name=entry.get("uri", "") or "",
+                            category_id=int(entry.get("categoryId") or 0),
                             size_in_bytes=sz or None,
                             size_kb=(sz // 1024) if sz else 0,
                             mod_version="",
@@ -2149,7 +2205,14 @@ class NexusAPI:
             except Exception as exc:
                 app_log(f"GraphQL modFilesBatch error: {exc}")
 
-        return results
+            return results
+
+        unique_mods = list(dict.fromkeys(mod_ids))
+        batch_size = self._GRAPHQL_FILE_BATCH
+        return self._map_graphql_batches(
+            [unique_mods[i:i + batch_size]
+             for i in range(0, len(unique_mods), batch_size)],
+            fetch_batch)
 
     def graphql_mod_info_batch(
         self,
@@ -2668,11 +2731,15 @@ class NexusAPI:
         return """
     query Collections(
         $gameDomain: String!
+        $schemaId: Int!
         $count: Int
         $offset: Int
     ) {
         collectionsV2(
-            filter: { gameDomain: [{ value: $gameDomain }] }
+            filter: {
+                gameDomain: [{ value: $gameDomain }]
+                schemaId: [{ value: $schemaId, op: EQUALS }]
+            }
             count: $count
             offset: $offset
             sort: [%s]
@@ -2728,7 +2795,12 @@ class NexusAPI:
         *sort* is one of COLLECTION_SORTS (downloads / endorsements / rating /
         recent); unknown values fall back to the most-downloaded default.
         """
-        variables = {"gameDomain": game_domain, "count": count, "offset": offset}
+        variables = {
+            "gameDomain": game_domain,
+            "schemaId": _SUPPORTED_COLLECTION_SCHEMA_ID,
+            "count": count,
+            "offset": offset,
+        }
         query = self._collections_query(self._collection_sort_clause(sort))
         try:
             resp = self._post_graphql(query, variables,
@@ -2755,6 +2827,7 @@ class NexusAPI:
         return """
     query CollectionsSearch(
         $gameDomain: String!
+        $schemaId: Int!
         $query: String!
         $count: Int
         $offset: Int
@@ -2762,6 +2835,7 @@ class NexusAPI:
         collectionsV2(
             filter: {
                 gameDomain: [{ value: $gameDomain }]
+                schemaId: [{ value: $schemaId, op: EQUALS }]
                 name: { value: $query, op: WILDCARD }
             }
             count: $count
@@ -2803,6 +2877,7 @@ class NexusAPI:
         """
         variables = {
             "gameDomain": game_domain,
+            "schemaId": _SUPPORTED_COLLECTION_SCHEMA_ID,
             "query": query,
             "count": count,
             "offset": offset,
@@ -2840,6 +2915,8 @@ class NexusAPI:
             }
             latestPublishedRevision {
                 revisionNumber
+                collectionSchemaId
+                gameVersions { reference }
                 modCount totalSize assetsSizeBytes
                 downloadLink
                 modFiles {
@@ -2859,6 +2936,8 @@ class NexusAPI:
     query CollectionRevision($slug: String!, $domain: String!, $revision: Int!) {
         collectionRevision(slug: $slug, domainName: $domain, revision: $revision) {
             revisionNumber
+            collectionSchemaId
+            gameVersions { reference }
             modCount totalSize assetsSizeBytes
             downloadLink
             modFiles {
@@ -2894,8 +2973,8 @@ class NexusAPI:
         where ``revisions`` is a list of dicts with ``revisionNumber`` and
         ``revisionStatus`` (only populated on the initial/latest fetch, not on
         specific-revision fetches), and ``card`` carries collection-level display
-        fields (``tile_image_url``, ``total_downloads``, ``endorsements``) for
-        re-hydrating a NexusCollection.
+        fields for re-hydrating a NexusCollection. Unsupported revision schemas
+        return no install data and are identified in ``card``.
         """
         try:
             self._refresh_oauth_if_needed()
@@ -2952,6 +3031,30 @@ class NexusAPI:
                 rev = rev_data.get("data", {}).get("collectionRevision") or {}
             else:
                 rev = latest_rev
+
+            game_versions = []
+            for item in (rev.get("gameVersions") or []):
+                reference = (item.get("reference") if isinstance(item, dict)
+                             else item)
+                reference = str(reference or "").strip()
+                if reference:
+                    game_versions.append(reference)
+            card["game_versions"] = game_versions
+
+            schema_id_value = rev.get("collectionSchemaId")
+            if schema_id_value is not None:
+                try:
+                    schema_id = int(schema_id_value)
+                except (TypeError, ValueError):
+                    schema_id = 0
+                card["collection_schema_id"] = schema_id
+                if schema_id != _SUPPORTED_COLLECTION_SCHEMA_ID:
+                    card["unsupported_collection_schema"] = True
+                    app_log(
+                        f"get_collection_detail: unsupported collection schema "
+                        f"{schema_id} for slug={slug!r} rev={revision_number}"
+                    )
+                    return (col_name, 0, 0, [], "", revisions, card)
 
             total_size = int(rev.get("totalSize") or 0) + int(rev.get("assetsSizeBytes") or 0)
             mod_count = int(rev.get("modCount") or 0)
@@ -3051,7 +3154,7 @@ class NexusAPI:
                         app_log(f"get_collection_archive_json: mirror {cdn_url!r} failed: {_mirror_exc}")
                 if dl_resp is None:
                     raise RuntimeError("all CDN mirrors failed")
-                from Utils import bandwidth_limit as _bw
+                from Utils.downloads import bandwidth as _bw
                 with open(tmp_path, "wb") as fh:
                     for chunk in dl_resp.iter_content(chunk_size=65536):
                         if chunk:
@@ -3158,7 +3261,7 @@ class NexusAPI:
                         app_log(f"get_collection_archive_full: mirror {cdn_url!r} failed: {_mirror_exc}")
                 if dl_resp is None:
                     raise RuntimeError("all CDN mirrors failed")
-                from Utils import bandwidth_limit as _bw
+                from Utils.downloads import bandwidth as _bw
                 with open(tmp_path, "wb") as fh:
                     for chunk in dl_resp.iter_content(chunk_size=65536):
                         if chunk:
@@ -3243,7 +3346,7 @@ class NexusAPI:
             # Stream to a .part sidecar so an interrupted download never leaves a
             # truncated .7z that later looks like a complete archive.
             part_path = f"{dest_path}.part"
-            from Utils import bandwidth_limit as _bw
+            from Utils.downloads import bandwidth as _bw
             with open(part_path, "wb") as fh:
                 for chunk in dl_resp.iter_content(chunk_size=65536):
                     if chunk:

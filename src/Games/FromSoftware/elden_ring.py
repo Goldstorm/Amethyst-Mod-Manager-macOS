@@ -44,15 +44,15 @@ from Games.base_game import BaseGame, WizardTool
 from Games.FromSoftware import me3_profile, me3_runtime
 from Utils.atomic_write import write_atomic_text
 from Utils.config_paths import get_profiles_dir
-from Utils.deploy import (
+from Utils.deployment import (
     LinkMode,
     _FILEMAP_SNAPSHOT_NAME,
     _move_runtime_files,
     deploy_root_folder,
     restore_root_folder,
 )
-from Utils.mod_files import excluded_raw_by_mod
-from Utils.modlist import read_modlist
+from Utils.mods.files import excluded_raw_by_mod
+from Utils.mods.modlist import read_modlist
 
 _PROFILES_DIR = get_profiles_dir()
 
@@ -874,11 +874,11 @@ class EldenRing(BaseGame):
 
         # Routed files are hardlinks we made, not the user's mod content.
         try:
-            from Utils.deploy_custom_rules import restore_custom_rules
+            from Utils.deployment.custom_rules import restore_custom_rules
             routed = self.get_routed_package_path()
             restore_custom_rules(self.get_effective_filemap_path(), routed,
-                                 self.custom_routing_rules,
-                                 log_fn=lambda m: None)
+                                 [],
+                                 log_fn=lambda m: None, prefix_root=self.get_prefix_path())
             if routed.is_dir():
                 shutil.rmtree(routed)
                 _log(f"Removed {routed.name}/.")
@@ -926,17 +926,17 @@ class EldenRing(BaseGame):
         whether the file sits at the mod root or inside an optional-variant
         subfolder (only the copy Mod Files leaves enabled reaches the filemap).
         """
-        from Utils.deploy import CustomRule
+        from Utils.deployment import CustomRule
         return [
-            CustomRule(dest="chr",
+            CustomRule(rule_id='elden_ring:37163bc08e63', dest="chr",
                        extensions=[".anibnd.dcx", ".chrbnd.dcx", ".behbnd.dcx"],
                        flatten=True),
-            CustomRule(dest="parts", extensions=[".partsbnd.dcx"], flatten=True),
-            CustomRule(dest="sfx", extensions=[".ffxbnd.dcx"], flatten=True),
-            CustomRule(dest="material", extensions=[".matbinbnd.dcx"],
+            CustomRule(rule_id='elden_ring:dc535ba27921', dest="parts", extensions=[".partsbnd.dcx"], flatten=True),
+            CustomRule(rule_id='elden_ring:ac3c3535b3cc', dest="sfx", extensions=[".ffxbnd.dcx"], flatten=True),
+            CustomRule(rule_id='elden_ring:35e6a0991bc5', dest="material", extensions=[".matbinbnd.dcx"],
                        flatten=True),
-            CustomRule(dest="event", extensions=[".emevd.dcx"], flatten=True),
-            CustomRule(dest="script", extensions=[".luabnd.dcx"], flatten=True),
+            CustomRule(rule_id='elden_ring:e3e544566ef7', dest="event", extensions=[".emevd.dcx"], flatten=True),
+            CustomRule(rule_id='elden_ring:60a87a212c93', dest="script", extensions=[".luabnd.dcx"], flatten=True),
         ]
 
     def get_routed_package_path(self) -> Path:
@@ -954,7 +954,7 @@ class EldenRing(BaseGame):
         the game root - Elden Ring copies nothing into the game, so the rules'
         destinations are resolved inside a folder me3 serves from.
         """
-        from Utils.deploy_custom_rules import (deploy_custom_rules,
+        from Utils.deployment.custom_rules import (deploy_custom_rules,
                                                restore_custom_rules)
         routed = self.get_routed_package_path()
         filemap = self.get_effective_filemap_path()
@@ -962,8 +962,8 @@ class EldenRing(BaseGame):
         # Always clear the previous run first: a file that stopped matching (mod
         # disabled, or moved into chr/ by hand) must not linger and keep winning.
         try:
-            restore_custom_rules(filemap, routed, self.custom_routing_rules,
-                                 log_fn=lambda m: None)
+            restore_custom_rules(filemap, routed, self.effective_custom_routing_rules,
+                                 log_fn=lambda m: None, prefix_root=self.get_prefix_path())
         except Exception:
             pass
         try:
@@ -972,13 +972,15 @@ class EldenRing(BaseGame):
         except OSError as exc:
             log_fn(f"  Could not clear {routed.name}/ ({exc}).")
 
-        if not filemap.is_file():
+        from Utils.filegraph.deploy import input_ready, legacy_rows
+        if not input_ready():
             return None, set()
         try:
             handled = deploy_custom_rules(
                 filemap, routed, self.get_effective_mod_staging_path(),
-                self.custom_routing_rules, mode=LinkMode.HARDLINK,
+                self.effective_custom_routing_rules, mode=LinkMode.HARDLINK,
                 log_fn=lambda m: log_fn(f"  {m}"),
+                prefix_root=self.get_prefix_path(),
             )
         except Exception as exc:
             # A routing failure must not lose the whole mod list.
@@ -989,16 +991,9 @@ class EldenRing(BaseGame):
 
         # Map the handled paths back to the mods they came from.
         mods: set[str] = set()
-        try:
-            with filemap.open(encoding="utf-8", errors="surrogateescape") as fh:
-                for line in fh:
-                    if "\t" not in line:
-                        continue
-                    rel, mod_name = line.rstrip("\n").split("\t", 1)
-                    if rel.lower() in handled:
-                        mods.add(mod_name)
-        except OSError:
-            pass
+        for rel, mod_name in legacy_rows():
+            if rel.lower() in handled:
+                mods.add(mod_name)
 
         log_fn(f"  Placed {len(handled)} file(s) into {routed.name}/ "
                "at the paths the game reads them from.")

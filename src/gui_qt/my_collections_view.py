@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
 )
 
 from gui_qt.safe_emit import safe_emit
-from gui_qt.theme_qt import active_palette, _c
+from gui_qt.theme_qt import active_palette, close_button, _c
 from gui_qt.export_profile_view import _CardOverlay, _card_title, _card_button_bar
 
 _COL_NAME, _COL_GAME, _COL_STATUS, _COL_REVISION, _COL_DOWNLOADS = range(5)
@@ -169,9 +169,7 @@ class MyCollectionsView(QWidget):
         refresh.setCursor(Qt.PointingHandCursor)
         refresh.clicked.connect(self.refresh)
         hb.addWidget(refresh)
-        close = QPushButton(self.tr("✕ Close"))
-        close.setObjectName("FormButton")
-        close.setCursor(Qt.PointingHandCursor)
+        close = close_button(self.tr("✕ Close"))
         close.clicked.connect(self._close)
         hb.addWidget(close)
         root.addWidget(bar)
@@ -592,7 +590,7 @@ class MyCollectionsView(QWidget):
         if col is None:
             return
         name = self._name.text().strip()
-        from Utils.collection_export import validate_collection_name
+        from Utils.collections.export import validate_collection_name
         problem = validate_collection_name(name)
         if problem:
             self._notify(problem, "warning")

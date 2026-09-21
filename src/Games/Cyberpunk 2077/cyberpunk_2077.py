@@ -20,7 +20,7 @@ from pathlib import Path
 
 from Games.base_game import BaseGame, MODERN_DIRECTX_DEPS
 from Utils.vfs import ProfileVFSGameMixin
-from Utils.deploy import (
+from Utils.deployment import (
     CustomRule,
     LinkMode,
     deploy_custom_rules,
@@ -30,10 +30,12 @@ from Utils.deploy import (
     expand_separator_deploy_paths,
     expand_separator_link_modes,
     expand_separator_raw_deploy,
+    _prune_empty_dirs,
+    _resolve_root_path,
     restore_custom_rules,
     restore_filemap_from_root,
 )
-from Utils.modlist import read_modlist
+from Utils.mods.modlist import read_modlist
 from Utils.config_paths import get_profiles_dir
 
 _PROFILES_DIR = get_profiles_dir()
@@ -136,13 +138,13 @@ class Cyberpunk2077(ProfileVFSGameMixin, BaseGame):
     @property
     def custom_routing_rules(self) -> list[CustomRule]:
         return [
-            CustomRule(
+            CustomRule(rule_id='cyberpunk_2077:9608abbaf6a4',
                 dest="archive/pc/mod",
                 extensions=[".archive"],
                 companion_extensions=[".xl"],
                 loose_only=True,
             ),
-            CustomRule(
+            CustomRule(rule_id='cyberpunk_2077:9dfbd499fa02',
                 dest="archive/pc/mod",
                 extensions=[".xl"],
                 loose_only=True,
@@ -263,7 +265,8 @@ class Cyberpunk2077(ProfileVFSGameMixin, BaseGame):
         filemap   = self.get_effective_filemap_path()
         staging   = self.get_effective_mod_staging_path()
 
-        if not filemap.is_file():
+        from Utils.filegraph.deploy import input_ready
+        if not input_ready():
             raise RuntimeError(
                 f"filemap.txt not found: {filemap}\n"
                 "Run 'Build Filemap' before deploying."
@@ -288,7 +291,7 @@ class Cyberpunk2077(ProfileVFSGameMixin, BaseGame):
         per_mod_modes = expand_separator_link_modes(_sep_deploy, _sep_entries) or None
         per_mod_raw = expand_separator_raw_deploy(_sep_deploy, _sep_entries) or None
 
-        custom_rules = self.custom_routing_rules
+        custom_rules = self.effective_custom_routing_rules
         custom_exclude: set[str] = set()
         if custom_rules:
             _log("Routing loose .archive/.xl files to archive/pc/mod/ ...")
@@ -301,6 +304,7 @@ class Cyberpunk2077(ProfileVFSGameMixin, BaseGame):
                 per_mod_link_modes=per_mod_modes,
                 raw_mods=per_mod_raw,
                 log_fn=_log,
+                prefix_root=self.get_prefix_path(),
             )
 
         _log(f"Transferring mod files into game root ({mode.name}) ...")
@@ -335,7 +339,12 @@ class Cyberpunk2077(ProfileVFSGameMixin, BaseGame):
 
     @staticmethod
     def _archive_modlist_dest(game_root: Path) -> Path:
-        return game_root / "archive" / "pc" / "mod" / "modlist.txt"
+        # The ordinary and custom-rule deploy paths merge case-insensitively
+        # into existing game directories.  Keep the generated load-order file
+        # on that same physical path too; otherwise an existing ``Mod`` folder
+        # receives the archives while this writer creates a sibling ``mod``.
+        return _resolve_root_path(
+            game_root, Path("archive/pc/mod/modlist.txt"))
 
     def _ordered_mod_archives(self, filemap: Path, profile_dir: Path,
                               exclude_mods: "set[str] | None" = None) -> list[str]:
@@ -349,7 +358,7 @@ class Cyberpunk2077(ProfileVFSGameMixin, BaseGame):
         (raw-deploy / custom-location separator mods) never land in
         archive/pc/mod, so their archives are dropped entirely.
         """
-        from Utils.data_tab import parse_filemap
+        from Utils.filegraph.deploy import legacy_rows
 
         mods = [e.name for e in read_modlist(profile_dir / "modlist.txt")
                 if e.enabled and not e.is_separator]
@@ -364,7 +373,7 @@ class Cyberpunk2077(ProfileVFSGameMixin, BaseGame):
         # apply the same substitution before deciding what lands in the dir.
         remap = [(k.lower(), v) for k, v in (self.mod_deploy_path_remap or {}).items()]
         best: dict[str, tuple[int, str]] = {}  # filename_lower → (rank, filename)
-        for rel, mod in parse_filemap(filemap):
+        for rel, mod in legacy_rows():
             rl = rel.lower()
             if not rl.endswith(".archive") or mod in excluded:
                 continue
@@ -479,71 +488,38 @@ class Cyberpunk2077(ProfileVFSGameMixin, BaseGame):
             profile_dir = self.get_profile_root() / "profiles" / profile
             root_owns = False
             if bool(getattr(self, "_pipeline_root_folder_enabled", True)):
-                from Utils.deploy import _resolve_nocase
+                from Utils.deployment import _resolve_nocase
                 root_source = _resolve_nocase(
                     self.get_effective_root_folder_path(), rel)
                 root_owns = bool(
                     root_source is not None and root_source.is_file())
-            root_map = filemap.parent / "filemap_root.txt"
-            if not root_owns and root_map.is_file():
-                # A map entry is only a claim if its source actually survived
-                # exclusions/resolution and reached the view. A stale map line
-                # with a missing source must not suppress generation.
-                from Utils.deploy import _resolve_nocase
-                from Utils.mod_files import excluded_raw_by_mod
-                excluded = excluded_raw_by_mod(profile_dir) or {}
-                per_mod_strip = load_per_mod_strip_prefixes(profile_dir)
+            if not root_owns:
+                # The pinned plan already incorporates exclusions, routing,
+                # and exact staged source identity.
+                from Utils.deployment import _resolve_nocase
+                from Utils.filegraph.deploy import entries as filegraph_entries
                 view_dest = _resolve_nocase(view_root, rel)
-                for line in root_map.read_text(
-                    encoding="utf-8", errors="surrogateescape"
-                ).splitlines():
-                    if "\t" not in line:
+                for entry in filegraph_entries(include_root=True):
+                    if (entry.destination.replace("\\", "/").casefold()
+                            != rel.casefold()
+                            or entry.source_path is None):
                         continue
-                    mapped_rel, owner = line.split("\t", 1)
-                    if (mapped_rel.replace("\\", "/").casefold()
-                            != rel.casefold()):
-                        continue
-                    prefixes = list(per_mod_strip.get(owner) or ())
-                    shared = list(self.mod_folder_strip_prefixes or ())
-                    prefixes.extend(shared)
-                    if per_mod_strip.get(owner):
-                        prefixes.extend(
-                            f"{outer}/{inner}"
-                            for outer in per_mod_strip[owner]
-                            for inner in shared
-                        )
-                    candidates = [mapped_rel] + [
-                        f"{prefix}/{mapped_rel}" for prefix in prefixes
-                    ]
-                    owner_excluded = excluded.get(owner) or set()
-                    for candidate_rel in candidates:
-                        source = _resolve_nocase(
-                            staging / owner, candidate_rel)
-                        if source is None or not source.is_file():
-                            continue
+                    source = Path(entry.source_path)
+                    if source.is_file() and view_dest is not None and view_dest.is_file():
                         try:
-                            real_rel = source.relative_to(
-                                staging / owner).as_posix().casefold()
-                        except ValueError:
-                            real_rel = candidate_rel.casefold()
-                        if real_rel in owner_excluded:
-                            continue
-                        if view_dest is not None and view_dest.is_file():
+                            root_owns = view_dest.samefile(source)
+                        except OSError:
+                            root_owns = False
+                        if not root_owns:
                             try:
-                                root_owns = view_dest.samefile(source)
+                                root_owns = (
+                                    view_dest.stat().st_size
+                                    == source.stat().st_size
+                                    and view_dest.read_bytes()
+                                    == source.read_bytes()
+                                )
                             except OSError:
                                 root_owns = False
-                            if not root_owns:
-                                try:
-                                    root_owns = (
-                                        view_dest.stat().st_size
-                                        == source.stat().st_size
-                                        and view_dest.read_bytes()
-                                        == source.read_bytes()
-                                    )
-                                except OSError:
-                                    root_owns = False
-                        break
                     if root_owns:
                         break
             if root_owns:
@@ -595,6 +571,7 @@ class Cyberpunk2077(ProfileVFSGameMixin, BaseGame):
         dest = self._archive_modlist_dest(game_root)
         state = filemap.parent / "archive_modlist.state"
         backup = filemap.parent / "archive_modlist_backup.txt"
+        removed_generated = state.is_file()
         if state.is_file():
             if dest.is_file():
                 dest.unlink()
@@ -603,6 +580,12 @@ class Cyberpunk2077(ProfileVFSGameMixin, BaseGame):
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(backup), str(dest))
             _log("Archive load order: original modlist.txt restored.")
+        elif removed_generated:
+            # This generated file is removed after the routed/root file logs
+            # have already pruned their paths.  Revisit its parent now: when
+            # archive/pc/mod did not exist before deploy, modlist.txt was the
+            # last entry keeping that deployment-created directory alive.
+            _prune_empty_dirs({dest.parent}, stop_dirs={game_root})
 
     def _deployed_redmods(self) -> list[str]:
         """Names of REDmods deployed in the game root (mods/<name>/info.json)."""
@@ -653,12 +636,12 @@ class Cyberpunk2077(ProfileVFSGameMixin, BaseGame):
         time, re-read per launch).  Returns a user-facing warning only when
         the option couldn't be added automatically."""
         try:
-            from Utils.exe_launch import (
+            from Utils.executables.launch import (
                 effective_steam_id, game_is_steam_install,
                 game_is_heroic_install, heroic_app_names_for_launch,
             )
             if game_is_steam_install(self):
-                from Utils.steam_finder import (
+                from Utils.launchers.steam import (
                     add_steam_launch_option, steam_launch_options,
                 )
                 sid = effective_steam_id(self) or self.steam_id
@@ -688,7 +671,7 @@ class Cyberpunk2077(ProfileVFSGameMixin, BaseGame):
                     "(Properties → Launch Options) - it couldn't be added "
                     "automatically.")
             elif game_is_heroic_install(self):
-                from Utils.heroic_finder import (
+                from Utils.launchers.heroic import (
                     add_heroic_launcher_arg, heroic_launcher_args,
                 )
                 names = heroic_app_names_for_launch(self)
@@ -723,10 +706,8 @@ class Cyberpunk2077(ProfileVFSGameMixin, BaseGame):
         filemap   = self.get_effective_filemap_path()
         game_root = self._game_path
 
-        custom_rules = self.custom_routing_rules
-        if custom_rules:
-            _log("Restore: removing custom-routed .archive files ...")
-            restore_custom_rules(filemap, game_root, rules=custom_rules, log_fn=_log)
+        _log("Restore: removing custom-routed .archive files ...")
+        restore_custom_rules(filemap, game_root, rules=[], log_fn=_log, prefix_root=self.get_prefix_path())
 
         # Restore follows the state that actually exists rather than the
         # current toggle. A user can turn VFS off after deploying, and an older

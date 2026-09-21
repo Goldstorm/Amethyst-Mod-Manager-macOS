@@ -47,16 +47,16 @@ from pathlib import Path
 
 from Games.base_game import BaseGame
 from Utils.vfs import ProfileVFSGameMixin
-from Utils.deploy import (
+from Utils.deployment import (
     LinkMode,
     cleanup_custom_deploy_dirs,
     deploy_filemap_to_root,
     load_per_mod_strip_prefixes,
     restore_filemap_from_root,
 )
-from Utils.modlist import read_modlist
+from Utils.mods.modlist import read_modlist
 from Utils.config_paths import get_profiles_dir
-from Utils.re_pak_patcher import (
+from Utils.re_engine.pak import (
     find_pak_files,
     hash_filepath,
     patch_pak_file,
@@ -64,8 +64,8 @@ from Utils.re_pak_patcher import (
     restore_pak_file,
     update_root_manifest,
 )
-from Utils.steam_finder import parse_acf_beta_key
-from Utils.tex_convert import convert_tex_v10_to_v34, tex_needs_conversion
+from Utils.launchers.steam import parse_acf_beta_key
+from Utils.re_engine.tex import convert_tex_v10_to_v34, tex_needs_conversion
 
 _PROFILES_DIR = get_profiles_dir()
 
@@ -294,6 +294,7 @@ class ResidentEvilVillage(ProfileVFSGameMixin, BaseGame):
         progress_fn=None,
         state_dir: Path | None = None,
         write_snapshot: bool = True,
+        exclude: set[str] | None = None,
     ) -> tuple[int, set[str]]:
         """Place loose files physically or into a private VFS build layer."""
         _log = log_fn or (lambda _: None)
@@ -353,6 +354,7 @@ class ResidentEvilVillage(ProfileVFSGameMixin, BaseGame):
                 per_mod_strip_prefixes=per_mod_strip,
                 log_fn=_log,
                 progress_fn=progress_fn,
+                exclude=exclude,
                 path_remap=self.mod_deploy_path_remap or None,
                 ext_remap=tex_ext_remap or None,
                 file_transform=file_transform,
@@ -415,17 +417,11 @@ class ResidentEvilVillage(ProfileVFSGameMixin, BaseGame):
         those same upper files again under their original pre-remap names.
         Runtime-created upper files absent from the filemap remain unaffected.
         """
+        from Utils.filegraph.deploy import legacy_rows
         entries: set[str] = set()
-        with filemap.open(
-            encoding="utf-8", errors="surrogateescape",
-        ) as handle:
-            for line in handle:
-                line = line.rstrip("\n")
-                if "\t" not in line:
-                    continue
-                relative, owner = line.split("\t", 1)
-                if owner == "[Overwrite]":
-                    entries.add(relative.replace("\\", "/").lower())
+        for relative, owner in legacy_rows():
+            if owner == "[Overwrite]":
+                entries.add(relative.replace("\\", "/").lower())
         return entries
 
     def _patch_pak_files(
@@ -564,7 +560,8 @@ class ResidentEvilVillage(ProfileVFSGameMixin, BaseGame):
         filemap = self.get_effective_filemap_path()
         staging = self.get_effective_mod_staging_path()
 
-        if not filemap.is_file():
+        from Utils.filegraph.deploy import input_ready
+        if not input_ready():
             raise RuntimeError(
                 f"filemap.txt not found: {filemap}\n"
                 "Run 'Build Filemap' before deploying."
@@ -631,6 +628,7 @@ class ResidentEvilVillage(ProfileVFSGameMixin, BaseGame):
             "Step 1: Deploying mod files to game root, backing up "
             "overwritten vanilla files ..."
         )
+        custom_exclude = self._deploy_custom_routing_rules(mode, log_fn)
         linked_mod, placed_lower = self._deploy_loose_filemap(
             filemap=filemap,
             destination=self._game_path,
@@ -640,7 +638,10 @@ class ResidentEvilVillage(ProfileVFSGameMixin, BaseGame):
             per_mod_strip=per_mod_strip,
             log_fn=_log,
             progress_fn=progress_fn,
+            exclude=custom_exclude,
         )
+        placed_lower.update(self._custom_routing_destinations_under(
+            custom_exclude, self._game_path))
         _log(f"  Deployed {linked_mod} mod file(s).")
         self._patch_pak_files(
             placed_lower, profile=profile, log_fn=_log)
@@ -653,9 +654,11 @@ class ResidentEvilVillage(ProfileVFSGameMixin, BaseGame):
         if self._game_path is None:
             raise RuntimeError("Game path is not configured.")
 
+        self._restore_custom_routing_rules(log_fn)
+
         _profile_dir = self._active_profile_dir
         _entries = read_modlist(_profile_dir / "modlist.txt") if _profile_dir else []
-        cleanup_custom_deploy_dirs(_profile_dir, _entries, log_fn=_log)
+        cleanup_custom_deploy_dirs(_profile_dir, _entries, log_fn=_log, game=self)
 
         # Restore PAK entries from every profile's pak_patches/ backups.
         # Deploy writes backups under whichever profile was active, so restore

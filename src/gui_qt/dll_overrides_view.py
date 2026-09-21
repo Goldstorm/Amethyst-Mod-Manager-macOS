@@ -4,8 +4,8 @@ improvement: the Tk panel hardcodes ``native,builtin`` for every DLL, whereas
 this offers a PER-DLL load-order picker (native / builtin / native,builtin /
 builtin,native / disabled).
 
-The persistence reuses the neutral ``Utils.wine_dll_config`` +
-``Utils.deploy_wine_dll`` helpers unchanged - those already write whatever value
+The persistence reuses the neutral ``Utils.wine.dll_config`` +
+``Utils.deployment.wine_dll`` helpers unchanged - those already write whatever value
 string they're given, so per-order flexibility is a pure UI change. Overrides are
 saved to config and applied to the prefix's ``user.reg`` on "Save & Apply".
 """
@@ -21,9 +21,9 @@ from PySide6.QtWidgets import (
     QComboBox, QFrame, QScrollArea,
 )
 
-from gui_qt.theme_qt import active_palette, _c, danger_close_button, contrast_text
+from gui_qt.theme_qt import active_palette, _c, close_button, contrast_text
 from gui_qt.wheel_guard import no_wheel
-from Utils.wine_dll_config import (
+from Utils.wine.dll_config import (
     load_wine_dll_overrides, save_wine_dll_overrides,
 )
 
@@ -103,7 +103,7 @@ class DllOverridesView(QWidget):
         title = QLabel(self.tr("Wine DLL Overrides - {0}").format(gname))
         title.setObjectName("DllTitle")
         hb.addWidget(title); hb.addStretch(1)
-        close = danger_close_button()
+        close = close_button()
         close.clicked.connect(self._close)
         hb.addWidget(close)
         root.addWidget(bar)
@@ -266,7 +266,7 @@ class DllOverridesView(QWidget):
         def worker():
             ok = True
             try:
-                from Utils.deploy import (
+                from Utils.deployment import (
                     apply_wine_dll_overrides, remove_wine_dll_overrides)
                 if removed_copy:
                     self._log(f"Wine DLL Overrides: removing "

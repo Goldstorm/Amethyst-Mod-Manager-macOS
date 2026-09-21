@@ -8,7 +8,7 @@ also writes a failsafe manifest of the original hash bytes into the game root
 (``.mm_pak_restore.json``); this view restores from that manifest.
 
 Opens as a plugins-panel-scoped tab.  All PAK logic is in the neutral
-Utils.re_pak_patcher; the repair runs on a daemon thread and marshals log
+Utils.re_engine.pak; the repair runs on a daemon thread and marshals log
 lines / completion back to the UI thread via Signals.
 """
 
@@ -23,9 +23,9 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QPlainTextEdit,
 )
 
-from gui_qt.theme_qt import active_palette, _c, button_qss, err_text
+from gui_qt.theme_qt import active_palette, _c, button_qss, close_button, err_text
 from gui_qt.safe_emit import safe_emit
-from Utils.re_pak_patcher import (
+from Utils.re_engine.pak import (
     ROOT_MANIFEST_NAME,
     restore_from_root_manifest,
     root_manifest_summary,
@@ -71,10 +71,7 @@ class RePakRestoreView(QWidget):
         title.setStyleSheet(f"color:{_c(p,'TEXT_MAIN')}; font-weight:600;")
         hb.addWidget(title)
         hb.addStretch(1)
-        close = QPushButton(self.tr("✕ Close"))
-        close.setCursor(Qt.PointingHandCursor)
-        close.setStyleSheet(
-            button_qss("BTN_DANGER", padding="5px 12px"))
+        close = close_button(self.tr("✕ Close"), pal=p)
         close.clicked.connect(self._on_close)
         hb.addWidget(close)
         v.addWidget(bar)

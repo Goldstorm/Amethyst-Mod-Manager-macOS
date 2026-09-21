@@ -1,0 +1,14 @@
+py.install_sources(
+  '__init__.py',
+  'bandwidth.py',
+  'cache.py',
+  'core.py',
+  'locations.py',
+  'install.py',
+  'modl.py',
+  'mpi.py',
+  'scheduler.py',
+  'speed.py',
+  'resources.py',
+  subdir: 'Utils/downloads',
+)

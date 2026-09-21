@@ -1,6 +1,6 @@
 """Prefix Health Check - a modal report of what a game's Proton prefix contains.
 
-Opened from the Proton Tools menu. Every row comes from ``Utils.prefix_health``,
+Opened from the Proton Tools menu. Every row comes from ``Utils.wine.health``,
 which reads the prefix itself rather than trusting Amethyst's
 ``amethyst_deps.json`` marker, so prefixes provisioned by hand report honestly.
 Which rows appear is driven entirely by the game handler's ``auto_install_deps``
@@ -30,10 +30,10 @@ from PySide6.QtWidgets import (
 from gui_qt.overlay_base import OverlayBase
 from gui_qt.safe_emit import safe_emit
 from gui_qt.theme_qt import (
-    _c, active_palette, button_qss, contrast_text, danger_close_button,
+    _c, active_palette, button_qss, contrast_text, close_button,
     err_text, ok_text,
 )
-from Utils.prefix_health import HealthStatus
+from Utils.wine.health import HealthStatus
 
 _GLYPH = {
     HealthStatus.OK: "✔",
@@ -46,68 +46,45 @@ _GLYPH = {
 def _fix_game_registry(game, log_fn) -> bool:
     """Re-register the game's install path in the prefix (Bethesda tools).
 
-    Headless equivalent of the Register Game Path wizard: the marker is cleared
-    first so a manual fix always rewrites, even when the recorded path matches.
+    Uses the same stale-path repair as deploy and restore.
     """
-    from Utils.bethesda_registry import _marker_path, register_bethesda_game_path
-    from Utils.proton_prefix import resolve_compat_data
-    from Utils.proton_tools import resolve_proton_env
-
-    registry_name = getattr(game, "synthesis_registry_name", None)
-    if not registry_name:
-        log_fn("This game does not use the Bethesda Softworks registry key.")
-        return False
-    prefix = game.get_prefix_path() if hasattr(game, "get_prefix_path") else None
-    if not prefix:
-        log_fn("No Proton prefix is configured for this game.")
-        return False
     game_path = game.get_game_path() if hasattr(game, "get_game_path") else None
     if not game_path:
         log_fn("The game install path is not configured.")
         return False
-
-    proton_script, env = resolve_proton_env(game, log_fn)
-    if proton_script is None:
-        log_fn("No Proton could be resolved for this prefix.")
-        return False
-    env = dict(env or {})
-    env.setdefault("WINEDEBUG", "-all")
-
-    # register_bethesda_game_path takes the compat-data dir (the parent of
-    # pfx/), NOT the prefix - and for Heroic/Lutris/Faugus that is the prefix
-    # itself, so resolve it rather than assuming .parent.
-    compat_data = resolve_compat_data(Path(prefix))
-    try:
-        _marker_path(compat_data, registry_name).unlink()
-    except OSError:
-        pass
-    return register_bethesda_game_path(
-        prefix_dir=compat_data, proton_script=proton_script, env=env,
-        game_path=Path(game_path), registry_game_name=registry_name,
-        log_fn=log_fn)
+    from Utils.bethesda.registry import repair_game_registry_path
+    return repair_game_registry_path(game, Path(game_path), log_fn)
 
 
 def _install_vcredist(game, log_fn) -> bool:
-    from Utils.proton_tools import install_vcredist
+    from Utils.wine.proton import install_vcredist
     return install_vcredist(game, log_fn=log_fn)
 
 
 def _install_d3dcompiler(game, log_fn) -> bool:
-    from Utils.proton_tools import install_d3dcompiler_47
+    from Utils.wine.proton import install_d3dcompiler_47
     return install_d3dcompiler_47(game, log_fn=log_fn)
 
 
 def _install_lavfilters(game, log_fn) -> bool:
-    from Utils.proton_tools import repair_lavfilters
+    from Utils.wine.proton import repair_lavfilters
     return repair_lavfilters(game, log_fn=log_fn)
 
 
-from Utils.protontricks import WINETRICKS_VERB_DEPS as _WINETRICKS_VERB_DEPS
+def _install_dotnet(version: str):
+    def _install(game, log_fn) -> bool:
+        from Utils.wine.proton import install_dotnet
+        return install_dotnet(game, version, log_fn=log_fn)
+    return _install
+
+
+from Utils.wine.protontricks import WINETRICKS_VERB_DEPS as _WINETRICKS_VERB_DEPS
+from Utils.wine.proton import DOTNET_VERSIONS as _DOTNET_VERSIONS
 
 def _install_winetricks_verb(verb: str):
     """Fix handler for a component that is just a winetricks verb."""
     def _install(game, log_fn) -> bool:
-        from Utils.protontricks import install_winetricks_verb
+        from Utils.wine.protontricks import install_winetricks_verb
         return install_winetricks_verb(game, verb, log_fn=log_fn)
     return _install
 
@@ -118,6 +95,7 @@ _FIX_INSTALLERS = {
     "d3dcompiler_47": _install_d3dcompiler,
     "lavfilters": _install_lavfilters,
     "game_registry": _fix_game_registry,
+    **{f"dotnet{_v}": _install_dotnet(_v) for _v in _DOTNET_VERSIONS},
     **{_v: _install_winetricks_verb(_v) for _v in _WINETRICKS_VERB_DEPS},
 }
 
@@ -164,7 +142,7 @@ class PrefixHealthOverlay(OverlayBase):
         if win is None:
             return
         try:
-            safe_emit(win._op_log, f"Prefix health: {message}")  # i18n: skip — log line
+            win._append_log(f"Prefix health: {message}")  # i18n: skip — log line
         except Exception:
             pass
 
@@ -244,7 +222,7 @@ class PrefixHealthOverlay(OverlayBase):
         bar.addWidget(self._fix_all)
 
         bar.addStretch(1)
-        self._close_btn = danger_close_button()
+        self._close_btn = close_button()
         self._close_btn.clicked.connect(lambda: self._finish(None))
         bar.addWidget(self._close_btn)
         v.addLayout(bar)
@@ -317,6 +295,9 @@ class PrefixHealthOverlay(OverlayBase):
 
     def _label_for(self, check) -> str:
         """Localised row label; falls back to the util's English one."""
+        for version in _DOTNET_VERSIONS:
+            if check.check_id == f"dotnet{version}":
+                return self.tr(".NET {0} Desktop Runtime").format(version)
         return {
             "prefix_exists": self.tr("Proton prefix"),
             "prefix_structure": self.tr("Prefix structure"),
@@ -390,16 +371,16 @@ class PrefixHealthOverlay(OverlayBase):
         def _worker():
             proton_script = None
             try:
-                from Utils.proton_tools import resolve_proton_env
+                from Utils.wine.proton import resolve_proton_env
                 proton_script, _env = resolve_proton_env(self._game, self._log)
             except Exception as exc:
                 self._log(f"could not resolve Proton: {exc}")
             try:
-                from Utils.prefix_health import run_prefix_health
+                from Utils.wine.health import run_prefix_health
                 checks = run_prefix_health(self._game, proton_script=proton_script,
                                            check_proton=True)
             except Exception as exc:
-                from Utils.prefix_health import HealthCheck
+                from Utils.wine.health import HealthCheck
                 self._log(f"check failed: {exc}")
                 checks = [HealthCheck("error", HealthStatus.UNKNOWN,
                                       "Health check", str(exc))]

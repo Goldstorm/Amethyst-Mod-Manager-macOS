@@ -17,8 +17,8 @@ Mod structure:
 from pathlib import Path
 
 from Games.base_game import BaseGame
-from Utils.deploy import CustomRule, LinkMode, deploy_custom_rules, deploy_filemap, deploy_core, load_per_mod_strip_prefixes, load_separator_deploy_paths, expand_separator_deploy_paths, cleanup_custom_deploy_dirs, move_to_core, restore_custom_rules, restore_data_core
-from Utils.modlist import read_modlist
+from Utils.deployment import CustomRule, LinkMode, deploy_custom_rules, deploy_filemap, deploy_core, load_per_mod_strip_prefixes, load_separator_deploy_paths, expand_separator_deploy_paths, cleanup_custom_deploy_dirs, move_to_core, restore_custom_rules, restore_data_core
+from Utils.mods.modlist import read_modlist
 from Utils.config_paths import get_profiles_dir
 
 _PROFILES_DIR = get_profiles_dir()
@@ -32,7 +32,7 @@ _MODS_SUBPATH = Path(
 _TRAY_SUBPATH = _MODS_SUBPATH.parent / "Tray"
 
 # Tray file extensions; the game only reads these from Tray/, never Mods/.
-_TRAY_EXTENSIONS = [".householdbinary", ".trayitem", ".sgi", ".hhi"]
+_TRAY_EXTENSIONS = [".householdbinary", ".trayitem", ".sgi", ".hhi", ".blueprint", ".room", ".rmi",".bpi"]
 
 
 class TheSims4(BaseGame):
@@ -80,7 +80,7 @@ class TheSims4(BaseGame):
     def custom_routing_rules(self) -> list[CustomRule]:
         """Tray files go to the prefix Tray/ folder, not Mods/."""
         return [
-            CustomRule(dest=str(_TRAY_SUBPATH), extensions=_TRAY_EXTENSIONS,
+            CustomRule(rule_id='the_sims_4:764037fc0f9a', dest=str(_TRAY_SUBPATH), extensions=_TRAY_EXTENSIONS,
                        flatten=True, to_prefix=True),
         ]
 
@@ -166,7 +166,8 @@ class TheSims4(BaseGame):
 
         mods_dir.mkdir(parents=True, exist_ok=True)
 
-        if not filemap.is_file():
+        from Utils.filegraph.deploy import input_ready
+        if not input_ready():
             raise RuntimeError(
                 f"filemap.txt not found: {filemap}\n"
                 "Run 'Build Filemap' before deploying."
@@ -178,7 +179,7 @@ class TheSims4(BaseGame):
         _sep_entries = read_modlist(profile_dir / "modlist.txt") if _sep_deploy else []
         per_mod_deploy = expand_separator_deploy_paths(_sep_deploy, _sep_entries) or None
 
-        custom_rules = self.custom_routing_rules
+        custom_rules = self.effective_custom_routing_rules
         custom_exclude: set[str] = set()
         if custom_rules:
             _log("Step 0: Routing Tray files into the prefix Tray/ folder ...")
@@ -230,21 +231,21 @@ class TheSims4(BaseGame):
 
         _profile_dir = self._active_profile_dir
         _entries = read_modlist(_profile_dir / "modlist.txt") if _profile_dir else []
-        cleanup_custom_deploy_dirs(_profile_dir, _entries, log_fn=_log)
+        cleanup_custom_deploy_dirs(_profile_dir, _entries, log_fn=_log, game=self)
 
-        custom_rules = self.custom_routing_rules
-        if custom_rules:
-            _log("Restore: removing custom-routed Tray files ...")
-            restore_custom_rules(
-                self.get_effective_filemap_path(),
-                self._game_path or self._prefix_path,
-                rules=custom_rules,
-                log_fn=_log,
-                prefix_root=self._prefix_path,
-            )
+        _log("Restore: removing custom-routed Tray files ...")
+        restore_custom_rules(
+            self.get_effective_filemap_path(),
+            self._game_path or self._prefix_path,
+            rules=[],
+            log_fn=_log,
+            prefix_root=self._prefix_path,
+        )
 
         _log("Restore: clearing Mods/ and moving Mods_Core/ back ...")
-        restored = restore_data_core(mods_dir, overwrite_dir=self.get_effective_overwrite_path(), log_fn=_log)
+        restored = restore_data_core(
+            mods_dir, overwrite_dir=self.get_effective_overwrite_path(),
+            log_fn=_log, game=self, profile_dir=self._active_profile_dir)
         _log(f"  Restored {restored} file(s). Mods_Core/ removed.")
 
         _log("Restore complete.")

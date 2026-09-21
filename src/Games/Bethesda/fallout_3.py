@@ -14,8 +14,8 @@ from pathlib import Path
 
 from Games.base_game import BaseGame, WizardTool, MODERN_DIRECTX_DEPS
 from Games.Bethesda.bethesda_ini import _read_ini_key, _set_ini_key
-from Utils.deploy import LinkMode, deploy_core, deploy_custom_rules, deploy_filemap, load_per_mod_strip_prefixes, load_separator_deploy_paths, expand_separator_deploy_paths, expand_separator_link_modes, expand_separator_raw_deploy, cleanup_custom_deploy_dirs, restore_custom_rules, move_to_core, restore_data_core, remove_case_alias_links, remove_probe_stub_dirs
-from Utils.modlist import read_modlist
+from Utils.deployment import LinkMode, deploy_core, deploy_custom_rules, deploy_filemap, load_per_mod_strip_prefixes, load_separator_deploy_paths, expand_separator_deploy_paths, expand_separator_link_modes, expand_separator_raw_deploy, cleanup_custom_deploy_dirs, restore_custom_rules, move_to_core, restore_data_core, remove_case_alias_links, remove_probe_stub_dirs
+from Utils.mods.modlist import read_modlist
 from Utils.config_paths import get_profiles_dir
 from Utils.vfs import ProfileVFSGameMixin
 
@@ -48,6 +48,7 @@ class Fallout_3(ProfileVFSGameMixin, BaseGame):
 
     # Enderal's own launcher already bootstraps its extender and overrides this.
     vfs_prefers_script_extender = True
+    supports_script_extender_swap = True
 
     plugins_use_star_prefix = False
     plugins_include_vanilla = True
@@ -206,6 +207,7 @@ class Fallout_3(ProfileVFSGameMixin, BaseGame):
                 "seq",
                 "shadercache",
                 "shaders",
+                "reshade-shaders",
                 "shadersfx",
                 "grass",
                 "video",
@@ -253,7 +255,7 @@ class Fallout_3(ProfileVFSGameMixin, BaseGame):
 
     @property
     def conflict_ignore_filenames(self) -> set[str]:
-        return {"info.xml","*read*.txt","*.jpg","*.md","*.url","*.zip"}
+        return {"info.xml","*read*.txt","*.md","*.url","*.zip"}
 
     @property
     def conflict_ignore_foldernames(self) -> set[str]:
@@ -287,25 +289,62 @@ class Fallout_3(ProfileVFSGameMixin, BaseGame):
     
     @property
     def custom_routing_rules(self) -> list:
-        from Utils.deploy import CustomRule
+        from Utils.deployment import CustomRule
         return [
-            CustomRule(dest="", filenames=["fose_loader.exe"], flatten=True, loose_only=True),
-            CustomRule(dest="", folders=["Data"], flatten=True, loose_only=True),
-            CustomRule(dest="", filenames=["fose*.dll"], flatten=True, loose_only=True),
+            CustomRule(rule_id='fallout_3:abb8b8d9e72f', dest="", filenames=["fose_loader.exe"], flatten=True, loose_only=True),
+            CustomRule(rule_id='fallout_3:42b2892ccb1f', dest="", folders=["Data"], flatten=True, loose_only=True),
+            CustomRule(rule_id='fallout_3:853eca2b27b4', dest="", filenames=["fose*.dll"], flatten=True, loose_only=True),
             self._saves_routing_rule([".fos"]),
                 ]
 
     def _saves_routing_rule(self, extensions: list[str]):
         """Route loose save files into the prefix's My Games Saves folder, mirrored to the GOG variant if that folder exists."""
-        from Utils.deploy import CustomRule
+        from Utils.deployment import CustomRule
         gog_sub = self._MYGAMES_SUBPATH_GOG or Path(f"{self._MYGAMES_SUBPATH} GOG")
         mirrors: list[str] = []
         if self._prefix_path is not None and (self._prefix_path / self._MYGAMES_DOCS / gog_sub).is_dir():
             mirrors.append(str(self._MYGAMES_DOCS / gog_sub / "Saves"))
-        return CustomRule(
+        return CustomRule(rule_id='fallout_3:7dd628b5eb3e',
             dest=str(self._MYGAMES_DOCS / self._MYGAMES_SUBPATH / "Saves"),
             extensions=extensions, flatten=True, to_prefix=True,
             mirror_dests=mirrors,
+        )
+
+    @staticmethod
+    def _fo3_mpi_wizard_tools(id_suffix: str) -> list[WizardTool]:
+        return [
+            WizardTool(
+                id=f"{id_suffix}_bsa_decompressor",
+                label="BSA Decompressor",
+                description=(
+                    "Decompress the vanilla BSA archives for faster loading "
+                    "(native Linux MPI installer) and add the result as a mod. "
+                    "Needs the FO3 BSA Decompressor download from Nexus."
+                ),
+                dialog_class_path="wizards.bsa_decompressor.BSADecompressorWizard",
+                category="Setup and Installers",
+            ),
+            WizardTool(
+                id=f"{id_suffix}_esm_fixes",
+                label="Install Unofficial Fallout 3 ESM Patcher",
+                description=(
+                    "Patch the vanilla .esm masters with community bugfixes "
+                    "(native Linux MPI installer) and add the result as a mod. "
+                    "Needs the Unofficial Fallout 3 ESM Patcher download from "
+                    "Nexus."
+                ),
+                dialog_class_path="wizards.esm_fixes.ESMFixesWizard",
+                category="Setup and Installers",
+            ),
+        ]
+
+    @staticmethod
+    def _xlodgen_wizard_tool(id_suffix: str) -> WizardTool:
+        return WizardTool(
+            id=f"run_xlodgen_{id_suffix}",
+            label="Run xLODGen",
+            description="Install xLODGen, deploy mods, and run xLODGenx64.exe.",
+            dialog_class_path="wizards.dyndolod.xLODGenWizard",
         )
 
     @property
@@ -330,12 +369,14 @@ class Fallout_3(ProfileVFSGameMixin, BaseGame):
                     "archive_keywords": ["fose"],
                 },
             ),
+            *self._fo3_mpi_wizard_tools("fo3"),
             WizardTool(
                 id="run_wrye_bash_fo3",
                 label="Run Wrye Bash",
                 description="Download and run Wrye Bash.",
                 dialog_class_path="wizards.wrye_bash.WryeBashWizard",
             ),
+            self._xlodgen_wizard_tool("fo3"),
             *self._xedit_wizard_tools(
                 build="FO3Edit", id_suffix="fo3",
                 nexus_url="https://www.nexusmods.com/fallout3/mods/637?tab=files",
@@ -815,7 +856,7 @@ class Fallout_3(ProfileVFSGameMixin, BaseGame):
             ]
         if not ordered:
             return
-        from Utils.plugin_mtimes import stamp_plugin_load_order
+        from Utils.plugins.mtimes import stamp_plugin_load_order
         data_dir = self._game_path / "Data"
         if self.vfs_launch_enabled:
             from Utils.vfs import virtual_data_write_path
@@ -836,12 +877,27 @@ class Fallout_3(ProfileVFSGameMixin, BaseGame):
 
     _MYGAMES_DOCS = Path("drive_c/users/steamuser/Documents/My Games")
 
+    @staticmethod
+    def _resolve_ini_path(directory: Path, filename: str) -> Path:
+        """Keep an existing INI's on-disk casing, or use the configured name."""
+        target = directory / filename
+        if target.is_file() or target.is_symlink():
+            return target
+        try:
+            for entry in directory.iterdir():
+                if (entry.name.casefold() == filename.casefold()
+                        and (entry.is_file() or entry.is_symlink())):
+                    return entry
+        except OSError:
+            pass
+        return target
+
     def _get_archive_ini_path(self) -> "Path | None":
         """Return the primary INI used for archive invalidation (back-compat)."""
         mygames = self._mygames_path()
         if mygames is None:
             return None
-        return mygames / self._ARCHIVE_INI_FILENAME
+        return self._resolve_ini_path(mygames, self._ARCHIVE_INI_FILENAME)
 
     def _get_archive_ini_paths(self) -> list[Path]:
         """Return every INI that needs the invalidation keys written.
@@ -852,9 +908,10 @@ class Fallout_3(ProfileVFSGameMixin, BaseGame):
         mygames = self._mygames_path()
         if mygames is None:
             return []
-        paths = [mygames / self._ARCHIVE_INI_FILENAME]
+        paths = [self._resolve_ini_path(mygames, self._ARCHIVE_INI_FILENAME)]
         if self._ARCHIVE_PREFS_INI_FILENAME:
-            paths.append(mygames / self._ARCHIVE_PREFS_INI_FILENAME)
+            paths.append(self._resolve_ini_path(
+                mygames, self._ARCHIVE_PREFS_INI_FILENAME))
         return paths
 
     def _mygames_paths(self) -> list[Path]:
@@ -882,13 +939,51 @@ class Fallout_3(ProfileVFSGameMixin, BaseGame):
         paths = self._mygames_paths()
         return paths[0] if paths else None
 
-    def _symlink_profile_ini_files(self, profile: str, log_fn) -> None:
-        """Symlink *.ini files from the profile folder into the My Games directory.
+    def _profile_ini_filename(self, filename: str) -> str:
+        prefs = self._ARCHIVE_PREFS_INI_FILENAME
+        stem = Path(prefs or self._ARCHIVE_INI_FILENAME).stem.removesuffix("Prefs")
+        names = [self._ARCHIVE_INI_FILENAME, prefs, self._CUSTOM_INI_FILENAME,
+                 f"{stem}Custom.ini"]
+        return next((name for name in names if name and name.casefold() == filename.casefold()), filename)
 
-        Any existing file at the target is backed up as <name>.bak before being
-        replaced.  Existing symlinks pointing to our profile dir are silently
-        replaced without a backup (they are already managed by us).
-        """
+    @staticmethod
+    def _profile_ini_link_dir(target: Path) -> "Path | None":
+        if not target.is_symlink():
+            return None
+        try:
+            source = target.readlink()
+            if not source.is_absolute():
+                source = target.parent / source
+            return source.parent.resolve()
+        except (OSError, RuntimeError):
+            return None
+
+    def _is_managed_profile_ini_link(self, target: Path) -> bool:
+        link_dir = self._profile_ini_link_dir(target)
+        if link_dir is None:
+            return False
+        try:
+            relative = link_dir.relative_to(
+                (self.get_profile_root() / "profiles").resolve())
+        except (OSError, RuntimeError, ValueError):
+            return False
+        return (
+            len(relative.parts) == 2
+            and relative.parts[1].casefold()
+            == self._PROFILE_INI_SUBDIR.casefold()
+        )
+
+    @staticmethod
+    def _restore_profile_ini_link(target: Path, log_fn) -> None:
+        target.unlink()
+        log_fn(f"  Removed profile INI symlink: {target.name}")
+        backup = target.with_suffix(".bak")
+        if backup.exists() or backup.is_symlink():
+            backup.rename(target)
+            log_fn(f"  Restored {target.name} from .bak")
+
+    def _symlink_profile_ini_files(self, profile: str, log_fn) -> None:
+        """Link profile INIs using the game's filenames, preserving prefix backups."""
         _log = log_fn
         if not self._profile_ini_files:
             return
@@ -898,62 +993,59 @@ class Fallout_3(ProfileVFSGameMixin, BaseGame):
             return
         ini_dir = self._profile_ini_dir(profile)
         ini_dir.mkdir(parents=True, exist_ok=True)
-        ini_files = list(ini_dir.glob("*.ini"))
+        ini_files = {}
+        for src in sorted(ini_dir.iterdir()):
+            if src.suffix.casefold() != ".ini" or not src.is_file():
+                continue
+            key = src.name.casefold()
+            if key in ini_files:
+                import filecmp
+                if not filecmp.cmp(src, ini_files[key], shallow=False):
+                    raise RuntimeError(f"Conflicting profile INIs: {ini_files[key].name} and {src.name}. Keep one version in {ini_dir}.")
+                _log(f"  Ignoring identical INI casing duplicate: {src.name}")
+                continue
+            ini_files[key] = src
         if not ini_files:
             _log(f"  No *.ini files found in '{ini_dir.name}' folder - skipping.")
             return
         for mygames in mygames_dirs:
             mygames.mkdir(parents=True, exist_ok=True)
-            for src in ini_files:
-                target = mygames / src.name
-                if target.is_symlink():
-                    target.unlink()
-                elif target.exists():
+            for target in mygames.iterdir():
+                if (target.name.casefold() in ini_files
+                        and self._is_managed_profile_ini_link(target)):
+                    self._restore_profile_ini_link(target, _log)
+            for src in ini_files.values():
+                target = self._resolve_ini_path(mygames, self._profile_ini_filename(src.name))
+                if target.exists() or target.is_symlink():
                     backup = target.with_suffix(".bak")
+                    if backup.exists() or backup.is_symlink():
+                        number = 1
+                        saved = backup.with_name(f"{backup.name}.{number}")
+                        while saved.exists() or saved.is_symlink():
+                            number += 1
+                            saved = backup.with_name(f"{backup.name}.{number}")
+                        backup.rename(saved)
+                        _log(f"  Preserved earlier backup: {saved.name}")
                     target.rename(backup)
                     _log(f"  Backed up {target.name} → {backup.name}")
                 target.symlink_to(src)
                 _log(f"  Linked {src.name} → {target}")
 
-    def _remove_profile_ini_symlinks(self, profile: str, log_fn) -> None:
+    def _remove_profile_ini_symlinks(self, _profile: str, log_fn) -> None:
         """Remove profile INI symlinks from My Games and restore any backups."""
         _log = log_fn
-        if not self._profile_ini_files:
-            return
         mygames_dirs = [p for p in self._mygames_paths() if p.is_dir()]
         if not mygames_dirs:
             return
-        ini_dir = self._profile_ini_dir(profile)
-        if not ini_dir.is_dir():
-            return
-        try:
-            ini_dir_resolved = ini_dir.resolve()
-        except OSError:
-            ini_dir_resolved = ini_dir
         for mygames in mygames_dirs:
             # Scan the actual My Games folder so orphaned symlinks (whose source
             # .ini was deleted from the profile) are still removed.
-            for target in mygames.glob("*.ini"):
-                if not target.is_symlink():
+            for target in mygames.iterdir():
+                if target.suffix.casefold() != ".ini":
                     continue
-                # Compare the symlink's *target* directory against our ini dir,
-                # resolving both sides so a symlinked prefix/staging path on the
-                # way to ini_dir doesn't break the match.
-                try:
-                    link_target = target.readlink()
-                    if not link_target.is_absolute():
-                        link_target = target.parent / link_target
-                    link_parent = link_target.resolve().parent
-                except OSError:
+                if not self._is_managed_profile_ini_link(target):
                     continue
-                if link_parent != ini_dir_resolved:
-                    continue
-                target.unlink()
-                _log(f"  Removed profile INI symlink: {target.name}")
-                backup = target.with_suffix(".bak")
-                if backup.exists():
-                    backup.rename(target)
-                    _log(f"  Restored {target.name} from .bak")
+                self._restore_profile_ini_link(target, _log)
 
     # -----------------------------------------------------------------------
     # Profile-specific saves
@@ -1124,14 +1216,14 @@ class Fallout_3(ProfileVFSGameMixin, BaseGame):
         over = len(list_str) > 255
         if over and self._archive_list_fix_installed():
             for d in ini_dirs:
-                _set_ini_key(d / self._CUSTOM_INI_FILENAME, "Archive",
+                _set_ini_key(self._resolve_ini_path(d, self._CUSTOM_INI_FILENAME), "Archive",
                              key, list_str)
             _log(f"  {key} is {len(list_str)} chars (engine limit 255) - "
                  f"wrote full list to {self._CUSTOM_INI_FILENAME} "
                  f"({self._archive_list_fix_name} installed).")
             return
         for d in ini_dirs:
-            custom_ini = d / self._CUSTOM_INI_FILENAME
+            custom_ini = self._resolve_ini_path(d, self._CUSTOM_INI_FILENAME)
             if custom_ini.is_file():
                 _set_ini_key(custom_ini, "Archive", key, None)
         if over:
@@ -1175,7 +1267,7 @@ class Fallout_3(ProfileVFSGameMixin, BaseGame):
         if self._archive_list_needs_mod_bsas:
             self._save_tracked_mod_bsas([])
             for d in {p.parent for p in ini_paths}:
-                custom_ini = d / self._CUSTOM_INI_FILENAME
+                custom_ini = self._resolve_ini_path(d, self._CUSTOM_INI_FILENAME)
                 if custom_ini.is_file():
                     _set_ini_key(custom_ini, "Archive",
                                  self._invalidation_archive_list_key, None)
@@ -1240,7 +1332,7 @@ class Fallout_3(ProfileVFSGameMixin, BaseGame):
         if self._game_path is None:
             _log("  WARN: Game path not set - skipping dummy BSA write.")
             return
-        from Utils.bsa_invalidation import write_dummy_bsa
+        from Utils.bsa.invalidation import write_dummy_bsa
         try:
             if self.vfs_launch_enabled:
                 from Utils.vfs import virtual_data_write_path
@@ -1283,7 +1375,7 @@ class Fallout_3(ProfileVFSGameMixin, BaseGame):
         bsa_name = self._invalidation_bsa_name
         if bsa_name is None:
             return ""
-        from Utils.bsa_invalidation import (
+        from Utils.bsa.invalidation import (
             ensure_in_archive_list, append_to_archive_list,
             remove_many_from_archive_list,
         )
@@ -1320,7 +1412,7 @@ class Fallout_3(ProfileVFSGameMixin, BaseGame):
         bsa_name = self._invalidation_bsa_name
         if bsa_name is None:
             return
-        from Utils.bsa_invalidation import (
+        from Utils.bsa.invalidation import (
             remove_from_archive_list, remove_many_from_archive_list,
         )
         key = self._invalidation_archive_list_key
@@ -1397,17 +1489,14 @@ class Fallout_3(ProfileVFSGameMixin, BaseGame):
         Vanilla archives are already in the engine's default SArchiveList; we
         only append archives that a mod actually deploys into Data/.
         """
-        try:
-            filemap = self.get_effective_filemap_path()
-        except Exception:
-            return []
-        if not filemap.is_file():
+        from Utils.filegraph.deploy import current, legacy_rows
+        if current() is None:
             return []
         names: list[str] = []
         seen: set[str] = set()
         try:
-            for line in filemap.read_text(encoding="utf-8").splitlines():
-                rel = line.split("\t", 1)[0].strip()
+            for rel, _owner in legacy_rows():
+                rel = rel.strip()
                 if not rel or "/" in rel or "\\" in rel:
                     continue  # only top-level Data/ entries are loadable archives
                 low = rel.lower()
@@ -1503,10 +1592,53 @@ class Fallout_3(ProfileVFSGameMixin, BaseGame):
                     return name
         return self.exe_name
 
+    @property
+    def _script_extender_runtime_ini(self) -> "Path | None":
+        return None
+
+    def _script_extender_runtime_ini_path(self) -> "Path | None":
+        rel_path = self._script_extender_runtime_ini
+        if self._game_path is None or rel_path is None:
+            return None
+        from Utils.games.frameworks import resolve_file_ci
+        return (resolve_file_ci(self._game_path, rel_path)
+                or self._game_path / rel_path)
+
+    def _write_script_extender_runtime_override(self, backup_name: str,
+                                                log_fn) -> None:
+        ini_path = self._script_extender_runtime_ini_path()
+        if ini_path is None:
+            return
+        if ini_path.is_symlink():
+            from Utils.atomic_write import write_atomic
+            write_atomic(ini_path, ini_path.read_bytes())
+        _set_ini_key(ini_path, "Loader", "RuntimeName", backup_name,
+                     case_insensitive=True)
+        rel_path = ini_path.relative_to(self._game_path)
+        log_fn(f"  Wrote {rel_path} (RuntimeName={backup_name}).")
+
+    def _remove_script_extender_runtime_override(self, log_fn) -> None:
+        ini_path = self._script_extender_runtime_ini_path()
+        if ini_path is None or self._game_path is None:
+            return
+        backup_name = Path(self._launcher_name()).stem + ".bak"
+        backup = self._game_path / backup_name
+        if not backup.is_file() or _read_ini_key(
+                ini_path, "Loader", "RuntimeName",
+                case_insensitive=True) != backup_name:
+            return
+        _set_ini_key(ini_path, "Loader", "RuntimeName", None,
+                     case_insensitive=True)
+        rel_path = ini_path.relative_to(self._game_path)
+        log_fn(f"  Removed Amethyst RuntimeName from {rel_path}.")
+
     def swap_launcher(self, log_fn) -> None:
         """Replace the game launcher with the script extender if present."""
         _log = log_fn
         if self._game_path is None:
+            return
+        if not self.supports_script_extender_swap:
+            _log("  Launcher swap is not used for this game - skipping.")
             return
         if self.vfs_launch_enabled:
             _log("  VFS launch: launcher swap is virtual - game files unchanged.")
@@ -1526,6 +1658,8 @@ class Fallout_3(ProfileVFSGameMixin, BaseGame):
             _log(f"  Renamed {exe_name} → {backup.name}.")
         shutil.copy2(se, launcher)
         _log(f"  Copied {self._script_extender_exe} → {exe_name}.")
+        if backup.is_file():
+            self._write_script_extender_runtime_override(backup.name, _log)
 
     def _restore_launcher(self, log_fn) -> None:
         """Reverse the script extender launcher swap if a backup exists."""
@@ -1566,11 +1700,16 @@ class Fallout_3(ProfileVFSGameMixin, BaseGame):
 
         if not data_dir.is_dir():
             raise RuntimeError(f"Data directory not found: {data_dir}")
-        if not filemap.is_file():
+        from Utils.filegraph.deploy import input_ready
+        if not input_ready():
             raise RuntimeError(
                 f"filemap.txt not found: {filemap}\n"
                 "Run 'Build Filemap' before deploying."
             )
+
+        from Utils.bethesda.registry import repair_game_registry_path
+        if not repair_game_registry_path(self, self._game_path, _log):
+            _log("  WARN: Bethesda registry game path could not be repaired.")
 
         if self.vfs_launch_enabled:
             return self._deploy_vfs(
@@ -1591,10 +1730,14 @@ class Fallout_3(ProfileVFSGameMixin, BaseGame):
         per_mod_modes = expand_separator_link_modes(_sep_deploy, _sep_entries) or None
         per_mod_raw = expand_separator_raw_deploy(_sep_deploy, _sep_entries) or None
 
-        custom_rules = self.custom_routing_rules
+        custom_rules = self.effective_custom_routing_rules
+        _log("Step 1: Moving Data/ → Data_Core/ ...")
+        move_to_core(data_dir, log_fn=_log)
+        _log("  Backed up existing files → Data_Core/.")
+
         custom_exclude: set[str] = set()
         if custom_rules:
-            _log("Step 0: Routing files via custom rules ...")
+            _log("Step 1b: Routing files via custom rules ...")
             custom_exclude = deploy_custom_rules(
                 filemap, self._game_path, staging,
                 rules=custom_rules,
@@ -1607,10 +1750,6 @@ class Fallout_3(ProfileVFSGameMixin, BaseGame):
                 progress_fn=progress_fn,
                 prefix_root=self.get_prefix_path(),
             )
-
-        _log("Step 1: Moving Data/ → Data_Core/ ...")
-        move_to_core(data_dir, log_fn=_log)
-        _log("  Backed up existing files → Data_Core/.")
 
         _log(f"Step 2: Transferring mod files into Data/ ({mode.name}) ...")
         linked_mod, placed = deploy_filemap(filemap, data_dir, staging,
@@ -1666,6 +1805,18 @@ class Fallout_3(ProfileVFSGameMixin, BaseGame):
 
         data_dir = self._game_path / "Data"
 
+        default_game_path = self.get_global_game_path()
+        if default_game_path is None:
+            _log("  WARN: Default-profile game path is not configured; "
+                 "Bethesda registry path was not restored.")
+        else:
+            from Utils.bethesda.registry import repair_game_registry_path
+            if not repair_game_registry_path(self, default_game_path, _log):
+                _log("  WARN: Bethesda registry game path could not be restored "
+                     "to the default profile.")
+
+        self._remove_script_extender_runtime_override(_log)
+
         _log("Restore: removing case-alias symlinks ...")
         remove_case_alias_links(self._game_path, self.case_alias_dirs,
                                 log_fn=_log)
@@ -1682,15 +1833,15 @@ class Fallout_3(ProfileVFSGameMixin, BaseGame):
         cleanup_custom_deploy_dirs(
             _profile_dir, _entries, log_fn=_log,
             filemap_path=self.get_effective_filemap_path(),
+            game=self,
         )
 
-        custom_rules = self.custom_routing_rules
-        if custom_rules and self._game_path:
+        if self._game_path:
             _log("Restore: removing custom-routed files ...")
             restore_custom_rules(
                 self.get_effective_filemap_path(),
                 self._game_path,
-                rules=custom_rules,
+                rules=[],
                 log_fn=_log,
                 prefix_root=self.get_prefix_path(),
             )
@@ -1712,6 +1863,7 @@ class Fallout_3(ProfileVFSGameMixin, BaseGame):
                 log_fn=_log,
                 restore_whitelist=self.restore_whitelist_matcher(
                     rel_prefix="data/"),
+                game=self, profile_dir=self._active_profile_dir,
             )
             _log(f"  Restored {restored} file(s). Data_Core/ removed.")
         elif not vfs_deploy:

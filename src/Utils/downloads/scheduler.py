@@ -1,0 +1,322 @@
+"""Bounded download dispatch with small-first and large-first lanes."""
+
+from __future__ import annotations
+
+import queue as _queue
+import threading
+from typing import Any, Callable, Iterable
+
+
+def order_by_size(mods: Iterable, size_key: Callable[[object], int] | None = None
+                  ) -> list:
+    """Return *mods* sorted smallest→largest by size.
+
+    Mods that don't report a size (``size_bytes`` 0/missing - some Nexus files
+    omit it) are sorted to the END, not the front: their real size is unknown and
+    could be large, so we download the known-small mods first and leave the
+    unknowns for last (rather than letting a big unknown-size mod jump the queue
+    and hog a slot while everything small waits behind it)."""
+    if size_key is None:
+        def size_key(m):
+            return getattr(m, "size_bytes", 0) or 0
+    # (0 = unknown → sort last) via a (is_unknown, size) key.
+    return sorted(mods, key=lambda m: (size_key(m) <= 0, size_key(m)))
+
+
+def run_double_ended(mods: list, work: Callable[[object], None], workers: int,
+                     *, stop: "threading.Event | None" = None,
+                     spawn: Callable[[Callable, str], object] | None = None
+                     ) -> None:
+    """Dispatch *mods* to *work* using the double-ended policy and block until
+    every mod has been processed (or *stop* is set).
+
+    *mods*    - the download units, PRE-SORTED smallest→largest
+                (see :func:`order_by_size`).
+    *work*    - called once per mod on a worker thread: ``work(mod)``.
+    *workers* - total worker threads (>=1). One is the "large" worker pulling
+                from the tail; the rest pull from the head.
+    *stop*    - optional cancel event; when set, workers drain without calling
+                *work* on the remainder (the caller's *work* still runs for
+                already-claimed items and is expected to short-circuit on stop).
+    *spawn*   - optional ``spawn(target, name) -> thread-like`` with ``.start``/
+                ``.join`` (defaults to daemon ``threading.Thread``); lets a test
+                inject deterministic threading.
+
+    A single shared [lo, hi] cursor over the sorted list guarantees each mod is
+    claimed once. The large worker takes ``mods[hi]`` then hi-=1; the small
+    workers take ``mods[lo]`` then lo+=1. When the ranges cross, everyone stops.
+    """
+    n = len(mods)
+    if n == 0:
+        return
+    workers = max(1, int(workers))
+
+    lock = threading.Lock()
+    cursor = {"lo": 0, "hi": n - 1}
+
+    def _claim(from_tail: bool):
+        """Claim the next mod for this worker, or None when exhausted."""
+        with lock:
+            if cursor["lo"] > cursor["hi"]:
+                return None
+            if from_tail:
+                m = mods[cursor["hi"]]
+                cursor["hi"] -= 1
+            else:
+                m = mods[cursor["lo"]]
+                cursor["lo"] += 1
+            return m
+
+    def _worker(from_tail: bool):
+        while True:
+            if stop is not None and stop.is_set():
+                # Drain the rest without doing work so the caller's join
+                # returns promptly; already-claimed items are handled by work.
+                _drain_remaining(work, cursor, lock, mods, stop)
+                return
+            mod = _claim(from_tail)
+            if mod is None:
+                return
+            work(mod)
+
+    if spawn is None:
+        def spawn(target, name):
+            return threading.Thread(target=target, name=name, daemon=True)
+
+    threads = []
+    # Exactly one large-end worker (unless there's only a single worker, in
+    # which case it must still cover the whole list - it pulls from the head so
+    # small-first behaviour is preserved when workers==1).
+    for i in range(workers):
+        from_tail = (workers > 1 and i == 0)
+        t = spawn(lambda ft=from_tail: _worker(ft),
+                  f"col-dl-{'big' if from_tail else 'small'}-{i}")
+        threads.append(t)
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+
+def run_pipelined(mods: list, fetch: Callable[[object], Any],
+                  download: Callable[[object, Any], None],
+                  dl_workers: int, *, link_workers: int = 2,
+                  large_workers: int = 1,
+                  large_download: "Callable[[object, Any], None] | None" = None,
+                  strict_order: bool = False,
+                  size_key: "Callable[[object], int] | None" = None,
+                  group_key: "Callable[[object], object] | None" = None,
+                  stop: "threading.Event | None" = None,
+                  worker_done: "Callable[[], None] | None" = None,
+                  spawn: Callable[[Callable, str], object] | None = None
+                  ) -> None:
+    """Two-stage double-ended dispatch with prefetched signed CDN links.
+
+    Root problem this solves: with a single fetch-link→download loop per worker,
+    every worker blocks on a ``get_download_links`` round-trip between mods. For
+    tiny archives that latency is comparable to the download itself and all the
+    workers hit it in lockstep, so the pipe stutters - downloads arrive at the
+    installer in bursts of *dl_workers* with idle gaps between. Pipelining the
+    link fetch hides that latency behind other in-flight downloads. Reserving a
+    lane for the largest remaining archives also overlaps that small-file churn
+    with a long transfer that can keep the connection busy.
+
+    *mods*        - PRE-SORTED smallest→largest (see :func:`order_by_size`).
+    *fetch*       - ``fetch(mod) -> links``, called on a link-worker thread;
+                    whatever it returns is passed straight to *download* as-is
+                    (return None/[] to let *download* fetch links itself). May
+                    raise - the mod still flows to *download* with ``links=None``
+                    so the caller's per-mod bookkeeping (counters, install-queue
+                    sentinels) still fires exactly once.
+    *download*    - ``download(mod, links)``, called on a download-worker thread
+                    once per mod, exactly once. May raise - the exception is
+                    swallowed so the worker (and the pipeline) keeps flowing.
+    *dl_workers*  - number of download-worker threads (>=1).
+    *link_workers*- number of link-fetch threads (>=1) available across both
+                    lanes.
+    *large_workers* - download lanes reserved for the largest remaining mods.
+    *large_download* - optional callback for items downloaded by those lanes.
+    *strict_order* - publish prefetched items to each download lane in claim
+                    order, even when concurrent link fetches finish out of order.
+    *size_key*    - identify unknown sizes at the end, claimed after known sizes.
+    *stop*        - optional cancel event; when set, both stages drain the
+                    remainder (feeding *download* with ``links=None``) so every
+                    mod is still handed off once and the caller short-circuits.
+    *worker_done* - optional cleanup called once on each download-worker thread.
+    *spawn*       - optional ``spawn(target, name) -> thread-like`` for tests.
+
+    Each lane has a bounded ready queue so links are only minted a little ahead
+    of consumption. The small and large fetchers share one double-ended cursor,
+    guaranteeing that each mod is claimed exactly once.
+    """
+    n = len(mods)
+    if n == 0:
+        return
+    dl_workers = max(1, int(dl_workers))
+    link_workers = max(1, int(link_workers))
+    large_workers = max(0, int(large_workers))
+    if dl_workers < 2:
+        large_workers = 0
+    else:
+        large_workers = min(large_workers, dl_workers - 1)
+    small_workers = dl_workers - large_workers
+
+    lock = threading.Lock()
+    known_end = (next((i for i, mod in enumerate(mods) if size_key(mod) <= 0), n)
+                 if size_key is not None else n)
+    cursor = {"lo": 0, "hi": known_end - 1, "unknown": known_end}
+    claim_sequence = {False: 0, True: 0}
+    _READY_DONE = object()
+    grouped = {}
+    active_groups = {}
+    if group_key is not None:
+        from collections import deque
+        for mod in mods:
+            group = group_key(mod)
+            queues = grouped.setdefault(group, (deque(), deque()))
+            queues[int(size_key is not None and size_key(mod) <= 0)].append(mod)
+            active_groups[group] = 0
+
+    def _claim(from_tail: bool):
+        with lock:
+            if group_key is not None:
+                candidates = [key for key, queues in grouped.items() if any(queues)]
+                if not candidates:
+                    return None, True, -1
+                group = min(candidates, key=lambda key: (active_groups[key], key))
+                known, unknown = grouped[group]
+                mod = (known.pop() if from_tail else known.popleft()) if known else unknown.popleft()
+                active_groups[group] += 1
+            elif cursor["lo"] > cursor["hi"]:
+                if cursor["unknown"] >= n:
+                    return None, True, -1
+                mod = mods[cursor["unknown"]]
+                cursor["unknown"] += 1
+            elif from_tail:
+                mod = mods[cursor["hi"]]
+                cursor["hi"] -= 1
+            else:
+                mod = mods[cursor["lo"]]
+                cursor["lo"] += 1
+            sequence = claim_sequence[from_tail]
+            claim_sequence[from_tail] += 1
+            return mod, False, sequence
+
+    def _fetcher(ready, from_tail: bool, claim_gate=None, delivery=None):
+        while True:
+            if claim_gate is not None:
+                claim_gate.acquire()
+            mod, exhausted, sequence = _claim(from_tail)
+            if exhausted:
+                if claim_gate is not None:
+                    claim_gate.release()
+                return
+            links = None
+            if stop is None or not stop.is_set():
+                try:
+                    links = fetch(mod)
+                except Exception:
+                    links = None
+            # Enqueue even when stopping so the downloader still hands the mod
+            # off once (caller bookkeeping) - the download fn short-circuits.
+            if delivery is None:
+                ready.put((mod, links))
+            else:
+                condition, next_sequence = delivery
+                with condition:
+                    while sequence != next_sequence["value"]:
+                        condition.wait()
+                    ready.put((mod, links))
+                    next_sequence["value"] += 1
+                    condition.notify_all()
+
+    def _downloader(ready, work, claim_gate=None):
+        try:
+            while True:
+                item = ready.get()
+                if item is _READY_DONE:
+                    return
+                mod, links = item
+                try:
+                    work(mod, links)
+                except Exception:
+                    # A dead worker wedges the pipeline because fetchers can
+                    # block on a full ready queue. Drop this mod and keep going.
+                    pass
+                finally:
+                    if group_key is not None:
+                        with lock:
+                            active_groups[group_key(mod)] -= 1
+                    if claim_gate is not None:
+                        claim_gate.release()
+        finally:
+            if worker_done is not None:
+                try:
+                    worker_done()
+                except Exception:
+                    pass
+
+    if spawn is None:
+        def spawn(target, name):
+            return threading.Thread(target=target, name=name, daemon=True)
+
+    large_link_workers = (min(large_workers, max(1, link_workers - 1))
+                          if large_workers else 0)
+    small_link_workers = max(1, link_workers - large_link_workers)
+    lanes = []
+    if large_workers:
+        # Do not let the tail prefetcher reserve several large files serially.
+        lanes.append(("large", True, large_workers, large_link_workers,
+                      threading.Semaphore(large_workers),
+                      large_download if large_download is not None else download))
+    lanes.append(("small", False, small_workers, small_link_workers, None,
+                  download))
+
+    running = []
+    for name, from_tail, worker_count, fetch_count, claim_gate, work in lanes:
+        ready = _queue.Queue(maxsize=worker_count + fetch_count)
+        delivery = ((threading.Condition(), {"value": 0})
+                    if strict_order else None)
+        fetchers = [
+            spawn(lambda q=ready, tail=from_tail, gate=claim_gate,
+                         ordered_delivery=delivery:
+                  _fetcher(q, tail, gate, ordered_delivery),
+                  f"col-link-{name}-{i}")
+            for i in range(fetch_count)
+        ]
+        downloaders = [
+            spawn(lambda q=ready, fn=work, gate=claim_gate:
+                  _downloader(q, fn, gate),
+                  f"col-dl-{name}-{i}")
+            for i in range(worker_count)
+        ]
+        running.append((ready, fetchers, downloaders))
+
+    for _ready, _fetchers, downloaders in running:
+        for thread in downloaders:
+            thread.start()
+    for _ready, fetchers, _downloaders in running:
+        for thread in fetchers:
+            thread.start()
+
+    for ready, fetchers, downloaders in running:
+        for thread in fetchers:
+            thread.join()
+        for _ in downloaders:
+            ready.put(_READY_DONE)
+    for _ready, _fetchers, downloaders in running:
+        for thread in downloaders:
+            thread.join()
+
+
+def _drain_remaining(work, cursor, lock, mods, stop):
+    """After a cancel, feed every remaining mod to *work* so the caller's
+    per-mod bookkeeping (counters, install-queue sentinels) still fires - work
+    is expected to no-op the actual download when *stop* is set."""
+    while True:
+        with lock:
+            if cursor["lo"] > cursor["hi"]:
+                return
+            m = mods[cursor["lo"]]
+            cursor["lo"] += 1
+        work(m)

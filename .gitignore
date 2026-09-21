@@ -28,3 +28,4 @@ src/appimage/dist/
 /assets
 *.DS_Store
 PLAN.md
+result

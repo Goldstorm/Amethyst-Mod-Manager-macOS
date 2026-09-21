@@ -17,8 +17,8 @@ reachable and the divider never pops in/out.
 
 from __future__ import annotations
 
-from Utils.modlist import ModEntry
-from Utils.filemap import OVERWRITE_NAME, ROOT_FOLDER_NAME
+from Utils.mods.modlist import ModEntry
+from Utils.filegraph.constants import OVERWRITE_NAME, ROOT_FOLDER_NAME
 
 # The reverse-mode divider between the last user group and the ungrouped
 # float. UI-only: lives in the display list, never in the natural list, and is
@@ -27,7 +27,7 @@ DIVIDER_NAME = "__Ungrouped_Boundary__"
 
 # Sortable-column keys (match the Tk _sort_column strings; persisted to ini).
 SORT_KEYS = ("name", "category", "flags", "conflicts", "installed",
-             "version", "author", "priority", "size")
+             "version", "author", "priority", "size", "content")
 
 
 def make_divider() -> ModEntry:
@@ -151,6 +151,16 @@ def sort_key_fn(key: str, ctx: dict):
         sizes = ctx.get("size_bytes") or {}
         return lambda e: sizes.get(e.name, 0)
 
+    if key == "content":
+        from gui_qt.modlist_content import badge_signature
+        content = ctx.get("content") or {}
+        return lambda e: badge_signature(content.get(e.name, ()))
+
+    if key in ("nexus_mod_id", "nexus_file_id"):
+        ids = ctx.get(f"{key}s") or {}
+        return lambda e: ((0, ids[e.name]) if ids.get(e.name, 0) > 0
+                          else (1, 0))
+
     return lambda e: 0
 
 
@@ -159,7 +169,7 @@ def sort_key_fn(key: str, ctx: dict):
 # ---------------------------------------------------------------------------
 def build_display(natural: list[ModEntry], key: str | None, ascending: bool,
                   ctx: dict, divider: ModEntry | None = None,
-                  flatten_groups: bool = False
+                  flatten_groups: bool = False, mod_groups: dict | None = None
                   ) -> list[ModEntry]:
     """Derive the display order from the natural order. Returns a NEW list
     holding the SAME entry objects (plus the divider in reverse mode).
@@ -171,6 +181,27 @@ def build_display(natural: list[ModEntry], key: str | None, ascending: bool,
     separators are appended at the end (hidden by the filter anyway) so the
     natural round-trip and boundary handling stay intact. The special
     reverse-priority mode is unaffected - its grouping is intrinsic."""
+    if mod_groups:
+        from Utils.mods.groups import blocks, owners
+        membership = owners(mod_groups)
+        representatives = []
+        children = {}
+        for block in blocks(natural, mod_groups):
+            leader = membership.get(block[0].name)
+            if leader:
+                representatives.append(next(e for e in block if e.name == leader))
+                members = [e for e in block if e.name != leader]
+                if is_reverse(key, ascending):
+                    members.reverse()
+                elif key and key != "priority":
+                    members.sort(key=sort_key_fn(key, ctx), reverse=not ascending)
+                children[leader] = members
+            else:
+                representatives.extend(block)
+        display = build_display(representatives, key, ascending, ctx, divider,
+                                flatten_groups)
+        return [e for head in display for e in (head, *children.get(head.name, []))]
+
     if not key:
         return list(natural)
 

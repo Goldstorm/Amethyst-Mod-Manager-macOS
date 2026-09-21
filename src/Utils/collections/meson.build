@@ -1,0 +1,15 @@
+py.install_sources(
+  '__init__.py',
+  'diff.py',
+  'export.py',
+  'ini_tweaks.py',
+  'install.py',
+  'installed.py',
+  'manifest.py',
+  'options.py',
+  'grouping.py',
+  'group_reset.py',
+  'patches.py',
+  'reset.py',
+  subdir: 'Utils/collections',
+)

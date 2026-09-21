@@ -13,7 +13,7 @@ option whose files are entirely shadowed by another selected option is marked
 "(overridden)" in red. Checking an option auto-turns-off any other selected option
 with an identical file set ("your click wins"). Hovering an option shows its
 screenshot in the inline preview pane. All the underlying logic is GUI-free in
-Utils.re_bundle.
+Utils.re_engine.bundle.
 """
 
 from __future__ import annotations
@@ -27,12 +27,12 @@ from PySide6.QtWidgets import (
 )
 
 from gui_qt.theme_qt import (
-    active_palette, bind_theme_icon, _c, danger_close_button,
+    active_palette, bind_theme_icon, _c, close_button,
 )
 from gui_qt.image_preview import _load_qimage
 from PySide6.QtGui import QPixmap
 
-from Utils.re_bundle import (
+from Utils.re_engine.bundle import (
     option_deployable_rels, option_image, option_description,
 )
 
@@ -137,14 +137,14 @@ class BundleOptionsView(QWidget):
         v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(0)
 
-        # Header bar: title + ✕ Close (same red close button as ChangeVersionView).
+        # Header bar: title + shared Close button.
         bar = QWidget(); bar.setObjectName("HeaderBar")
         hb = QHBoxLayout(bar); hb.setContentsMargins(12, 8, 8, 8); hb.setSpacing(8)
         title = QLabel(self.tr("Bundle Options - {0}").format(self._mod_name))
         title.setStyleSheet(f"color:{_c(p,'TEXT_MAIN')}; font-weight:600;")
         hb.addWidget(title)
         hb.addStretch(1)
-        close = danger_close_button(pal=p)
+        close = close_button(pal=p)
         close.clicked.connect(lambda: self._on_close())
         hb.addWidget(close)
         v.addWidget(bar)
@@ -340,7 +340,7 @@ class BundleOptionsView(QWidget):
 
     def _ordered_selected_folders(self) -> list[str]:
         """Selected option folders in deploy apply order, mirroring
-        re_bundle._ordered_selected_folders: select-one groups first (declared
+        Utils.re_engine.bundle._ordered_selected_folders: select-one groups first (declared
         order), independent groups last, display order within a group (lower =
         applied later = wins)."""
         select_one: list[str] = []

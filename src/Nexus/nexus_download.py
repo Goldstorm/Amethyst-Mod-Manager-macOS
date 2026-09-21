@@ -26,6 +26,7 @@ Usage
 
 from __future__ import annotations
 
+import atexit
 import os
 import re
 import threading
@@ -38,10 +39,10 @@ import requests
 
 from .nexus_api import NexusAPI, NexusDownloadLink, NexusAPIError
 from .nxm_handler import NxmLink
-from Utils import bandwidth_limit
+from Utils.downloads import bandwidth
 from Utils.app_log import app_log
 from Utils.ca_bundle import resolve_ca_bundle
-from Utils.xdg import xdg_download_dir
+from Utils.environment.xdg import xdg_download_dir
 
 # Default chunk size for streaming downloads (256 KB)
 _CHUNK_SIZE = 256 * 1024
@@ -152,13 +153,17 @@ def ingest_archive_to_cache(path: Path, game_name: str,
 # -- md5 cache ---------------------------------------------------------------
 # Hashing a multi-GB archive is slow, so we cache results in a single JSON
 # file inside the app's download cache directory.  Entries are keyed by the
-# archive's absolute path and invalidated when size or mtime changes.  We
+# archive's absolute path and invalidated when its filesystem identity changes.  We
 # deliberately never write alongside the archive itself - that would pollute
 # the user's Downloads folder / any external download locations they've
 # configured.
 
 _MD5_CACHE_FILE = "md5_cache.json"
 _md5_cache_lock = threading.Lock()
+_md5_cache_data = {}
+_md5_cache_identity = None
+_md5_cache_pending = {}
+_md5_cache_timer = None
 
 
 def _md5_cache_path() -> Path:
@@ -166,21 +171,81 @@ def _md5_cache_path() -> Path:
     return get_download_cache_dir() / _MD5_CACHE_FILE
 
 
-def _md5_cache_load() -> dict:
+def _md5_file_stamp(path):
+    try:
+        info = path.stat()
+        return [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns]
+    except OSError:
+        return None
+
+
+def _md5_cache_read(path):
     try:
         import json
-        return json.loads(_md5_cache_path().read_text(encoding="utf-8"))
-    except Exception:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
         return {}
 
 
-def _md5_cache_save(data: dict) -> None:
-    try:
-        import json
-        from Utils.atomic_write import write_atomic_text
-        write_atomic_text(_md5_cache_path(), json.dumps(data))
-    except Exception:
-        pass
+def _md5_cache_merge(data):
+    for key, entry in _md5_cache_pending.items():
+        if entry is None:
+            data.pop(key, None)
+        else:
+            data[key] = entry
+    return data
+
+
+def _md5_cache_load() -> dict:
+    global _md5_cache_data, _md5_cache_identity
+    path = _md5_cache_path()
+    identity = path, _md5_file_stamp(path)
+    if identity != _md5_cache_identity:
+        if _md5_cache_identity is not None and _md5_cache_identity[0] != path:
+            _md5_cache_pending.clear()
+        _md5_cache_data = _md5_cache_merge(_md5_cache_read(path))
+        _md5_cache_identity = identity
+    return _md5_cache_data
+
+
+def _md5_cache_save(data, path) -> None:
+    import json
+    from Utils.atomic_write import write_atomic_text
+    write_atomic_text(path, json.dumps(data))
+
+
+def _md5_cache_flush():
+    global _md5_cache_timer, _md5_cache_data, _md5_cache_identity
+    import fcntl
+    with _md5_cache_lock:
+        if _md5_cache_timer is not None:
+            _md5_cache_timer.cancel()
+            _md5_cache_timer = None
+        if not _md5_cache_pending or _md5_cache_identity is None:
+            return
+        path = _md5_cache_identity[0]
+        try:
+            with path.with_name(path.name + ".lock").open("a+b") as stream:
+                fcntl.flock(stream, fcntl.LOCK_EX)
+                data = _md5_cache_merge(_md5_cache_read(path))
+                _md5_cache_save(data, path)
+                _md5_cache_data = data
+                _md5_cache_identity = path, _md5_file_stamp(path)
+                _md5_cache_pending.clear()
+        except OSError:
+            pass
+
+
+def _md5_cache_schedule():
+    global _md5_cache_timer
+    if _md5_cache_timer is None:
+        _md5_cache_timer = threading.Timer(2.0, _md5_cache_flush)
+        _md5_cache_timer.daemon = True
+        _md5_cache_timer.start()
+
+
+atexit.register(_md5_cache_flush)
 
 
 def _md5_cache_key(archive: Path) -> str:
@@ -191,39 +256,48 @@ def _md5_cache_key(archive: Path) -> str:
 
 
 def _md5_cache_get(archive: Path) -> str:
-    """Return the cached md5 for *archive*, or "" if absent/stale."""
-    try:
-        st = archive.stat()
-    except Exception:
+    stamp = _md5_file_stamp(archive)
+    if stamp is None:
         return ""
     key = _md5_cache_key(archive)
     with _md5_cache_lock:
-        entry = _md5_cache_load().get(key)
-    if not entry:
+        try:
+            entry = _md5_cache_load().get(key)
+        except OSError:
+            return ""
+    if not isinstance(entry, dict) or entry.get("stamp") != stamp:
         return ""
-    if entry.get("size") != st.st_size or entry.get("mtime") != int(st.st_mtime):
-        return ""
-    return (entry.get("md5") or "").lower()
+    digest = entry.get("md5")
+    return digest.lower() if isinstance(digest, str) else ""
 
 
-def _md5_cache_put(archive: Path, md5_hex: str) -> None:
-    try:
-        st = archive.stat()
-    except Exception:
-        return
+def _md5_cache_put(archive: Path, md5_hex: str, *, expected_stamp=None) -> bool:
+    stamp = _md5_file_stamp(archive)
+    if stamp is None or expected_stamp is not None and stamp != expected_stamp:
+        return False
     key = _md5_cache_key(archive)
+    entry = {"stamp": stamp, "md5": md5_hex.lower()}
     with _md5_cache_lock:
-        data = _md5_cache_load()
-        data[key] = {"size": st.st_size, "mtime": int(st.st_mtime), "md5": md5_hex.lower()}
-        _md5_cache_save(data)
+        try:
+            data = _md5_cache_load()
+        except OSError:
+            return True
+        data[key] = entry
+        _md5_cache_pending[key] = entry
+        _md5_cache_schedule()
+    return True
 
 
 def _md5_cache_forget(archive: Path) -> None:
     key = _md5_cache_key(archive)
     with _md5_cache_lock:
-        data = _md5_cache_load()
+        try:
+            data = _md5_cache_load()
+        except OSError:
+            return
         if data.pop(key, None) is not None:
-            _md5_cache_save(data)
+            _md5_cache_pending[key] = None
+            _md5_cache_schedule()
 
 
 def _compute_md5(path: Path) -> str:
@@ -252,10 +326,12 @@ def _md5_matches(archive: Path, expected_md5: str) -> bool:
     cached = _md5_cache_get(archive)
     if cached:
         return cached == expected
+    stamp = _md5_file_stamp(archive)
+    if stamp is None:
+        return False
     actual = _compute_md5(archive)
-    if actual:
-        _md5_cache_put(archive, actual)
-    return actual == expected
+    accepted = bool(actual) and _md5_cache_put(archive, actual, expected_stamp=stamp)
+    return accepted and actual == expected
 
 
 def _zip_is_intact(path: Path) -> bool:
@@ -276,6 +352,114 @@ def _zip_is_intact(path: Path) -> bool:
         return False
 
 
+@dataclass(frozen=True)
+class _ArchiveCandidate:
+    path: Path
+    size: int
+    file_id: int
+
+
+class ArchiveLookupIndex:
+    """Reusable archive metadata for cache-heavy collection downloads."""
+
+    def __init__(self, directories=()):
+        self._lock = threading.RLock()
+        self._entries: dict[str, list[_ArchiveCandidate]] = {}
+        self._by_file_id: dict[str, dict[int, list[_ArchiveCandidate]]] = {}
+        for directory in directories:
+            self.refresh(Path(directory))
+
+    @staticmethod
+    def _dir_key(directory: Path) -> str:
+        return os.path.abspath(os.fspath(directory))
+
+    @staticmethod
+    def _path_key(path: Path) -> str:
+        return os.path.abspath(os.fspath(path))
+
+    @staticmethod
+    def _read_directory(directory: Path) -> list[_ArchiveCandidate]:
+        entries: list[_ArchiveCandidate] = []
+        try:
+            paths = directory.iterdir()
+        except OSError:
+            return entries
+        try:
+            for path in paths:
+                try:
+                    if (not path.is_file()
+                            or not any(path.name.lower().endswith(ext)
+                                       for ext in _ARCHIVE_EXTS)):
+                        continue
+                    entries.append(_ArchiveCandidate(
+                        path, path.stat().st_size, _read_sidecar_file_id(path)))
+                except OSError:
+                    continue
+        except OSError:
+            pass
+        return entries
+
+    def _replace(self, key: str, entries: list[_ArchiveCandidate]) -> None:
+        by_file_id: dict[int, list[_ArchiveCandidate]] = {}
+        for entry in entries:
+            if entry.file_id > 0:
+                by_file_id.setdefault(entry.file_id, []).append(entry)
+        self._entries[key] = entries
+        self._by_file_id[key] = by_file_id
+
+    def refresh(self, directory: Path) -> None:
+        key = self._dir_key(directory)
+        entries = self._read_directory(directory)
+        with self._lock:
+            self._replace(key, entries)
+
+    def candidates(self, directory: Path) -> tuple[_ArchiveCandidate, ...]:
+        key = self._dir_key(directory)
+        with self._lock:
+            entries = self._entries.get(key)
+        if entries is None:
+            self.refresh(directory)
+            with self._lock:
+                entries = self._entries.get(key, [])
+        return tuple(entries)
+
+    def exact(self, directory: Path, file_id: int) -> tuple[_ArchiveCandidate, ...]:
+        key = self._dir_key(directory)
+        with self._lock:
+            missing = key not in self._entries
+        if missing:
+            self.refresh(directory)
+        with self._lock:
+            return tuple(self._by_file_id.get(key, {}).get(file_id, ()))
+
+    def add(self, path: Path, file_id: int = 0) -> None:
+        path = Path(path)
+        try:
+            entry = _ArchiveCandidate(
+                path, path.stat().st_size,
+                int(file_id or _read_sidecar_file_id(path)))
+        except OSError:
+            return
+        dir_key = self._dir_key(path.parent)
+        path_key = self._path_key(path)
+        with self._lock:
+            entries = [candidate for candidate in self._entries.get(dir_key, [])
+                       if self._path_key(candidate.path) != path_key]
+            entries.append(entry)
+            self._replace(dir_key, entries)
+
+    def discard(self, path: Path) -> None:
+        path = Path(path)
+        dir_key = self._dir_key(path.parent)
+        path_key = self._path_key(path)
+        with self._lock:
+            if dir_key not in self._entries:
+                return
+            entries = [candidate for candidate in self._entries[dir_key]
+                       if self._path_key(candidate.path) != path_key]
+            self._replace(dir_key, entries)
+
+
 def _find_cached_archive(
     dl_dir: Path,
     display_name: str,
@@ -283,6 +467,7 @@ def _find_cached_archive(
     mod_id: int = 0,
     file_id: int = 0,
     expected_md5: str = "",
+    cache_index: "ArchiveLookupIndex | None" = None,
 ) -> "tuple[Path | None, bool]":
     """Scan *dl_dir* for an existing archive that matches this mod.
 
@@ -321,48 +506,47 @@ def _find_cached_archive(
     norm_name = re.sub(r'[^\w]', '', (display_name or '').lower())
     mod_id_str = str(mod_id) if mod_id > 0 else ""
 
-    try:
-        candidates = [
-            f for f in dl_dir.iterdir()
-            if f.is_file() and any(f.name.lower().endswith(e) for e in _ARCHIVE_EXTS)
-        ]
-    except Exception:
-        return None, False
+    if cache_index is not None:
+        candidates = cache_index.candidates(dl_dir)
+    else:
+        candidates = ArchiveLookupIndex._read_directory(dl_dir)
 
     # Pass 0: exact file_id match via sidecar (written on every download)
     if file_id > 0:
-        for f in candidates:
-            if _read_sidecar_file_id(f) == file_id:
-                try:
-                    actual = f.stat().st_size
-                except Exception:
-                    continue
-                if expected_size_bytes > 0:
-                    ratio = actual / expected_size_bytes
-                    if ratio >= _PARTIAL_CUTOFF:
-                        is_complete = ratio >= (1.0 - _SIZE_TOLERANCE) and _zip_is_intact(f)
-                        return f, is_complete
-                    # Sidecar matched but file is clearly truncated - treat as partial
-                    return f, False
-                return f, _zip_is_intact(f)
+        exact = (cache_index.exact(dl_dir, file_id)
+                 if cache_index is not None
+                 else (candidate for candidate in candidates
+                       if candidate.file_id == file_id))
+        for candidate in exact:
+            f = candidate.path
+            try:
+                actual = f.stat().st_size
+            except Exception:
+                continue
+            if expected_size_bytes > 0:
+                ratio = actual / expected_size_bytes
+                if ratio >= _PARTIAL_CUTOFF:
+                    is_complete = ratio >= (1.0 - _SIZE_TOLERANCE) and _zip_is_intact(f)
+                    return f, is_complete
+                # Sidecar matched but file is clearly truncated - treat as partial
+                return f, False
+            return f, _zip_is_intact(f)
 
     best_partial: "Path | None" = None
 
-    for f in candidates:
+    for candidate in candidates:
+        f = candidate.path
         # Skip files whose sidecar belongs to a different file_id - they are
         # unambiguously a different download and must never be treated as
         # partials of this one.  This prevents cross-contamination when two
         # files from the same mod (e.g. 76460) are being fetched in parallel
         # and one's filename is a prefix of the other.
         if file_id > 0:
-            _sid = _read_sidecar_file_id(f)
+            _sid = candidate.file_id
             if _sid > 0 and _sid != file_id:
                 continue
 
-        try:
-            actual = f.stat().st_size
-        except Exception:
-            continue
+        actual = candidate.size
 
         if expected_size_bytes > 0:
             ratio = actual / expected_size_bytes
@@ -383,6 +567,12 @@ def _find_cached_archive(
                         _clean_nexus_stem(f.stem, mod_id_str).lower()
                     )
                     if clean and norm_name not in clean and clean not in norm_name:
+                        continue
+                if cache_index is not None:
+                    try:
+                        if f.stat().st_size != actual:
+                            continue
+                    except OSError:
                         continue
                 # Size (and optional name hint) match - verify md5 when
                 # provided (e.g. from a collection manifest) to rule out
@@ -422,6 +612,8 @@ def _find_cached_archive(
                 if mod_id_str else raw_stem
             norm_stem = re.sub(r'[^\w]', '', display_stem.lower())
             if norm_name and norm_stem == norm_name:
+                if cache_index is not None and not f.is_file():
+                    continue
                 if expected_md5 and not _md5_matches(f, expected_md5):
                     continue
                 return f, _zip_is_intact(f)
@@ -469,10 +661,26 @@ class NexusDownloader:
     """
 
     def __init__(self, api: NexusAPI,
-                 download_dir: Path | None = None):
+                 download_dir: Path | None = None, *, stream_handler=None):
         self._api = api
+        self._stream_handler = stream_handler
         self._download_dir = download_dir or _get_downloads_dir()
         self._download_dir.mkdir(parents=True, exist_ok=True)
+        self._worker_state = threading.local()
+
+    def _worker_session(self) -> requests.Session:
+        session = getattr(self._worker_state, "session", None)
+        if session is None:
+            session = requests.Session()
+            session.verify = resolve_ca_bundle() or True
+            self._worker_state.session = session
+        return session
+
+    def close_worker_session(self) -> None:
+        session = getattr(self._worker_state, "session", None)
+        if session is not None:
+            session.close()
+            del self._worker_state.session
 
     @property
     def download_dir(self) -> Path:
@@ -571,6 +779,7 @@ class NexusDownloader:
         known_file_name: str = "",
         expected_size_bytes: int = 0,
         prefetched_links: "list[NexusDownloadLink] | None" = None,
+        cache_index: "ArchiveLookupIndex | None" = None,
     ) -> DownloadResult:
         """
         Download a file directly (premium users only - no key needed).
@@ -598,6 +807,7 @@ class NexusDownloader:
                                download so a worker starts transferring bytes
                                with zero link latency. Ignored when a complete
                                cached archive is found (no download needed).
+        cache_index          : Reusable cache metadata for bulk downloads.
 
         Returns
         -------
@@ -617,7 +827,8 @@ class NexusDownloader:
         # so the download starts cleanly.
         _dest = dest_dir or self._download_dir
         cached, is_complete = _find_cached_archive(
-            _dest, known_file_name, expected_size_bytes, mod_id, file_id
+            _dest, known_file_name, expected_size_bytes, mod_id, file_id,
+            cache_index=cache_index,
         )
         if cached is not None:
             if is_complete:
@@ -640,6 +851,8 @@ class NexusDownloader:
                 try:
                     cached.unlink(missing_ok=True)
                     _fileid_sidecar(cached).unlink(missing_ok=True)
+                    if cache_index is not None:
+                        cache_index.discard(cached)
                 except Exception:
                     pass
 
@@ -738,6 +951,12 @@ class NexusDownloader:
     ) -> DownloadResult:
         """Try each mirror in order until one succeeds."""
 
+        from Utils.ui.config import load_nexus_download_server
+        preferred = load_nexus_download_server()
+        if preferred:
+            links = sorted(links, key=lambda link:
+                           link.short_name.casefold() != preferred.casefold())
+
         last_error = ""
         for link in links:
             if cancel is not None and cancel.is_set():
@@ -747,6 +966,7 @@ class NexusDownloader:
                     mod_id=mod_id, file_id=file_id,
                 )
             try:
+                app_log(f"Downloading {file_name} from {link.name or link.short_name}")
                 result = self._stream_download(
                     url=link.URI,
                     file_name=file_name,
@@ -791,7 +1011,14 @@ class NexusDownloader:
     ) -> DownloadResult:
         """Stream-download a single URL to disk."""
 
-        with requests.get(url, stream=True, timeout=60, verify=resolve_ca_bundle() or True) as resp:
+        if self._stream_handler is not None:
+            return self._stream_handler(url=url, file_name=file_name, dest_dir=dest_dir,
+                progress_cb=progress_cb, cancel=cancel, game_domain=game_domain,
+                mod_id=mod_id, file_id=file_id)
+
+        session = self._worker_session()
+        with session.get(url, stream=True, timeout=60,
+                         verify=session.verify) as resp:
             resp.raise_for_status()
 
             # Determine filename with the correct extension.
@@ -829,53 +1056,78 @@ class NexusDownloader:
                 total = 0
             dest = dest_dir / file_name
 
-            # Don't clobber existing files - add a suffix
+            # Reserve a .part name so concurrent downloads cannot share it.
             counter = 1
             stem = dest.stem
             suffix = dest.suffix
-            while dest.exists():
+            while True:
+                partial = dest.with_name(dest.name + ".part")
+                if not dest.exists():
+                    try:
+                        fh = partial.open("xb")
+                    except FileExistsError:
+                        pass
+                    else:
+                        if not dest.exists():
+                            break
+                        fh.close()
+                        partial.unlink(missing_ok=True)
                 dest = dest_dir / f"{stem} ({counter}){suffix}"
                 counter += 1
 
-            # Stamp the sidecar now, before the download starts, so that
-            # concurrent _find_cached_archive calls from other threads (e.g.
-            # a sibling file from the same mod) can identify this in-flight
-            # partial by file_id and skip it, rather than misclassifying it
-            # as a partial of their own file and unlinking it.
-            if file_id > 0:
-                _write_sidecar_file_id(dest, file_id)
-
             downloaded = 0
-            with open(dest, "wb") as fh:
-                for chunk in resp.iter_content(_CHUNK_SIZE):
-                    if cancel and cancel.is_set():
-                        fh.close()
-                        delete_archive_and_sidecar(dest)
-                        raise DownloadCancelled()
-
-                    fh.write(chunk)
-                    downloaded += len(chunk)
-                    bandwidth_limit.throttle(len(chunk), cancel)
-
+            completed = False
+            from Utils.downloads.resources import current_resources
+            resources = current_resources()
+            try:
+                with fh:
                     if progress_cb:
-                        progress_cb(downloaded, total)
+                        progress_cb(0, total)
+                    for chunk in resp.iter_content(_CHUNK_SIZE):
+                        if cancel and cancel.is_set():
+                            raise DownloadCancelled()
 
-        # Verify against Content-Length - a dropped connection can end the
-        # stream early without raising; a short file must not look successful.
-        if total and downloaded != total:
-            app_log(f"Incomplete download of {file_name}: got {downloaded} "
-                    f"of {total} bytes - discarding")
-            delete_archive_and_sidecar(dest)
-            return DownloadResult(
-                success=False,
-                error=f"Incomplete download: got {downloaded} of {total} bytes",
-                game_domain=game_domain,
-                mod_id=mod_id, file_id=file_id,
-            )
+                        if resources is not None:
+                            resources.throttle_download(len(chunk), cancel)
+                            if cancel and cancel.is_set():
+                                raise DownloadCancelled()
+                            resources.write_download(fh, chunk)
+                        else:
+                            fh.write(chunk)
+                        downloaded += len(chunk)
+                        bandwidth.throttle(len(chunk), cancel)
+
+                        if progress_cb:
+                            progress_cb(downloaded, total)
+
+                if cancel and cancel.is_set():
+                    raise DownloadCancelled()
+
+                if total and downloaded != total:
+                    app_log(f"Incomplete download of {file_name}: got {downloaded} "
+                            f"of {total} bytes - discarding")
+                    return DownloadResult(
+                        success=False,
+                        error=f"Incomplete download: got {downloaded} of {total} bytes",
+                        game_domain=game_domain,
+                        mod_id=mod_id, file_id=file_id,
+                    )
+
+                # Publish the identity before the complete archive becomes visible.
+                if file_id > 0:
+                    _write_sidecar_file_id(dest, file_id)
+                try:
+                    partial.replace(dest)
+                except OSError:
+                    if file_id > 0:
+                        _fileid_sidecar(dest).unlink(missing_ok=True)
+                    raise
+                completed = True
+            finally:
+                if not completed:
+                    partial.unlink(missing_ok=True)
 
         app_log(f"Downloaded {file_name} ({downloaded} bytes) → {dest}")
-        if file_id > 0:
-            _write_sidecar_file_id(dest, file_id)
 
         return DownloadResult(
             success=True,

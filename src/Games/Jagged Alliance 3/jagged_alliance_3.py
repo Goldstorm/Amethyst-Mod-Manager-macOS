@@ -17,12 +17,12 @@ Mod structure:
 from pathlib import Path
 
 from Games.base_game import BaseGame
-from Utils.deploy import (
+from Utils.deployment import (
     LinkMode, deploy_filemap, deploy_core, load_per_mod_strip_prefixes,
     load_separator_deploy_paths, expand_separator_deploy_paths,
     cleanup_custom_deploy_dirs, move_to_core, restore_data_core,
 )
-from Utils.modlist import read_modlist
+from Utils.mods.modlist import read_modlist
 from Utils.config_paths import get_profiles_dir
 
 _PROFILES_DIR = get_profiles_dir()
@@ -185,7 +185,8 @@ class JaggedAlliance3(BaseGame):
 
         mods_dir.mkdir(parents=True, exist_ok=True)
 
-        if not filemap.is_file():
+        from Utils.filegraph.deploy import input_ready
+        if not input_ready():
             raise RuntimeError(
                 f"filemap.txt not found: {filemap}\n"
                 "Run 'Build Filemap' before deploying."
@@ -201,7 +202,9 @@ class JaggedAlliance3(BaseGame):
         _sep_deploy = load_separator_deploy_paths(profile_dir)
         _sep_entries = read_modlist(profile_dir / "modlist.txt") if _sep_deploy else []
         per_mod_deploy = expand_separator_deploy_paths(_sep_deploy, _sep_entries) or None
+        custom_exclude = self._deploy_custom_routing_rules(mode, log_fn)
         linked_mod, placed = deploy_filemap(filemap, mods_dir, staging,
+                                            exclude=custom_exclude,
                                             mode=mode,
                                             strip_prefixes=self.mod_folder_strip_prefixes,
                                             per_mod_strip_prefixes=per_mod_strip,
@@ -210,6 +213,8 @@ class JaggedAlliance3(BaseGame):
                                             progress_fn=progress_fn,
                                             core_dir=mods_dir.parent / (mods_dir.name + "_Core"))
         _log(f"  Transferred {linked_mod} mod file(s).")
+        placed.update(self._custom_routing_destinations_under(
+            custom_exclude, mods_dir))
 
         _log("Step 3: Filling gaps with vanilla files from Mods_Core/ ...")
         linked_core = deploy_core(mods_dir, placed, mode=mode, log_fn=_log)
@@ -233,6 +238,7 @@ class JaggedAlliance3(BaseGame):
 
     def restore(self, log_fn=None, progress_fn=None) -> None:
         """Remove deployed mods and restore the vanilla Mods folder."""
+        self._restore_custom_routing_rules(log_fn)
         _log = log_fn or (lambda _: None)
 
         if self._prefix_path is None:
@@ -242,7 +248,7 @@ class JaggedAlliance3(BaseGame):
 
         _profile_dir = self._active_profile_dir
         _entries = read_modlist(_profile_dir / "modlist.txt") if _profile_dir else []
-        cleanup_custom_deploy_dirs(_profile_dir, _entries, log_fn=_log)
+        cleanup_custom_deploy_dirs(_profile_dir, _entries, log_fn=_log, game=self)
 
         # Restore any vanilla Packs/ files that loose .hpk mods replaced.
         if self._game_path is not None:
@@ -250,7 +256,9 @@ class JaggedAlliance3(BaseGame):
                 self.get_effective_filemap_path(), self._game_path, log_fn=_log)
 
         _log("Restore: clearing Mods/ and moving Mods_Core/ back ...")
-        restored = restore_data_core(mods_dir, overwrite_dir=self.get_effective_overwrite_path(), log_fn=_log)
+        restored = restore_data_core(
+            mods_dir, overwrite_dir=self.get_effective_overwrite_path(),
+            log_fn=_log, game=self, profile_dir=self._active_profile_dir)
         _log(f"  Restored {restored} file(s). Mods_Core/ removed.")
 
         _log("Restore complete.")

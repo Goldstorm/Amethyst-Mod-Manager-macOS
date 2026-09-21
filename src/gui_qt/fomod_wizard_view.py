@@ -13,6 +13,8 @@ which finish_install() feeds to resolve_files(). on_cancel() aborts the install.
 
 from __future__ import annotations
 
+import html
+import re
 from pathlib import Path
 
 from PySide6.QtCore import Qt
@@ -23,11 +25,42 @@ from PySide6.QtWidgets import (
 )
 
 from gui_qt.theme_qt import active_palette, _c
-from Utils.fomod_installer import (
+from Utils.fomod.installer import (
     get_visible_steps, get_default_selections, update_flags,
     validate_selections, resolve_plugin_type, plugin_dep_unmet, plugin_dep_met,
 )
-from Utils.fomod_parser import resolve_path_ci
+from Utils.fomod.parser import resolve_path_ci
+
+
+_WEB_URL_RE = re.compile(
+    r"(?<![\w@])(?:https?://|www\.)[^\s<>\"']+",
+    re.IGNORECASE,
+)
+
+
+def _description_html(text: str, link_color: str) -> str:
+    parts = []
+    cursor = 0
+    for match in _WEB_URL_RE.finditer(text):
+        parts.append(html.escape(text[cursor:match.start()]))
+        url = match.group(0)
+        suffix = ""
+        while url and url[-1] in ".,;:!?":
+            suffix = url[-1] + suffix
+            url = url[:-1]
+        for closing, opening in ((")", "("), ("]", "["), ("}", "{")):
+            while url.endswith(closing) and url.count(closing) > url.count(opening):
+                suffix = closing + suffix
+                url = url[:-1]
+        target = url if not url.lower().startswith("www.") else f"https://{url}"
+        parts.append(
+            f'<a href="{html.escape(target, quote=True)}" '
+            f'style="color:{link_color};">{html.escape(url)}</a>'
+            f"{html.escape(suffix)}"
+        )
+        cursor = match.end()
+    parts.append(html.escape(text[cursor:]))
+    return "".join(parts).replace("\n", "<br>")
 
 
 class FomodWizardView(QWidget):
@@ -81,6 +114,9 @@ class FomodWizardView(QWidget):
         title.setStyleSheet("font-size:15px; font-weight:600;")
         hb.addWidget(title)
         hb.addStretch(1)
+        self._step_name = QLabel("")
+        hb.addWidget(self._step_name)
+        hb.addStretch(1)
         self._step_lbl = QLabel("")
         self._step_lbl.setStyleSheet(f"color:{self._c('TEXT_DIM')};")
         hb.addWidget(self._step_lbl)
@@ -106,6 +142,9 @@ class FomodWizardView(QWidget):
         self._desc = QLabel("")
         self._desc.setWordWrap(True)
         self._desc.setAlignment(Qt.AlignTop)
+        self._desc.setTextFormat(Qt.RichText)
+        self._desc.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        self._desc.setOpenExternalLinks(True)
         self._desc.setStyleSheet(f"color:{self._c('TEXT_MAIN')};")
         self._desc_scroll = QScrollArea()
         self._desc_scroll.setWidgetResizable(True)
@@ -299,6 +338,7 @@ class FomodWizardView(QWidget):
         self._show_plugin(selected_plugin or first_plugin)
 
         total = len(self._visible_steps)
+        self._step_name.setText(step.name.strip())
         self._step_lbl.setText(self.tr("Step {0} of {1}").format(self._cur + 1, total))
         self._back_btn.setEnabled(self._cur > 0)
         self._next_btn.setText(self.tr("Finish") if self._cur >= total - 1 else self.tr("Next"))
@@ -428,7 +468,8 @@ class FomodWizardView(QWidget):
 
     # ---- left panel -------------------------------------------------------
     def _show_plugin(self, plugin):
-        self._desc.setText(plugin.description or "")
+        self._desc.setText(_description_html(
+            plugin.description or "", self._c("ACCENT")))
         img_rel = getattr(plugin, "image_path", "") or ""
         self._cur_pixmap = None
         self._cur_image_path = None

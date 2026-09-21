@@ -3,10 +3,11 @@ game with per-row management. Qt port of the Tk ``gui/profile_settings_overlay.p
 (``ProfileSettingsOverlay``), MINUS the "Steam Cmd" button.
 
 Each row: a lock toggle (disabled for the default profile), the profile name (with
-``(default)`` / ``★`` markers), and Rename / Open / Remove buttons. Rename opens an
-inline bar under the row; Remove restores the game first if the profile is deployed,
-asks a second time if the profile has its own mods, then deletes the folder. All the
-persistence reuses the neutral ``Utils.profile_state`` helpers - no backend rewrite.
+``(default)`` / ``★`` markers), a dropdown visibility checkbox, and Rename / Open /
+Remove buttons. Rename opens an inline bar under the row; Remove restores the game
+first if the profile is deployed, asks a second time if the profile has its own mods,
+then deletes the folder. All persistence reuses the neutral
+``Utils.profiles.state`` helpers - no backend rewrite.
 """
 
 from __future__ import annotations
@@ -19,16 +20,18 @@ from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QPainter, QPen, QColor
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
-    QFrame, QScrollArea,
+    QCheckBox, QFrame, QScrollArea,
 )
 
-from gui_qt.theme_qt import active_palette, _c, danger_close_button, contrast_text
+from gui_qt.theme_qt import active_palette, _c, close_button, contrast_text
 from gui_qt.icons import icon
 from gui_qt.safe_emit import safe_emit
-from Utils.profile_state import (
-    read_profile_settings, merge_profile_settings, profile_uses_specific_mods,
+from gui_qt.i18n import profile_display, is_reserved_profile_name
+from Utils.profiles.state import (
+    read_profile_settings, merge_profile_settings,
+    profile_hidden_from_dropdown, profile_uses_specific_mods,
 )
-from Utils.xdg import xdg_open
+from Utils.environment.xdg import xdg_open
 
 
 class _LockBox(QWidget):
@@ -133,7 +136,7 @@ class ProfileSettingsView(QWidget):
         hb = QHBoxLayout(bar); hb.setContentsMargins(12, 8, 12, 8)
         title = QLabel(self.tr("Profile Settings")); title.setObjectName("PSTitle")
         hb.addWidget(title); hb.addStretch(1)
-        close = danger_close_button(pal=p)
+        close = close_button(pal=p)
         close.clicked.connect(self._close)
         hb.addWidget(close)
         root.addWidget(bar)
@@ -152,7 +155,7 @@ class ProfileSettingsView(QWidget):
 
     # -- profile helpers (neutral, ported from the Tk overlay) --------------
     def _get_profile_dir(self, profile: str) -> Path:
-        from Utils.game_helpers import _GAMES
+        from Utils.games.registry import _GAMES
         game = _GAMES.get(self._game_name)
         if game is not None:
             return game.get_profile_root() / "profiles" / profile
@@ -160,7 +163,7 @@ class ProfileSettingsView(QWidget):
         return get_profiles_dir() / self._game_name / "profiles" / profile
 
     def _profiles(self) -> list[str]:
-        from Utils.game_helpers import _profiles_for_game
+        from Utils.games.registry import _profiles_for_game
         return _profiles_for_game(self._game_name)
 
     def _is_original_default(self, profile: str) -> bool:
@@ -183,6 +186,9 @@ class ProfileSettingsView(QWidget):
                         .get("profile_locked", False))
         except Exception:
             return False
+
+    def _is_profile_hidden(self, profile: str) -> bool:
+        return profile_hidden_from_dropdown(self._get_profile_dir(profile))
 
     def _mark_original_default(self, profile_dir: Path):
         try:
@@ -227,10 +233,11 @@ class ProfileSettingsView(QWidget):
                         lambda pr=profile: self._toggle_lock(pr))
         rl.addWidget(lock)
 
-        # (2) Name label.
-        text = profile
+        # (2) Name label. profile is the FOLDER NAME (the row's key for every
+        # button below); only the shown text is translated.
+        text = profile_display(profile)
         if is_default:
-            text += "  (default)"
+            text += self.tr("  (default)")
         if is_active:
             text += "  ★"
         name = QLabel(text)
@@ -240,7 +247,17 @@ class ProfileSettingsView(QWidget):
             name.setStyleSheet(f"color:{_c(p,'TEXT_MAIN')};")
         rl.addWidget(name, 1)
 
-        # (3) Buttons - Rename / Open / Remove (NO Steam Cmd).
+        hidden = QCheckBox(self.tr("Hide"))
+        hidden.setChecked(self._is_profile_hidden(profile))
+        hidden.setToolTip(self.tr(
+            "Hidden profiles remain available here. The active profile stays "
+            "in the dropdown until you switch profiles."))
+        hidden.clicked.connect(
+            lambda checked, pr=profile, cb=hidden:
+            self._set_profile_hidden(pr, checked, cb))
+        rl.addWidget(hidden)
+
+        # (4) Buttons - Rename / Open / Remove (NO Steam Cmd).
         rename = QPushButton(self.tr("Rename"))
         rename.setObjectName("FormButton")
         rename.setCursor(Qt.PointingHandCursor)
@@ -277,6 +294,18 @@ class ProfileSettingsView(QWidget):
         self._populate_list()
         self._on_profiles_changed()
 
+    def _set_profile_hidden(self, profile: str, hidden: bool,
+                            checkbox: QCheckBox):
+        try:
+            merge_profile_settings(
+                self._get_profile_dir(profile),
+                {"hide_from_profile_dropdown": True if hidden else None})
+        except Exception as e:
+            checkbox.setChecked(not hidden)
+            self._log(f"Could not save profile visibility: {e}")
+            return
+        self._on_profiles_changed()
+
     # -- open ---------------------------------------------------------------
     def _open_profile_folder(self, profile: str):
         folder = self._get_profile_dir(profile)
@@ -300,9 +329,11 @@ class ProfileSettingsView(QWidget):
         hb = QHBoxLayout(bar)
         hb.setContentsMargins(12, 6, 12, 6)
         hb.setSpacing(6)
-        lbl = QLabel(self.tr("Rename '{0}' to:").format(profile))
+        lbl = QLabel(self.tr("Rename '{0}' to:").format(profile_display(profile)))
         lbl.setStyleSheet(f"color:{_c(p,'TEXT_DIM')};")
         hb.addWidget(lbl)
+        # Seeded with the FOLDER name, not the display name - what the user
+        # edits here becomes the new folder.
         edit = QLineEdit(profile)
         edit.setFixedWidth(200)
         edit.selectAll()
@@ -340,6 +371,10 @@ class ProfileSettingsView(QWidget):
     def _do_rename(self):
         if self._rename_edit is None or self._rename_target is None:
             return
+        if getattr(self._window, "_filegraph_loading", False):
+            self._notify(self.tr("Wait for the profile to finish loading."),
+                         "info")
+            return
         old_name = self._rename_target
         new_name = self._rename_edit.text().strip()
 
@@ -349,7 +384,9 @@ class ProfileSettingsView(QWidget):
         if new_name == old_name:
             self._cancel_rename()
             return
-        if new_name.lower() == "default":
+        # Reject the folder name AND its translation: a profile literally named
+        # "Standard" under German would draw identically to the default one.
+        if is_reserved_profile_name(new_name):
             self._log("Cannot rename to 'default'.")
             return
         if new_name in self._profiles():
@@ -391,14 +428,18 @@ class ProfileSettingsView(QWidget):
     def _on_remove(self, profile: str):
         if self._is_original_default(profile) or self._is_profile_locked(profile):
             return
+        if getattr(self._window, "_filegraph_loading", False):
+            self._notify(self.tr("Wait for the profile to finish loading."),
+                         "info")
+            return
         from gui_qt.confirm_overlay import ConfirmOverlay
-        from Utils.game_helpers import _GAMES
+        from Utils.games.registry import _GAMES
         game = _GAMES.get(self._game_name)
 
         # Deleting a MEMBER of a group that is currently deployed would leave
         # the game full of dangling links - require a restore first.
         try:
-            from Utils.profile_groups import is_group, member_of_groups
+            from Utils.profiles.groups import is_group, member_of_groups
             target_is_group = is_group(self._get_profile_dir(profile))
             if game is not None and not target_is_group:
                 groups = member_of_groups(game, profile)
@@ -454,6 +495,10 @@ class ProfileSettingsView(QWidget):
 
     def _start_remove_worker(self, profile: str, is_deployed: bool):
         win = self._window
+        if getattr(win, "_filegraph_loading", False):
+            self._notify(self.tr("Wait for the profile to finish loading."),
+                         "info")
+            return
         # Coordinate with the app's deploy/restore mutex.
         if getattr(win, "_deploy_running", False):
             self._notify(self.tr("A deploy is in progress - try again shortly."), "warning")
@@ -469,7 +514,7 @@ class ProfileSettingsView(QWidget):
             except Exception:
                 pass
 
-        from Utils.game_helpers import _GAMES
+        from Utils.games.registry import _GAMES
         game = _GAMES.get(self._game_name)
 
         def worker():
@@ -493,7 +538,7 @@ class ProfileSettingsView(QWidget):
         Mirrors the app's _on_restore sequence (borrows the window's op signals
         for the progress popup)."""
         win = self._window
-        from Utils.deploy import restore_root_folder_for_game
+        from Utils.deployment import restore_root_folder_for_game
         # Remember the profile we're actually on so the finally block restores to
         # it - restoring to None (default) would desync the game object from the
         # selected profile and make later path-derived opens resolve wrong.
@@ -504,13 +549,13 @@ class ProfileSettingsView(QWidget):
             game_root = game.get_game_path()
             if hasattr(game, "restore"):
                 game.restore(
-                    log_fn=lambda m: win._op_log.emit(str(m)),
+                    log_fn=lambda m: self._log(str(m)),
                     progress_fn=lambda d, t, ph=None: win._op_progress.emit(d, t, ph))
             rf = game.get_effective_root_folder_path()
             if rf.is_dir() and game_root:
                 restore_root_folder_for_game(
                     game, root_folder_dir=rf, game_root=game_root,
-                    log_fn=lambda m: win._op_log.emit(str(m)),
+                    log_fn=lambda m: self._log(str(m)),
                 )
         finally:
             game.set_active_profile_dir(prev_profile_dir)

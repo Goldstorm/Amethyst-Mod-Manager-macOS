@@ -45,7 +45,7 @@ def proton_run_command(
     """
     if sys.platform != "darwin":
         # Linux: delegate to existing implementation
-        from Utils.steam_finder import proton_run_command as _original
+        from Utils.launchers.steam import proton_run_command as _original
         return _original(proton_script, *args, env=env, host_cwd=host_cwd)
 
     # macOS: route through WineRunner
@@ -97,7 +97,7 @@ def list_installed_proton() -> list[Path]:
     ``path.parent.name`` for display will get bottle names on macOS.
     """
     if sys.platform != "darwin":
-        from Utils.steam_finder import list_installed_proton as _original
+        from Utils.launchers.steam import list_installed_proton as _original
         return _original()
 
     # macOS: return CrossOver bottles as "runner paths"
@@ -140,7 +140,7 @@ def find_prefix(
     Backwards-compatible replacement for ``steam_finder.find_prefix``.
     """
     if sys.platform != "darwin":
-        from Utils.steam_finder import find_prefix as _original
+        from Utils.launchers.steam import find_prefix as _original
         return _original(steam_id, game_path)
 
     # macOS: try to find a CrossOver bottle
@@ -193,7 +193,7 @@ def install_winetricks_verb(
     log = log_fn or (lambda _m: None)
 
     if sys.platform != "darwin":
-        from Utils.protontricks import install_winetricks_verb as _original
+        from Utils.wine.protontricks import install_winetricks_verb as _original
         return _original(prefix, component, log_fn=log)
 
     # macOS: use WineRunner
@@ -210,11 +210,11 @@ def install_d3dcompiler_47(
     log = log_fn or (lambda _m: None)
 
     if sys.platform != "darwin":
-        from Utils.protontricks import install_d3dcompiler_47 as _original
+        from Utils.wine.protontricks import install_d3dcompiler_47 as _original
         return _original(prefix, log_fn=log)
 
     from Utils.wine_runner import get_runner
-    from Utils.protontricks import D3D_DEP_KEY
+    from Utils.wine.protontricks import D3D_DEP_KEY
     runner = get_runner()
     return runner.install_dependency(prefix, D3D_DEP_KEY, log_fn=log)
 
@@ -227,11 +227,11 @@ def install_vcredist(
     log = log_fn or (lambda _m: None)
 
     if sys.platform != "darwin":
-        from Utils.protontricks import install_vcredist as _original
+        from Utils.wine.protontricks import install_vcredist as _original
         return _original(prefix, log_fn=log)
 
     from Utils.wine_runner import get_runner
-    from Utils.protontricks import VCREDIST_DEP_KEY
+    from Utils.wine.protontricks import VCREDIST_DEP_KEY
     runner = get_runner()
     return runner.install_dependency(prefix, VCREDIST_DEP_KEY, log_fn=log)
 
@@ -266,7 +266,7 @@ def is_dep_installed(prefix: Path, key: str) -> bool:
 
     Works on both Linux and macOS.
     """
-    from Utils.protontricks import is_dep_installed as _original
+    from Utils.wine.protontricks import is_dep_installed as _original
     return _original(prefix, key)
 
 
@@ -320,7 +320,7 @@ def resolve_proton_env_for_game(game) -> tuple[Path | None, dict]:
     is None on macOS.
     """
     if sys.platform != "darwin":
-        from Utils.protontricks import build_proton_env_for_game
+        from Utils.wine.protontricks import build_proton_env_for_game
         return build_proton_env_for_game(game)
 
     # macOS: return CrossOver env

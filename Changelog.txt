@@ -1,3 +1,104 @@
+- v2.5.0
+### Wabbajack
+- Added the ability to browse and install Wabbajack modlists
+### Game Support
+- Added Project Zomboid #488
+### Additions
+- Added UI options to hide top bar buttons
+- Added an option in the profile settings to hide profiles from the profile dropdown
+- Added a content column to display certain types of content within a mod
+- Added a blacklist button to the data tab that allows additional files/folder to be blocked from deploy and the conflict calculation
+- Added an option to the xedit wizards to launch the 64 bit versions
+- Added right click options in the mod files tab to manager files and folders
+- Added a wizard for Cathedral Assets Optimizer under patchers and cleanup
+- Added a manual workaround for Nexus sso login
+- Added the option to enable lsfg vk when launching a game including a menu to change lsfg options
+### Changes
+- Smaller mods during collection install are added as a batch to remove flashing text as they download/install
+- Rearranged the game configure menu to better fit game options instead of them being in one small box
+- Disabled plugins are no longer shown in the xedit qac wizards
+- Updated flatpak to kde runtime 6.11
+- Logs older than 7 days are now automatically removed from the logs folder on startup
+- Improved update checking speed
+- Wine dll overrides are now fully automated and no longer need to be set in a game's handler
+- description text within the Fomod installer is now selectable. Links in the description can be clicked on to open in the browser
+- The collection preflight interface has been reworked to match the Wabbajack preflight interface
+### Bug Fixes
+- Fixed some issues with Bain mods
+- Fixed Cyberpunk's prefix health check returning a false positive for Vcredist
+- Fixed an issue when updating a mod while the rename after install and install disabled options were enabled could cause them to move to the top of the modlist
+- Fixed Bethesda creation content not being moved to overwrite when the game is redeployed
+- Fixed plugins being enabled from collections that are intended to be disabled
+- Fixed issues with Smapi not working with symlinks (smapi will need to be reinstalled via the wizard)
+
+---
+
+- v2.4.3
+- Fixed TTW/Mpi installer not downloading due to its location changing
+
+---
+
+- v2.4.2
+- Fixed a regression in 2.4.1 causing broken archives to stall Loot sorting and freeze the application
+- Fixed "Install destination is absolute:" error with some Fomod mods
+- Added a steam workshop downloader wizard for games that support it
+
+---
+
+- v2.4.1
+### Additions
+- Added a right click option to group mods together 
+- Added keybinds for opening the settings menu,installing a mod and creating an empty mod
+- Added the ability to change keybinds in the settings menu
+- Added support for sites that use the modl schema for direct downloads
+- Added an interface for managing the overwrite folder (Overwrite separator > Manage overwrite)
+- Added Wizards for Fo3 BSA Decompresser and ESM Patcher
+- Added a downloaded date column to the downloads tab as well as column sorting
+- Added xlodgen wizards to other games that use it
+- Added an option to hide archives in the downloads tab and a filter to show hidden archives
+### Changes
+- The reshade wizard now downloads and installs the add-ons version of reshade
+- Mod priority and version numbers in their columns can now be clicked to change them
+- Applied filters now persist when relaunching the application
+- Changed expanding/collapsing separators to a double click, or single clicking when pressing the arrow
+- The Fomod step name is now shown in the Fomod window #472
+### Bug Fixes
+- Fixed an issue where deferred Fomods in a collection install may not appear #443
+- Fixed larger modlists taking a while to load
+- Fixed an issue where the notification window would appear when the manager is minimised
+- Fixed modlist state loss after folder name sanitization
+- Fixed custom deploy paths in separator settings not working
+- Fixed excessive cache lookups on collection installs causing smaller mods to take longer to start downloading than usual
+
+---
+
+- v2.4.0
+### Performance Improvements
+- Fully reworked how conflicts are detected. Adding new mods, moving mods, enabling and disabling mods in a large modlist will feel much more responsive.
+- Improved application load and startup times
+### Game Support
+- Added Fallout New California (Gog)
+### Additions
+- Added a right click option to plugins with loot messages that contain links to open them
+- Added a Skyrim downgrade wizard for running the Mulderload downgrader
+- Added a right click option to Fomod mods to display the options that you made for that mod
+- Added support for the OpenMW appimage
+- Added a Wizard tool for Acmos Road generator (Skyrim SE in the Dyndolod category)
+- Added a logs dropdown to the text files tab.
+### Changes
+- The top bar can now be moved to the right or left of the application in the UI settings
+- The Amethyst theme is now the default theme for new installs
+- Audio and video files can now be played from the mod files tab and Data tab
+- Wabbajack lists no longer show in the collection browser
+- OpenMW plugins can now be flagged as groundcover plugins
+### Bug Fixes
+- Fixed repeated and unnecessary Nexus oauth token requests from the keyring during startup and during mod install
+- Fixed Enderal using Fallout's top level folder set causing some mods to install incorrectly
+- Fixed game launch options not applying correctly
+- Fixed an issue where applications run via the wizard could be left running in the background forever
+- Fixed separator strike lines not being visible with some themes
+---
+
 - v2.3.0
 ### VFS Deploy
 - Added a third deploy option to deploy mods into a Virtual file system instead of the game folder. Not every game has this option but most do.

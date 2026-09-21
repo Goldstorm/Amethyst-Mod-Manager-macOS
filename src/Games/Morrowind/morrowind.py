@@ -13,7 +13,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from Games.base_game import BaseGame, WizardTool
-from Utils.deploy import (
+from Utils.deployment import (
     LinkMode,
     cleanup_custom_deploy_dirs,
     deploy_core,
@@ -28,7 +28,7 @@ from Utils.deploy import (
     restore_custom_rules,
     restore_data_core,
 )
-from Utils.modlist import read_modlist
+from Utils.mods.modlist import read_modlist
 from Utils.config_paths import get_profiles_dir
 
 _PROFILES_DIR = get_profiles_dir()
@@ -145,15 +145,15 @@ class Morrowind(BaseGame):
     
     @property
     def custom_routing_rules(self) -> list:
-        from Utils.deploy import CustomRule
+        from Utils.deployment import CustomRule
         return [
-            CustomRule(dest="", filenames=["SlimDX.dll"], flatten=True, loose_only=True),
-            CustomRule(dest="", filenames=["Newtonsoft.Json.dll"], flatten=True, loose_only=True),
-            CustomRule(dest="", filenames=["MWSE-Update.exe"], flatten=True, loose_only=True),
-            CustomRule(dest="", filenames=["MGEXEgui.exe"], flatten=True, loose_only=True),
-            CustomRule(dest="", filenames=["dinput8.dll"], flatten=True, loose_only=True),
-            CustomRule(dest="", filenames=["d3d8.dll"], flatten=True, loose_only=True),
-            CustomRule(dest="", folders=["mge3"], flatten=True, loose_only=True),
+            CustomRule(rule_id='morrowind:c1b1b8039a67', dest="", filenames=["SlimDX.dll"], flatten=True, loose_only=True),
+            CustomRule(rule_id='morrowind:0b86a4133679', dest="", filenames=["Newtonsoft.Json.dll"], flatten=True, loose_only=True),
+            CustomRule(rule_id='morrowind:8a42671170a9', dest="", filenames=["MWSE-Update.exe"], flatten=True, loose_only=True),
+            CustomRule(rule_id='morrowind:9456f0949270', dest="", filenames=["MGEXEgui.exe"], flatten=True, loose_only=True),
+            CustomRule(rule_id='morrowind:9328ff928a2e', dest="", filenames=["dinput8.dll"], flatten=True, loose_only=True),
+            CustomRule(rule_id='morrowind:e6f5ad131c29', dest="", filenames=["d3d8.dll"], flatten=True, loose_only=True),
+            CustomRule(rule_id='morrowind:e9c4ffde03bf', dest="", folders=["mge3"], flatten=True, loose_only=True),
         ]
 
     @property
@@ -248,7 +248,8 @@ class Morrowind(BaseGame):
 
         if not data_dir.is_dir():
             raise RuntimeError(f"'Data Files' directory not found: {data_dir}")
-        if not filemap.is_file():
+        from Utils.filegraph.deploy import input_ready
+        if not input_ready():
             raise RuntimeError(
                 f"filemap.txt not found: {filemap}\n"
                 "Run 'Build Filemap' before deploying."
@@ -269,7 +270,7 @@ class Morrowind(BaseGame):
         # Custom-routed files (MGE XE loose files: d3d8.dll, MGEXEgui.exe,
         # mge3/, …) are placed under the game root - NOT 'Data Files/' - so run
         # this before the normal deploy and exclude the handled paths from it.
-        custom_rules = self.custom_routing_rules
+        custom_rules = self.effective_custom_routing_rules
         custom_exclude: set[str] = set()
         if custom_rules:
             _log("Step 1b: Routing files via custom rules ...")
@@ -347,15 +348,14 @@ class Morrowind(BaseGame):
 
         _profile_dir = self._active_profile_dir
         _entries = read_modlist(_profile_dir / "modlist.txt") if _profile_dir else []
-        cleanup_custom_deploy_dirs(_profile_dir, _entries, log_fn=_log)
+        cleanup_custom_deploy_dirs(_profile_dir, _entries, log_fn=_log, game=self)
 
-        custom_rules = self.custom_routing_rules
-        if custom_rules and self._game_path:
+        if self._game_path:
             _log("Restore: removing custom-routed files ...")
             restore_custom_rules(
                 self.get_effective_filemap_path(),
                 self._game_path,
-                rules=custom_rules,
+                rules=[],
                 log_fn=_log,
                 prefix_root=self.get_prefix_path(),
             )
@@ -373,6 +373,7 @@ class Morrowind(BaseGame):
                 staging_root=self.get_effective_mod_staging_path(),
                 strip_prefixes=self.mod_folder_strip_prefixes,
                 log_fn=_log,
+                game=self, profile_dir=self._active_profile_dir,
             )
             _log(f"  Restored {restored} file(s). 'Data Files_Core/' removed.")
         except RuntimeError as e:

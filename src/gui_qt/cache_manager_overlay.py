@@ -22,13 +22,14 @@ from PySide6.QtWidgets import (
 )
 
 from gui_qt.overlay_base import OverlayBase
-from gui_qt.theme_qt import active_palette, _c
+from gui_qt.theme_qt import active_palette, close_button, _c
 from gui_qt.confirm_overlay import ConfirmOverlay
 from Utils.config_paths import get_download_cache_dir
 
 # Sentinel key (in the checkbox / size-label dicts) for the orphaned-temp row -
 # not a real per-game cache name, so it can't collide with one.
 _ORPHANS = "\x00__orphans__"
+_WABBAJACK = "\x00__wabbajack__"
 
 
 class CacheManagerOverlay(OverlayBase):
@@ -43,6 +44,8 @@ class CacheManagerOverlay(OverlayBase):
     # so PySide6 marshals the plain dict/list across the thread boundary.
     _sizes_ready = Signal(object)        # {name: bytes} (per-game only)
     _orphans_ready = Signal(int, "qlonglong")   # dir count, total bytes
+    _wabbajack_ready = Signal(object)
+    _migration_failed = Signal(str)
     _clear_done = Signal(int, object)    # cleared_count, errors
 
     def __init__(self, host: QWidget, active_game_name: str = "",
@@ -59,6 +62,8 @@ class CacheManagerOverlay(OverlayBase):
         self._total = 0
 
         self._sizes_ready.connect(self._on_sizes)
+        self._wabbajack_ready.connect(self._on_wabbajack)
+        self._migration_failed.connect(lambda message: self._set_status(message, "err"))
         self._orphans_ready.connect(self._on_orphans)
         self._clear_done.connect(self._on_clear_done)
 
@@ -101,9 +106,7 @@ class CacheManagerOverlay(OverlayBase):
             f"color:{_c(p,'TEXT_MAIN')}; font-weight:600; font-size:15px;")
         h.addWidget(title)
         h.addStretch(1)
-        close = QPushButton(self.tr("✕ Close"))
-        close.setObjectName("DangerButton")
-        close.setCursor(Qt.PointingHandCursor)
+        close = close_button(self.tr("✕ Close"), pal=p)
         close.clicked.connect(self._finish)
         h.addWidget(close)
         outer.addWidget(bar)
@@ -191,7 +194,7 @@ class CacheManagerOverlay(OverlayBase):
         The leftover-temp row needs a sweep of every staging root, so it's
         appended later by :meth:`_on_orphans` off the scan thread.
         """
-        from Utils.cache_tools import enumerate_game_caches
+        from Utils.downloads.cache import enumerate_game_caches
         # Clear existing rows (keep the trailing stretch).
         while self._rows_v.count() > 1:
             item = self._rows_v.takeAt(0)
@@ -217,7 +220,7 @@ class CacheManagerOverlay(OverlayBase):
         for idx, game_dir in enumerate(games):
             name = game_dir.name
             active = (name == self._active)
-            label = self.tr("{0}  (active)").format(name) if active else name
+            label = self.tr("{0}  (active)").format(name) if active else self._label_for(name)
             color = _c(p, "TEXT_OK_BRIGHT") if active else _c(p, "TEXT_MAIN")
             self._add_row(idx, name, label, color)
 
@@ -245,11 +248,21 @@ class CacheManagerOverlay(OverlayBase):
     def _start_size_scan(self):
         """Size the per-game caches, then sweep for orphans - two emits, so the
         (fast) cache sizes land without waiting on the (slower) staging walk."""
-        names = [k for k in self._size_lbls if k != _ORPHANS]
+        names = [k for k in self._size_lbls if k not in {_ORPHANS, _WABBAJACK}]
+        self._clear_sel_btn.setEnabled(False)
+        self._clear_all_btn.setEnabled(False)
 
         def worker():
             try:
-                from Utils.cache_tools import game_cache_sizes
+                from Utils.config_paths import get_wabbajack_cache_dir
+                cache = get_wabbajack_cache_dir()
+                if cache.is_dir() and cache.name not in names:
+                    names.append(cache.name)
+            except Exception as exc:
+                from gui_qt.safe_emit import safe_emit
+                safe_emit(self._migration_failed, str(exc))
+            try:
+                from Utils.downloads.cache import game_cache_sizes
                 sizes = dict(game_cache_sizes(names))
             except Exception:
                 sizes = {}
@@ -258,20 +271,31 @@ class CacheManagerOverlay(OverlayBase):
             except (RuntimeError, TypeError):
                 return   # widget destroyed mid-scan (signal C++ object gone)
             try:
-                from Utils.cache_tools import orphaned_tmp_scan
+                from Utils.downloads.cache import orphaned_tmp_scan
                 dirs, nbytes = orphaned_tmp_scan()
             except Exception:
                 dirs, nbytes = [], 0
             try:
                 self._orphans_ready.emit(len(dirs), nbytes)
+                from Utils.wabbajack.maintenance import cache_items
+                self._wabbajack_ready.emit(cache_items())
             except (RuntimeError, TypeError):
                 pass
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_sizes(self, sizes: dict):
-        from Utils.cache_tools import format_size
+        from Utils.downloads.cache import format_size
+        self._clear_sel_btn.setEnabled(True)
+        self._clear_all_btn.setEnabled(True)
         for name, sz in sizes.items():
+            if name == "wabbajack" and name not in self._checks:
+                if self._empty_lbl is not None:
+                    self._rows_v.removeWidget(self._empty_lbl)
+                    self._empty_lbl.deleteLater()
+                    self._empty_lbl = None
+                self._add_row(max(self._rows_v.count() - 1, 0), name,
+                              self._label_for(name), _c(self._pal, "TEXT_MAIN"))
             self._sizes[name] = sz
             lbl = self._size_lbls.get(name)
             if lbl is not None:
@@ -280,7 +304,7 @@ class CacheManagerOverlay(OverlayBase):
 
     def _on_orphans(self, count: int, nbytes: int):
         """Append the leftover-temp row once the staging sweep finishes."""
-        from Utils.cache_tools import format_size
+        from Utils.downloads.cache import format_size
         self._orphan_scan_done = True
         if not count or _ORPHANS in self._checks:
             return
@@ -296,8 +320,24 @@ class CacheManagerOverlay(OverlayBase):
         self._size_lbls[_ORPHANS].setText(format_size(nbytes))
         self._refresh_total()
 
+    def _on_wabbajack(self, items):
+        from Utils.downloads.cache import format_size
+        if not items:
+            return
+        if self._empty_lbl is not None:
+            self._rows_v.removeWidget(self._empty_lbl)
+            self._empty_lbl.deleteLater()
+            self._empty_lbl = None
+        if _WABBAJACK not in self._checks:
+            self._add_row(max(self._rows_v.count() - 1, 0), _WABBAJACK,
+                          self.tr("Wabbajack jobs and update backups"), _c(self._pal, "TEXT_DIM"))
+        self._sizes[_WABBAJACK] = sum(item["bytes"] for item in items)
+        self._size_lbls[_WABBAJACK].setText(format_size(self._sizes[_WABBAJACK]))
+        self._checks[_WABBAJACK].setToolTip("\n".join(item["name"] for item in items))
+        self._refresh_total()
+
     def _refresh_total(self):
-        from Utils.cache_tools import format_size
+        from Utils.downloads.cache import format_size
         self._total = sum(self._sizes.values())
         self._total_lbl.setText(
             self.tr("Total: {0}").format(format_size(self._total)))
@@ -319,31 +359,33 @@ class CacheManagerOverlay(OverlayBase):
         """Sum the already-scanned sizes; only re-walk keys the scan missed
         (it's still running, or it failed) so the confirm prompt is instant."""
         missing = [k for k in keys
-                   if k not in self._sizes and k != _ORPHANS]
+                   if k not in self._sizes and k not in {_ORPHANS, _WABBAJACK}]
         if missing:
-            from Utils.cache_tools import game_cache_sizes
+            from Utils.downloads.cache import game_cache_sizes
             self._sizes.update(game_cache_sizes(missing))
         if _ORPHANS in keys and _ORPHANS not in self._sizes:
-            from Utils.cache_tools import orphaned_tmp_size
+            from Utils.downloads.cache import orphaned_tmp_size
             self._sizes[_ORPHANS] = orphaned_tmp_size()
         return sum(self._sizes.get(k, 0) for k in keys)
 
     def _label_for(self, key: str) -> str:
-        return "Leftover temp folders" if key == _ORPHANS else key
+        if key == "wabbajack":
+            return self.tr("Wabbajack gallery and packages")
+        return "Wabbajack jobs and update backups" if key == _WABBAJACK else "Leftover temp folders" if key == _ORPHANS else key
 
     def _on_clear_selected(self):
         keys = self._selected()
         if not keys:
             self._set_status(self.tr("Nothing selected."), "dim")
             return
-        from Utils.cache_tools import format_size
+        from Utils.downloads.cache import format_size
         total = self._selection_size(keys)
         shown = [self._label_for(k) for k in keys]
         listing = "\n".join(f"  • {n}" for n in shown[:10])
         if len(shown) > 10:
             listing += self.tr("\n  • …and {0} more").format(len(shown) - 10)
         body = self.tr("Clear {0} across {1} item(s)?\n\n"
-                "{2}\n\nArchives will be re-downloaded as needed.").format(
+                "{2}\n\nArchives, gallery data and modlist packages will be re-downloaded as needed. Saved Wabbajack requirement checks in the selected game caches will be reset. The Wabbajack jobs/backups entry removes abandoned jobs and update backups; referenced installations are preserved.").format(
                     format_size(total), len(keys), listing)
         n = len(keys)
         ConfirmOverlay.show_over(
@@ -357,19 +399,19 @@ class CacheManagerOverlay(OverlayBase):
         # The orphan row lands asynchronously; if the sweep hasn't reported yet
         # finish it here so "Clear All" can't silently skip leftover temp dirs.
         if not self._orphan_scan_done:
-            from Utils.cache_tools import orphaned_tmp_scan
+            from Utils.downloads.cache import orphaned_tmp_scan
             dirs, nbytes = orphaned_tmp_scan()
             self._on_orphans(len(dirs), nbytes)
         keys = list(self._checks.keys())
         if not keys:
             self._set_status(self.tr("Cache is empty."), "dim")
             return
-        from Utils.cache_tools import format_size
+        from Utils.downloads.cache import format_size
         total = self._selection_size(keys)
         body = self.tr("Clear {0} of cached downloads across every "
                 "game?\n\nLocation: {1}\n\n"
                 "The md5 cache is preserved. Archives will be re-downloaded as "
-                "needed.").format(format_size(total), get_download_cache_dir())
+                "needed. Wabbajack gallery data, modlist packages and saved requirement checks are also cleared. The jobs/backups entry removes abandoned jobs and update backups.").format(format_size(total), get_download_cache_dir())
         ConfirmOverlay.show_over(
             self._host, self.tr("Clear All Download Caches"), body,
             lambda ok: self._run_clear(keys) if ok else None,
@@ -380,18 +422,23 @@ class CacheManagerOverlay(OverlayBase):
         self._clear_sel_btn.setEnabled(False)
         self._clear_all_btn.setEnabled(False)
         self._set_status(self.tr("Clearing…"), "dim")
-        games = [k for k in keys if k != _ORPHANS]
+        games = [k for k in keys if k not in {_ORPHANS, _WABBAJACK}]
         do_orphans = _ORPHANS in keys
 
         def worker():
             cleared = 0
             errors: list = []
             try:
-                from Utils.cache_tools import (
+                from Utils.downloads.cache import (
                     clear_game_caches, clear_orphaned_tmp_dirs)
                 c, e = clear_game_caches(games)
                 cleared += c
                 errors += e
+                if _WABBAJACK in keys:
+                    from Utils.wabbajack.maintenance import clear_caches
+                    c3, e3 = clear_caches()
+                    cleared += c3
+                    errors += e3
                 if do_orphans:
                     c2, e2 = clear_orphaned_tmp_dirs()
                     cleared += c2

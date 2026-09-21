@@ -35,7 +35,7 @@ class Fallout_4(Fallout_3):
 
     @property
     def wizard_tools(self) -> list[WizardTool]:
-        from Utils.wizard_gates import find_mod_exe
+        from Utils.wizards.gates import find_mod_exe
         bodyslide_tools = []
         if find_mod_exe(self, ("BodySlide.exe", "BodySlide x64.exe")) is not None:
             bodyslide_tools.append(WizardTool(
@@ -70,8 +70,8 @@ class Fallout_4(Fallout_3):
                 id="downgrade_fo4",
                 label="Downgrade Fallout 4",
                 description=(
-                    "Download the latest Fallout 4 Steam Downgrader and run "
-                    "it from the game folder."),
+                    "Download the latest Fallout 4 Steam Downgrader (game or "
+                    "Creation Kit) and run it from the game folder."),
                 dialog_class_path=(
                     "wizards.fallout_4_downgrader.Fallout4DowngraderWizard"),
                 category="Setup and Installers",
@@ -98,6 +98,16 @@ class Fallout_4(Fallout_3):
                 description="Download and run Wrye Bash.",
                 dialog_class_path="wizards.wrye_bash.WryeBashWizard",
             ),
+            WizardTool(
+                id="run_cao_fo4",
+                label="Assets Optimizer (CAO)",
+                description=(
+                    "Install Cathedral Assets Optimizer and optimize a selected "
+                    "mod from the staging folder."),
+                dialog_class_path="wizards.cao.CAOWizard",
+                category="Patchers and Cleanup",
+            ),
+            self._xlodgen_wizard_tool("fo4"),
             *self._xedit_wizard_tools(
                 build="FO4Edit", id_suffix="fo4",
                 nexus_url="https://www.nexusmods.com/fallout4/mods/2737?tab=files",
@@ -135,12 +145,12 @@ class Fallout_4(Fallout_3):
 
     @property
     def custom_routing_rules(self) -> list:
-        from Utils.deploy import CustomRule
+        from Utils.deployment import CustomRule
         return [
-            CustomRule(dest="", filenames=["f4se_loader.exe"], flatten=True, loose_only=True),
-            CustomRule(dest="", filenames=["f4se*.dll"], flatten=True, loose_only=True),
-            CustomRule(dest="", folders=["Data"], flatten=True, loose_only=True),
-            CustomRule(dest="", filenames=["CustomControlMap.txt"], flatten=True, loose_only=True),
+            CustomRule(rule_id='fallout_4:21658df1edd5', dest="", filenames=["f4se_loader.exe"], flatten=True, loose_only=True),
+            CustomRule(rule_id='fallout_4:952082ae0722', dest="", filenames=["f4se*.dll"], flatten=True, loose_only=True),
+            CustomRule(rule_id='fallout_4:42b2892ccb1f', dest="", folders=["Data"], flatten=True, loose_only=True),
+            CustomRule(rule_id='fallout_4:1787289cbcae', dest="", filenames=["CustomControlMap.txt"], flatten=True, loose_only=True),
             self._saves_routing_rule([".fos"]),
                 ]
 

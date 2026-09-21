@@ -14,7 +14,7 @@ from pathlib import Path
 
 from Games.base_game import BaseGame
 from Utils.vfs import ProfileVFSGameMixin
-from Utils.deploy import (
+from Utils.deployment import (
     LinkMode,
     deploy_core,
     deploy_filemap,
@@ -25,7 +25,7 @@ from Utils.deploy import (
     move_to_core,
     restore_data_core,
 )
-from Utils.modlist import read_modlist
+from Utils.mods.modlist import read_modlist
 from Utils.config_paths import get_profiles_dir
 
 _PROFILES_DIR = get_profiles_dir()
@@ -141,7 +141,8 @@ class MountAndBlade2Bannerlord(ProfileVFSGameMixin, BaseGame):
         staging = self.get_effective_mod_staging_path()
         core = self.mods_dir + "_Core"
 
-        if not filemap.is_file():
+        from Utils.filegraph.deploy import input_ready
+        if not input_ready():
             raise RuntimeError(
                 f"filemap.txt not found: {filemap}\n"
                 "Run 'Build Filemap' before deploying."
@@ -167,8 +168,10 @@ class MountAndBlade2Bannerlord(ProfileVFSGameMixin, BaseGame):
         _sep_deploy = load_separator_deploy_paths(profile_dir)
         _sep_entries = read_modlist(profile_dir / "modlist.txt") if _sep_deploy else []
         per_mod_deploy = expand_separator_deploy_paths(_sep_deploy, _sep_entries) or None
+        custom_exclude = self._deploy_custom_routing_rules(mode, log_fn)
         linked_mod, placed = deploy_filemap(
             filemap, modules_dir, staging,
+            exclude=custom_exclude,
             mode=mode,
             strip_prefixes=self.mod_folder_strip_prefixes,
             per_mod_strip_prefixes=per_mod_strip,
@@ -178,6 +181,8 @@ class MountAndBlade2Bannerlord(ProfileVFSGameMixin, BaseGame):
             core_dir=modules_dir.parent / (modules_dir.name + "_Core"),
         )
         _log(f"  Transferred {linked_mod} mod file(s).")
+        placed.update(self._custom_routing_destinations_under(
+            custom_exclude, modules_dir))
 
         _log(f"Step 3: Filling gaps with vanilla files from {core}/ ...")
         linked_core = deploy_core(modules_dir, placed, mode=mode, log_fn=_log)
@@ -194,6 +199,7 @@ class MountAndBlade2Bannerlord(ProfileVFSGameMixin, BaseGame):
 
     def restore(self, log_fn=None, progress_fn=None) -> None:
         """Restore Modules/ to vanilla: clear deployed mods and move Modules_Core/ back."""
+        self._restore_custom_routing_rules(log_fn)
         _log = log_fn or (lambda _: None)
 
         if self._game_path is None:
@@ -205,7 +211,7 @@ class MountAndBlade2Bannerlord(ProfileVFSGameMixin, BaseGame):
 
         _profile_dir = self._active_profile_dir
         _entries = read_modlist(_profile_dir / "modlist.txt") if _profile_dir else []
-        cleanup_custom_deploy_dirs(_profile_dir, _entries, log_fn=_log)
+        cleanup_custom_deploy_dirs(_profile_dir, _entries, log_fn=_log, game=self)
 
         from Utils.vfs import cleanup_deployment, has_deployment_state
         if has_deployment_state(self):
@@ -218,7 +224,8 @@ class MountAndBlade2Bannerlord(ProfileVFSGameMixin, BaseGame):
         _log(f"Restore: clearing {modules_dir.name}/ and moving {core}/ back if present ...")
         restored = restore_data_core(
             modules_dir, core_dir=core_dir,
-            overwrite_dir=self.get_effective_overwrite_path(), log_fn=_log
+            overwrite_dir=self.get_effective_overwrite_path(), log_fn=_log,
+            game=self, profile_dir=self._active_profile_dir,
         )
         if restored > 0:
             _log(f"  Restored {restored} file(s). {core}/ removed.")

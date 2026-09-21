@@ -14,6 +14,8 @@ from PySide6.QtWidgets import QToolButton, QMenu, QListWidget
 from PySide6.QtGui import QActionGroup
 from PySide6.QtCore import Qt, QSize, QEvent, QObject, QTimer, Signal
 
+_QWIDGETSIZE_MAX = (1 << 24) - 1
+
 
 class SplitPressHighlighter(QObject):
     """Event filter for split (MenuButtonPopup) buttons whose QSS lights the
@@ -65,6 +67,13 @@ class _StayOpenMenu(QMenu):
         super().mouseReleaseEvent(event)
 
 
+class _SelectorMenu(QMenu):
+    def sizeHint(self):                         # noqa: N802
+        hint = super().sizeHint()
+        hint.setHeight(min(hint.height(), self.maximumHeight()))
+        return hint
+
+
 def _item_list_qss() -> str:
     """Menu-like look for the scrollable item list: transparent rows with the
     QMenu hover highlight, and a faint tint on the current selection."""
@@ -97,10 +106,12 @@ class _ItemList(QListWidget):
         self._on_pick = on_pick
         self._labels: list[str | None] = []      # None = separator row
         self.current_row = -1
+        self._pressed_row = -1
         self.setFrameShape(QListWidget.Shape.NoFrame)
         self.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.setVerticalScrollMode(QListWidget.ScrollMode.ScrollPerPixel)
         self.setMouseTracking(True)
         # Focus stays with the menu (its keyboard navigation still reaches the
         # pinned actions); the list is mouse/wheel driven.
@@ -137,11 +148,21 @@ class _ItemList(QListWidget):
         hints = [self.sizeHintForRow(i) for i in range(min(self.count(), 8))]
         return max([h for h in hints if h > 0] or [24])
 
+    def mousePressEvent(self, event):
+        self._pressed_row = -1
+        if event.button() == Qt.LeftButton:
+            item = self.itemAt(event.position().toPoint())
+            row = self.row(item) if item is not None else -1
+            if 0 <= row < len(self._labels) and self._labels[row] is not None:
+                self._pressed_row = row
+        super().mousePressEvent(event)
+
     def mouseReleaseEvent(self, event):
         item = self.itemAt(event.position().toPoint())
         row = self.row(item) if item is not None else -1
         label = self._labels[row] if 0 <= row < len(self._labels) else None
-        if label is None:
+        pressed_row, self._pressed_row = self._pressed_row, -1
+        if label is None or row != pressed_row:
             super().mouseReleaseEvent(event)
             return
         self._menu.close()
@@ -158,6 +179,7 @@ class SelectorButton(QToolButton):
                  on_select: "Callable[[str], None] | None" = None,
                  prefix="", suffix="", min_width=170, icon=None, icon_px=18,
                  item_icons=None, icon_provider=None, scroll_after=None,
+                 face_icon=None, face_icon_px=None, display_fn=None,
                  parent=None):
         """*items*   - list of selectable labels.
         *current*   - initially selected label (defaults to items[0]).
@@ -181,6 +203,19 @@ class SelectorButton(QToolButton):
         *scroll_after* - past this many items the list becomes one scrollable
                       block that tall, keeping the pinned actions in view
                       instead of pushing them down the screen. None = never.
+        *face_icon* - fallback QIcon for icon-only mode when the current item
+                      has no *item_icons* entry (the profile selector's icons
+                      are group badges, so an ungrouped profile has none).
+                      Unlike *icon* it doesn't force icon-only mode.
+        *face_icon_px* - draw size for that face; defaults to *icon_px*. Keeps
+                      small menu-row icons while the collapsed face is drawn
+                      at the toolbar's icon size.
+        *display_fn* - called with a label to get the text to DRAW for it; the
+                      labels themselves stay canonical, so *on_select* and
+                      :meth:`current` still hand back the real value. Used by
+                      the profile selector to show the default profile's
+                      translated name while "default" (its folder name) is what
+                      travels back into paths. Identity when None.
         """
         super().__init__(parent)
         self._items: list[str] = list(items or [])
@@ -189,11 +224,15 @@ class SelectorButton(QToolButton):
         self._prefix = prefix
         self._suffix = suffix or ""
         self._icon = icon
+        self._face_icon = face_icon
         self._item_icons: dict = dict(item_icons or {})
         self._icon_provider = icon_provider
+        self._display_fn = display_fn
         self._item_icon_px = icon_px
+        self._face_icon_px = face_icon_px or icon_px
         self._scroll_after = scroll_after
         self._item_list: _ItemList | None = None
+        self._item_list_other_height: int | None = None
         # Narrow-bar compaction (see set_label_width / set_icon_only) and the
         # width measurements it runs on.
         self._min_width = min_width
@@ -228,7 +267,7 @@ class SelectorButton(QToolButton):
         else:
             self.setToolButtonStyle(Qt.ToolButtonTextOnly)
             self.setMinimumWidth(min_width)
-        self._menu = QMenu(self)
+        self._menu = _SelectorMenu(self)
         self.setMenu(self._menu)
         # The text section (left of the split) also opens the menu - a selector
         # has no separate primary action. Open on *press* (like the arrow
@@ -258,6 +297,14 @@ class SelectorButton(QToolButton):
         self.style().unpolish(self)
         self.style().polish(self)
 
+    def showMenu(self):                         # noqa: N802
+        self._prep_item_list()
+        super().showMenu()
+
+    def mousePressEvent(self, event):           # noqa: N802
+        self._prep_item_list()
+        super().mousePressEvent(event)
+
     # -- public API ---------------------------------------------------------
     def set_items(self, items, current=None, item_icons=None,
                   separator_before=None):
@@ -285,6 +332,7 @@ class SelectorButton(QToolButton):
         rebuild the menu. Each entry is (label, cb) or (label, cb, opts) where
         cb is a callable, a list of nested entries (→ a submenu), or None (a
         disabled/header row). *opts* is an optional dict with any of:
+          enabled   - whether the action can be selected
           checkable - draw a check indicator; checked reflects `checked`
           checked   - initial checked state
           group     - a hashable id; entries sharing it become mutually
@@ -328,7 +376,7 @@ class SelectorButton(QToolButton):
     def full_text(self) -> str:
         """The unelided button label (prefix + current item + suffix)."""
         return self.tr("{0}{1}{2}").format(
-            self._prefix, self._current or "-", self._suffix)
+            self._prefix, self._display(self._current) or "-", self._suffix)
 
     def natural_width(self) -> int:
         """Layout width with the full label - its minimum width floors it."""
@@ -340,10 +388,14 @@ class SelectorButton(QToolButton):
         """Layout width in the present state (full / elided / icon-only)."""
         return max(self.minimumWidth(), self.sizeHint().width())
 
+    def _face_for_current(self):
+        """Icon for icon-only mode: the item's own, else the face_icon."""
+        return self._item_icons.get(self._current) or self._face_icon
+
     def icon_width(self) -> int:
         """Layout width in icon-only mode; 0 when the current item has no icon
         to fall back on (collapsing it would leave a blank button)."""
-        if self._icon is not None or self._item_icons.get(self._current) is None:
+        if self._icon is not None or self._face_for_current() is None:
             return 0
         if self._icon_w is None:
             self._text_chrome()     # cache the text metrics while we still can
@@ -373,7 +425,7 @@ class SelectorButton(QToolButton):
     def set_icon_only(self, on: bool) -> None:
         """Show the current item's icon INSTEAD of its label. Ignored when that
         item has no icon."""
-        on = bool(on) and self._item_icons.get(self._current) is not None
+        on = bool(on) and self._face_for_current() is not None
         if on == self._icon_only:
             return
         if on:
@@ -402,31 +454,44 @@ class SelectorButton(QToolButton):
         if self._icon is not None:
             return              # fixed-icon selector - its face never changes
         full = self.full_text()
-        face = self._item_icons.get(self._current)
+        face = self._face_for_current()
         if self._icon_only and face is not None:
-            self.setIcon(face)
-            self.setIconSize(QSize(self._item_icon_px, self._item_icon_px))
-            self.setToolButtonStyle(Qt.ToolButtonIconOnly)
+            icon_size = QSize(self._face_icon_px, self._face_icon_px)
+            if self.icon().cacheKey() != face.cacheKey():
+                self.setIcon(face)
+            if self.iconSize() != icon_size:
+                self.setIconSize(icon_size)
+            if self.toolButtonStyle() != Qt.ToolButtonIconOnly:
+                self.setToolButtonStyle(Qt.ToolButtonIconOnly)
             # Same QSS hook the action buttons use for their icon-only mode:
             # drops the label padding, keeps the arrow section.
-            self.setProperty("compact", True)
-            self.setToolTip(full)
-            self._repolish()
+            if self.property("compact") is not True:
+                self.setProperty("compact", True)
+                self._repolish()
+            if self.toolTip() != full:
+                self.setToolTip(full)
             self._pin_minimum()
             return
         # The current item's icon is drawn ourselves in paintEvent (to the left
         # of the still-centred text). Keep the QToolButton in text-only mode so
         # Qt centres the label; its built-in icon slot would left-align the
         # icon+text group instead.
-        self.setToolButtonStyle(Qt.ToolButtonTextOnly)
-        self.setProperty("compact", False)
+        if self.toolButtonStyle() != Qt.ToolButtonTextOnly:
+            self.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        compact_changed = self.property("compact") is not False
+        if compact_changed:
+            self.setProperty("compact", False)
         cap = self._label_cap
         if cap is None:
             # No trailing glyph - the split-button's arrow section shows it now.
-            self.setText(full)
-            self.setMinimumWidth(self._min_width)
-            self.setToolTip("")
-            self._repolish()
+            if self.text() != full:
+                self.setText(full)
+            if self.minimumWidth() != self._min_width:
+                self.setMinimumWidth(self._min_width)
+            if self.toolTip():
+                self.setToolTip("")
+            if compact_changed:
+                self._repolish()
             return
         # Drop the suffix and the prefix before eliding the name itself:
         # "Gate_To_Sovn…" says more in the same pixels than "Profile: Gate_To…".
@@ -435,12 +500,16 @@ class SelectorButton(QToolButton):
         if fm.horizontalAdvance(full) <= room:
             text = full
         else:
-            name = self._current or "-"
+            name = self._display(self._current) or "-"
             text = (name if fm.horizontalAdvance(name) <= room
                     else fm.elidedText(name, Qt.ElideRight, room))
-        self.setText(text)
-        self.setToolTip("" if text == full else full)
-        self._repolish()
+        if self.text() != text:
+            self.setText(text)
+        tooltip = "" if text == full else full
+        if self.toolTip() != tooltip:
+            self.setToolTip(tooltip)
+        if compact_changed:
+            self._repolish()
         self._pin_minimum()
 
     def _pin_minimum(self) -> None:
@@ -448,8 +517,9 @@ class SelectorButton(QToolButton):
         full min_width the layout couldn't shrink it at all; left at 0 it
         becomes the one elastic item in the bar and gets squeezed to nothing
         once everything else is collapsed too."""
-        self.setMinimumWidth(0)         # drop the old floor before re-reading
-        self.setMinimumWidth(self.sizeHint().width())
+        target = self.sizeHint().width()
+        if self.minimumWidth() != target:
+            self.setMinimumWidth(target)
 
     def _repolish(self) -> None:
         self.style().unpolish(self); self.style().polish(self)
@@ -489,8 +559,10 @@ class SelectorButton(QToolButton):
         self._menu.setStyleSheet(
             f"QMenu {{ icon-size: {self._item_icon_px}px; }}"
             if self._item_icons else "")
+        self._menu.setMaximumHeight(_QWIDGETSIZE_MAX)
         self._menu.clear()
         self._item_list = None      # cleared with the menu
+        self._item_list_other_height = None
         # Exclusive action group → the selectable items render as radio buttons.
         self._group = QActionGroup(self._menu)
         self._group.setExclusive(True)
@@ -517,13 +589,25 @@ class SelectorButton(QToolButton):
         if self._items and self._actions:
             self._menu.addSeparator()
         self._add_actions(self._menu, self._actions)
+        self._prep_item_list()
         self.face_changed.emit()
+
+    def _display(self, label: str) -> str:
+        """The text to DRAW for *label* (see *display_fn*). Never used as a
+        key - lookups and callbacks keep the canonical label."""
+        if self._display_fn is None:
+            return label
+        try:
+            return self._display_fn(label)
+        except Exception:
+            return label
 
     def _item_text(self, label: str) -> str:
         """Row text for *label* - the highlighted (deployed) item says so."""
+        shown = self._display(label)
         if self._highlighted is not None and label == self._highlighted:
-            return self.tr("{0}   ✓ deployed").format(label)
-        return label
+            return self.tr("{0}   ✓ deployed").format(shown)
+        return shown
 
     def _add_item_list(self):
         """Add the selectable items as one scrollable list capped at
@@ -550,12 +634,31 @@ class SelectorButton(QToolButton):
         self._item_list = lst
 
     def _prep_item_list(self):
-        """On each open: re-read the theme colours (a switch since the last
-        rebuild would leave stale ones) and scroll to the current item."""
+        """Fit the item list beside its button, refresh it, and scroll current."""
         lst = self._item_list
         if lst is None:
             return
         lst.setStyleSheet(_item_list_qss())
+        screen = self.screen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            top = self.mapToGlobal(self.rect().topLeft()).y()
+            bottom = self.mapToGlobal(self.rect().bottomLeft()).y() + 1
+            room = max(1, min(available.height(), max(
+                top - available.top(), available.bottom() + 1 - bottom)))
+            row_height = lst.row_height()
+            if self._item_list_other_height is None:
+                self._item_list_other_height = max(
+                    0, self._menu.sizeHint().height() - lst.height())
+            other_height = self._item_list_other_height
+            rows = max(1, min(
+                self._scroll_after,
+                (room - other_height - 12) // row_height,
+            ))
+            list_height = row_height * rows + 4
+            lst.setFixedHeight(list_height)
+            self._menu.setMaximumHeight(min(
+                room, other_height + list_height))
         if 0 <= lst.current_row < lst.count():
             lst.scrollToItem(lst.item(lst.current_row),
                              QListWidget.ScrollHint.PositionAtCenter)
@@ -564,8 +667,8 @@ class SelectorButton(QToolButton):
         """Append pinned action entries to *menu*. Each entry is (label, cb) or
         (label, cb, opts) where cb is a callable, a list of nested entries (→ a
         submenu, nested arbitrarily deep), or None (a plain/disabled row).
-        *opts* (optional dict) may set checkable/checked/group/separator_after -
-        see set_actions()."""
+        *opts* (optional dict) may set enabled/checkable/checked/group/
+        separator_after - see set_actions()."""
         groups: dict = {}   # group id → QActionGroup (per this menu level)
         for entry in actions:
             label, cb = entry[0], entry[1]
@@ -581,6 +684,7 @@ class SelectorButton(QToolButton):
                 self._add_actions(sub, cb)
             elif cb is not None:
                 a = menu.addAction(label)
+                a.setEnabled(bool(opts.get("enabled", True)))
                 stateful = bool(opts.get("checkable") or opts.get("group"))
                 if opts.get("checkable"):
                     a.setCheckable(True)

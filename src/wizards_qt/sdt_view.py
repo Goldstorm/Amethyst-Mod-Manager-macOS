@@ -4,7 +4,7 @@ A modlist-panel-scoped tab: a scrollable grid form of every SSEDisplayTweaks.ini
 setting with a per-key enable checkbox, a typed value control (bool → two
 radios, enum → combo, else line edit) and a dim description.  Save renders the
 values into the managed 'SSE Display Tweaks ini' mod (schema/parse/render in
-Utils/sdt_config.py); Reset restores the built-in defaults.
+Utils/bethesda/display_tweaks.py); Reset restores the built-in defaults.
 """
 
 from __future__ import annotations
@@ -17,9 +17,9 @@ from PySide6.QtWidgets import (
     QLineEdit, QPushButton, QRadioButton, QScrollArea, QVBoxLayout, QWidget,
 )
 
-from gui_qt.theme_qt import active_palette, _c
+from gui_qt.theme_qt import active_palette, close_button, _c
 from wizards_qt._view_base import GREEN, RED, WizardViewBase
-import Utils.sdt_config as cfg
+import Utils.bethesda.display_tweaks as cfg
 
 if TYPE_CHECKING:
     from Games.base_game import BaseGame
@@ -93,8 +93,7 @@ class SDTView(WizardViewBase):
         bar = QWidget()
         bh = QHBoxLayout(bar); bh.setContentsMargins(0, 4, 0, 0); bh.setSpacing(8)
         bh.addStretch(1)
-        close = QPushButton(self.tr("Close"))
-        close.setCursor(Qt.PointingHandCursor)
+        close = close_button(self.tr("Close"))
         close.clicked.connect(self._finish)
         bh.addWidget(close)
         reset = QPushButton(self.tr("Reset to defaults"))

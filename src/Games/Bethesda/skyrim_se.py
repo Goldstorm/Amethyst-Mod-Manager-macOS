@@ -10,17 +10,26 @@ Mod structure:
 from pathlib import Path
 
 from Games.Bethesda.fallout_3 import Fallout_3
+from Games.Bethesda.skyrim_common import SKYRIM_MOD_REQUIRED_TOP_LEVEL_FOLDERS
 from Games.base_game import WizardTool, MODERN_DIRECTX_DEPS
 
 
 class SkyrimSE(Fallout_3):
 
     # Skyrim's BSResource loose-file traversal still encounters legacy Windows
-    # path limits.  Deep OAR animation paths that are safe below the normal
-    # Steam install can cross MAX_PATH when the process sees the longer profile
-    # `.amethyst-vfs/view` path.  Bind the view at the configured game path so
-    # Skyrim retains its short, stable working directory.
+    # path limits. Deep OAR animation paths that are safe below the normal
+    # Steam install can cross MAX_PATH below a Wabbajack stock-game root or
+    # `.amethyst-vfs/view`. Bind the view at a short process-visible path.
     vfs_bind_launch_at_game_root = True
+
+    def get_vfs_launch_bind_root(self) -> Path | None:
+        game_root = self.get_vfs_game_root()
+        global_root = self.get_global_game_path()
+        if (game_root is not None and global_root is not None
+                and global_root.is_dir()
+                and len(str(global_root)) < len(str(game_root))):
+            return global_root
+        return game_root
 
     # SSE auto-loads plugin-matched BSAs - it is NOT a FO3/FNV-style engine that
     # only reads archives listed in the INI. Override the Fallout_3 default.
@@ -79,42 +88,7 @@ class SkyrimSE(Fallout_3):
 
     @property
     def mod_required_top_level_folders(self) -> set[str]:
-        # Skyrim SE subset - excludes Fallout-specific folders (f4se, nvse,
-        # fose, config) that Fallout_3 includes.
-        return {
-            "skse",
-            "textures",
-            "sound",
-            "meshes",
-            "mcm",
-            "scripts",
-            "interface",
-            "lightplacer",
-            "mapmarkers",
-            "music",
-            "nemesis_engine",
-            "seq",
-            "shadercache",
-            "shaders",
-            "grass",
-            "video",
-            "source",
-            "calientetools",
-            "data",
-            "PBRNifPatcher",
-            "PBRTextureSets",
-            "distantlod",
-            "fonts",
-            "facegen",
-            "menus",
-            "lodsettings",
-            "lsdata",
-            "strings",
-            "trees",
-            "asi",
-            "tools",
-            "enbseries",
-        }
+        return set(SKYRIM_MOD_REQUIRED_TOP_LEVEL_FOLDERS)
 
     @property
     def mod_folder_strip_prefixes_post(self) -> set[str]:
@@ -193,21 +167,21 @@ class SkyrimSE(Fallout_3):
 
     @property
     def custom_routing_rules(self) -> list:
-        from Utils.deploy import CustomRule
+        from Utils.deployment import CustomRule
         return [
-            CustomRule(dest="", filenames=["d3dx9_42.dll"], flatten=True),
-            CustomRule(dest="", filenames=["skse64_1*.dll"], flatten=True, loose_only=True),
-            CustomRule(dest="", filenames=["skse64_loader.exe"], flatten=True, loose_only=True),
-            CustomRule(dest="", filenames=["d3dcompiler_47.dll"], flatten=True, loose_only=True),
-            CustomRule(dest="Data/SKSE/Plugins/CharGen/Presets", extensions=[".jslot"], flatten=True),
+            CustomRule(rule_id='skyrim_se:37111f7bfb46', dest="", filenames=["d3dx9_42.dll"], flatten=True),
+            CustomRule(rule_id='skyrim_se:a84e7a154053', dest="", filenames=["skse64_1*.dll"], flatten=True, loose_only=True),
+            CustomRule(rule_id='skyrim_se:e772bb9074f3', dest="", filenames=["skse64_loader.exe"], flatten=True, loose_only=True),
+            CustomRule(rule_id='skyrim_se:44bc033720c3', dest="", filenames=["d3dcompiler_47.dll"], flatten=True, loose_only=True),
+            CustomRule(rule_id='skyrim_se:e39e7c9da11d', dest="Data/SKSE/Plugins/CharGen/Presets", extensions=[".jslot"], flatten=True),
             # ENB Series files → game root
-            CustomRule(dest="", filenames=[
+            CustomRule(rule_id='skyrim_se:92efaebf878e', dest="", filenames=[
                 "d3d11.dll",
                 "d3dcompiler_46e.dll",
                 "enblocal.ini",
                 "enbseries.ini",
             ], flatten=True),
-            CustomRule(dest="", folders=["enbseries"], flatten=True),
+            CustomRule(rule_id='skyrim_se:112bbe22ee8d', dest="", folders=["enbseries"], flatten=True),
             self._saves_routing_rule([".ess"]),
         ]
 
@@ -247,8 +221,7 @@ class SkyrimSE(Fallout_3):
 
     @property
     def wizard_tools(self) -> list[WizardTool]:
-        from Utils.pandora_tools import find_pandora_exe
-        from Utils.wizard_gates import (
+        from Utils.wizards.gates import (
             engine_fixes_installed as ef_installed,
             find_mod_exe,
             sse_display_tweaks_installed as sdt_installed,
@@ -272,13 +245,12 @@ class SkyrimSE(Fallout_3):
                 category="INI Tweaks",
                 extra={"_full_width_overlay": True},
             ))
-        if find_pandora_exe(self) is not None:
-            pandora_tools.append(WizardTool(
-                id="run_pandora_skyrimse",
-                label="Run Pandora",
-                description="Deploy mods and run Pandora Behaviour Engine+.",
-                dialog_class_path="wizards.pandora.PandoraWizard",
-            ))
+        pandora_tools.append(WizardTool(
+            id="run_pandora_skyrimse",
+            label="Run Pandora",
+            description="Install or run Pandora Behaviour Engine+.",
+            dialog_class_path="wizards.pandora.PandoraWizard",
+        ))
         if find_mod_exe(self, ("BodySlide.exe", "BodySlide x64.exe")) is not None:
             pandora_tools.append(WizardTool(
                 id="run_bodyslide_skyrimse",
@@ -308,6 +280,17 @@ class SkyrimSE(Fallout_3):
             dialog_class_path="wizards.bodyslide_linux.OutfitStudioLinuxWizard",
         ))
         return self._base_wizard_tools() + pandora_tools + [
+            WizardTool(
+                id="downgrade_skyrimse",
+                label="Downgrade Skyrim Special Edition",
+                description=(
+                    "Download the latest Skyrim Special Edition Steam "
+                    "Downgrader (game or Creation Kit) and run it from the "
+                    "game folder."),
+                dialog_class_path=(
+                    "wizards.skyrim_se_downgrader.SkyrimSEDowngraderWizard"),
+                category="Setup and Installers",
+            ),
             WizardTool(
                 id="install_se_skyrimse",
                 label="Install Script Extender (SKSE64)",
@@ -350,6 +333,15 @@ class SkyrimSE(Fallout_3):
                 label="Run PGPatcher",
                 description="Install PGPatcher, deploy mods, and run PGPatcher.exe.",
                 dialog_class_path="wizards.pgpatcher.PGPatcherWizard",
+            ),
+            WizardTool(
+                id="run_cao_skyrimse",
+                label="Assets Optimizer (CAO)",
+                description=(
+                    "Install Cathedral Assets Optimizer and optimize a selected "
+                    "mod from the staging folder."),
+                dialog_class_path="wizards.cao.CAOWizard",
+                category="Patchers and Cleanup",
             ),
             WizardTool(
                 id="run_sseedit_skyrimse",
@@ -407,11 +399,15 @@ class SkyrimSE(Fallout_3):
                 description="Install DynDOLOD tools, deploy mods, and run DynDOLODx64.exe.",
                 dialog_class_path="wizards.dyndolod.DynDOLODWizard",
             ),
+            self._xlodgen_wizard_tool("skyrimse"),
             WizardTool(
-                id="run_xlodgen_skyrimse",
-                label="Run xLODGen",
-                description="Install xLODGen, deploy mods, and run xLODGenx64.exe.",
-                dialog_class_path="wizards.dyndolod.xLODGenWizard",
+                id="run_acmos_skyrimse",
+                label="Run ACMOS Road Generator",
+                description=(
+                    "Install ACMOS Road Generator, choose a terrain LOD mod, "
+                    "and write generated road textures to ACMOS_Output."),
+                dialog_class_path="wizards.acmos.ACMOSWizard",
+                category="DynDOLOD",
             ),
             WizardTool(
                 id="run_bethini_skyrimse",

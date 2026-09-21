@@ -1,5 +1,5 @@
 """Delegate for the Downloads list - modlist-style blue checkbox, bold section
-headers, right-aligned size, and an Install/Reinstall button per archive row
+headers, right-aligned size, and an install-state button per archive row
 (painted + hit-tested here). Visual language matches the other Qt tabs.
 """
 
@@ -11,8 +11,10 @@ from PySide6.QtWidgets import QStyledItemDelegate
 
 from gui_qt.theme_qt import bind_theme, qc, qc_contrast
 from gui_qt.downloads_model import (
-    COL_CHECK, COL_NAME, COL_SIZE, COL_INSTALL, EntryRole, InstalledRole,
+    COL_CHECK, COL_NAME, COL_SIZE, COL_DOWNLOADED, COL_INSTALL,
+    EntryRole, InstallStateRole, HiddenRole,
 )
+from Utils.downloads.core import ARCHIVE_INSTALLED, ARCHIVE_UNINSTALLED
 
 CHECK_BOX = 18
 FONT_PX = 14          # bigger row text
@@ -31,7 +33,7 @@ class DownloadsDelegate(QStyledItemDelegate):
         bind_theme(self, roles={
             "TEXT_MAIN", "TEXT_DIM", "BORDER_FAINT", "CHECK_FILL",
             "BG_DEEP", "BG_SELECT", "BG_HEADER", "BTN_SUCCESS",
-            "BTN_WARN", "ACCENT",
+            "BTN_WARN", "BTN_INFO", "ACCENT",
         })
 
     def refresh_theme(self, p: dict) -> None:
@@ -45,12 +47,14 @@ class DownloadsDelegate(QStyledItemDelegate):
         self.c_header_bg = qc(p, "BG_HEADER")
         self.c_install = qc(p, "BTN_SUCCESS")
         self.c_reinstall = qc(p, "BTN_WARN")   # orange (already installed)
+        self.c_uninstalled = qc(p, "BTN_INFO")
         self.c_blue = qc(p, "ACCENT")          # Select-all button
         # Button label colours are auto-contrasted off each button's own fill so
         # they stay readable on any theme (e.g. a bright-yellow BTN_WARN needs
         # dark text, not white). Text visibility beats palette choice.
         self.c_install_text = qc_contrast(p, "BTN_SUCCESS")
         self.c_reinstall_text = qc_contrast(p, "BTN_WARN")
+        self.c_uninstalled_text = qc_contrast(p, "BTN_INFO")
         self.c_selall_text = qc_contrast(p, "ACCENT")
         self._view.viewport().update()
 
@@ -88,19 +92,28 @@ class DownloadsDelegate(QStyledItemDelegate):
         if col == COL_CHECK:
             self._paint_check(p, r, index.model().data(index, Qt.CheckStateRole))
         elif col == COL_NAME:
-            p.setPen(self.c_text)
+            hidden = index.model().data(index, HiddenRole)
+            p.setPen(self.c_dim if hidden else self.c_text)
             f = QFont(); f.setPixelSize(FONT_PX); p.setFont(f)
             rect = r.adjusted(6, 0, -4, 0)
+            name = e.path.name if e.path else ""
+            if hidden:
+                name = self.tr("{0} (hidden)").format(name)
             txt = p.fontMetrics().elidedText(
-                e.path.name if e.path else "", Qt.ElideRight, rect.width())
+                name, Qt.ElideRight, rect.width())
             p.drawText(rect, Qt.AlignVCenter | Qt.AlignLeft, txt)
         elif col == COL_SIZE:
             p.setPen(self.c_dim)
             f = QFont(); f.setPixelSize(FONT_PX); p.setFont(f)
             p.drawText(r.adjusted(0, 0, -8, 0),
                        Qt.AlignVCenter | Qt.AlignRight, e.size_str)
+        elif col == COL_DOWNLOADED:
+            p.setPen(self.c_dim)
+            f = QFont(); f.setPixelSize(FONT_PX); p.setFont(f)
+            p.drawText(r.adjusted(4, 0, -4, 0), Qt.AlignCenter,
+                       index.model().data(index, Qt.DisplayRole) or "")
         elif col == COL_INSTALL:
-            self._paint_button(p, r, index.model().data(index, InstalledRole))
+            self._paint_button(p, r, index.model().data(index, InstallStateRole))
 
     def _paint_check(self, p, r, state):
         box = QRect(r.center().x() - CHECK_BOX // 2,
@@ -122,16 +135,24 @@ class DownloadsDelegate(QStyledItemDelegate):
         y = r.top() + (r.height() - BTN_H) // 2
         return QRect(r.right() - BTN_W - 6, y, BTN_W, BTN_H)
 
-    def _paint_button(self, p, r, installed):
+    def _paint_button(self, p, r, state):
+        installed = state == ARCHIVE_INSTALLED
+        uninstalled = state == ARCHIVE_UNINSTALLED
         rect = self._button_rect(r)
         p.setRenderHint(p.RenderHint.Antialiasing, True)
         p.setPen(Qt.NoPen)
-        p.setBrush(self.c_reinstall if installed else self.c_install)
+        fill = (self.c_reinstall if installed else
+                self.c_uninstalled if uninstalled else self.c_install)
+        text_colour = (self.c_reinstall_text if installed else
+                       self.c_uninstalled_text if uninstalled
+                       else self.c_install_text)
+        p.setBrush(fill)
         p.drawRoundedRect(rect, 4, 4)
-        p.setPen(self.c_reinstall_text if installed else self.c_install_text)
+        p.setPen(text_colour)
         f = QFont(); f.setPixelSize(BTN_FONT_PX); f.setBold(True); p.setFont(f)
-        p.drawText(rect, Qt.AlignCenter,
-                   self.tr("Reinstall") if installed else self.tr("Install"))
+        text = (self.tr("Reinstall") if installed else
+                self.tr("Uninstalled") if uninstalled else self.tr("Install"))
+        p.drawText(rect, Qt.AlignCenter, text)
         p.setRenderHint(p.RenderHint.Antialiasing, False)
 
     def sizeHint(self, opt, index):

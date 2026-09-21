@@ -1,10 +1,11 @@
 """Modlist model - QAbstractTableModel over the ModEntry list.
 
 Columns: Mod Name, Category, Flags, Conflicts, Installed, Version, Author,
-Priority, Size (the checkbox is painted into column 0 by the delegate). Fed by
-read_modlist; version / installed / flags / conflicts / authors are optional
-dicts keyed by mod name (blank when absent). Index 0 = highest priority; the Priority column shows a descending
-number (highest-priority row = largest value).
+Priority, Size, Nexus Mod ID, Nexus File ID (the checkbox is painted into
+column 0 by the delegate). Fed by read_modlist; metadata columns are backed by
+optional dicts keyed by mod name (blank when absent). Index 0 = highest
+priority; the Priority column shows a descending number (highest-priority row
+= largest value).
 """
 
 from __future__ import annotations
@@ -17,8 +18,11 @@ from PySide6.QtCore import (
 # Crash-proof diagnostic prints (Flatpak stdout can raise BrokenPipeError and
 # kill worker threads). See Utils.app_log.safe_print.
 from Utils.app_log import safe_print as print  # noqa: A004
-from Utils.modlist import ModEntry, read_modlist
-from Utils.filemap import OVERWRITE_NAME, ROOT_FOLDER_NAME
+from Utils.diagnostics.conflicts import ConflictTimeline, ensure_timeline
+from Utils.mods.modlist import ModEntry, read_modlist
+from Utils.mods.groups import normalize_groups
+from gui_qt.modlist_groups import ModGrouping
+from Utils.filegraph.constants import OVERWRITE_NAME, ROOT_FOLDER_NAME
 from gui_qt.modlist_sort import (
     DIVIDER_NAME, build_display, uninvert_display, make_divider, is_reverse,
 )
@@ -29,8 +33,13 @@ _BOUNDARY_NAMES = (OVERWRITE_NAME, ROOT_FOLDER_NAME)
 # All UI-only pinned rows: boundaries + the reverse-mode float divider.
 _PINNED_NAMES = _BOUNDARY_NAMES + (DIVIDER_NAME,)
 
+# Version stamped into a newly created empty mod's meta.ini, and shown in the
+# Version column for it right away.
+NEW_MOD_VERSION = "1.0"
 
-# Column indices. Order mirrors the Tk app: Category right after Name, Size last.
+
+# Column indices. Existing columns retain their logical positions; new optional
+# metadata columns are appended so saved layouts remain compatible.
 COL_NAME = 0
 COL_CATEGORY = 1
 COL_FLAGS = 2
@@ -40,8 +49,12 @@ COL_VERSION = 5
 COL_AUTHOR = 6
 COL_PRIORITY = 7
 COL_SIZE = 8
+COL_NEXUS_MOD_ID = 9
+COL_NEXUS_FILE_ID = 10
+COL_CONTENT = 11
 COLUMNS = ["Mod Name", "Category", "Flags", "Conflicts", "Installed",
-           "Version", "Author", "Priority", "Size"]
+           "Version", "Author", "Priority", "Size", "Nexus Mod ID",
+           "Nexus File ID", "Content"]
 
 # COLUMNS doubles as canonical persistence keys, so it must stay untranslated;
 # headerData() translates each label at display time via self.tr(COLUMNS[i]).
@@ -58,6 +71,9 @@ _COLUMN_TR_MARKERS = [
     QT_TRANSLATE_NOOP("ModListModel", "Author"),
     QT_TRANSLATE_NOOP("ModListModel", "Priority"),
     QT_TRANSLATE_NOOP("ModListModel", "Size"),
+    QT_TRANSLATE_NOOP("ModListModel", "Nexus Mod ID"),
+    QT_TRANSLATE_NOOP("ModListModel", "Nexus File ID"),
+    QT_TRANSLATE_NOOP("ModListModel", "Content"),
 ]
 
 # Custom roles for the delegate.
@@ -70,11 +86,16 @@ HighlightRole = Qt.UserRole + 6    # int: 0 none, 1 higher(green), -1 lower(red)
                                    #      2 anchor(orange, plugin-selected mod),
                                    #      3 requires(purple), -3 required-by(blue)
 UuidConflictRole = Qt.UserRole + 7  # int: BG3 pak module-UUID conflict code
+ContentRole = Qt.UserRole + 8      # tuple[(badge_id, from_archive), ...]
 
 _MIME = "application/x-amethyst-modrows"
+_ITEM_BASE = Qt.ItemIsEnabled | Qt.ItemIsSelectable
+_ITEM_DRAG = _ITEM_BASE | Qt.ItemIsDragEnabled
+_ITEM_DROP = _ITEM_BASE | Qt.ItemIsDropEnabled
+_ITEM_DRAG_DROP = _ITEM_DRAG | Qt.ItemIsDropEnabled
 
 
-class ModListModel(QAbstractTableModel):
+class ModListModel(ModGrouping, QAbstractTableModel):
     # Mods were enabled/disabled and modlist.txt saved. Payload is
     # list[(mod_name, now_enabled)] - the window syncs plugins.txt to it
     # (Tk parity: _sync_plugins_for_toggle).
@@ -82,6 +103,7 @@ class ModListModel(QAbstractTableModel):
     # modlist.txt write failed - the window surfaces a toast (console print
     # alone loses the user's reorder/toggle silently).
     save_failed = Signal(str)
+    groups_changed = Signal()
 
     def __init__(self, entries: list[ModEntry] | None = None,
                  versions: dict[str, str] | None = None,
@@ -96,6 +118,7 @@ class ModListModel(QAbstractTableModel):
         # always writes from _natural.
         self._natural: list[ModEntry] = entries or []
         self._entries: list[ModEntry] = self._natural
+        self._priority_by_entry: dict[int, int] | None = None
         # Mod names as of the last load from disk. save() needs it to tell a
         # user removal (was in baseline, now gone → drop) from an entry an
         # install worker added after we loaded (in neither → keep).
@@ -125,6 +148,12 @@ class ModListModel(QAbstractTableModel):
         self._sizes: dict[str, str] = {}
         # Raw byte counts backing the Size column sort.
         self._size_bytes: dict[str, int] = {}
+        self._nexus_mod_ids: dict[str, int] = {}
+        self._nexus_file_ids: dict[str, int] = {}
+        # Content badges per mod (Content column) as (badge_id, from_archive)
+        # tuples. Computed lazily - only when the Content column is visible -
+        # so a default-hidden Content column costs no backend query.
+        self._content: dict[str, tuple] = {}
         self._conflicts = conflicts or {}
         self._bsa_conflicts: dict[str, int] = {}
         self._uuid_conflicts: dict[str, int] = {}
@@ -181,6 +210,15 @@ class ModListModel(QAbstractTableModel):
         # counts files on disk. Filled by an async walk (see the app's
         # _refresh_boundary_counts); empty until it lands.
         self._boundary_counts: dict[str, int] = {}
+        self._init_groups()
+        for signal in (self.modelReset, self.rowsInserted, self.rowsRemoved,
+                       self.rowsMoved, self.layoutChanged):
+            signal.connect(self._invalidate_priority_cache)
+
+    def _invalidate_priority_cache(self, *_args) -> None:
+        self._priority_by_entry = None
+        self._group_row_map = None
+        self._group_summary_cache.clear()
 
     # ---- loading ----------------------------------------------------------
     @classmethod
@@ -196,9 +234,15 @@ class ModListModel(QAbstractTableModel):
         bot = ModEntry(ROOT_FOLDER_NAME, True, True, True)
         return [top] + body + [bot]
 
-    def set_entries(self, entries: list[ModEntry]) -> None:
+    def set_entries(self, entries: list[ModEntry], mod_groups=None) -> None:
         self.beginResetModel()
         self._natural = self._with_boundaries(entries)
+        if mod_groups is not None:
+            from copy import deepcopy
+            self._saved_mod_groups = deepcopy(mod_groups)
+        self._mod_groups = normalize_groups(
+            self._mod_groups if mod_groups is None else mod_groups, self._natural)
+        self._index_groups()
         self._entries = self._derive_display()
         self._sep_hl_cache.clear()
         self._baseline_names = {
@@ -255,22 +299,27 @@ class ModListModel(QAbstractTableModel):
             "installed": self._installed,
             "authors": self._authors,
             "size_bytes": self._size_bytes,
+            "nexus_mod_ids": self._nexus_mod_ids,
+            "nexus_file_ids": self._nexus_file_ids,
             "flags": flags,
             "conflicts": self._conflicts,
+            "content": self._content,
         }
 
     def _derive_display(self) -> list[ModEntry]:
-        if not self._sort_key:
+        if not self._sort_key and not self._mod_groups:
             return self._natural
         return build_display(self._natural, self._sort_key,
-                             self._sort_ascending, self._sort_ctx(),
+                             self._sort_ascending, self._sort_ctx() if self._sort_key else {},
                              divider=self._divider,
-                             flatten_groups=self._separators_hidden)
+                             flatten_groups=self._separators_hidden,
+                             mod_groups=self._mod_groups)
 
     def _rebuild_display(self) -> None:
         """Re-derive the display list from the natural order + active sort.
         Uses layoutChanged with a persistent-index remap (by entry identity)
         so selection/scroll follow the rows. No-op if the order is unchanged."""
+        self._priority_by_entry = None
         old = self._entries
         new = self._derive_display()
         if len(new) == len(old) and all(a is b for a, b in zip(new, old)):
@@ -299,10 +348,11 @@ class ModListModel(QAbstractTableModel):
     def set_meta(self, versions: dict[str, str], installed: dict[str, str],
                  categories: dict[str, str],
                  descriptions: "dict[str, str] | None" = None,
-                 authors: "dict[str, str] | None" = None) -> None:
-        """Set the meta.ini-derived per-mod dicts (Version / Installed /
-        Category / Author columns), repaint those columns, and re-sort if the
-        active sort reads them. The reload pushes entries first and applies the
+                 authors: "dict[str, str] | None" = None,
+                 nexus_mod_ids: "dict[str, int] | None" = None,
+                 nexus_file_ids: "dict[str, int] | None" = None) -> None:
+        """Set the meta.ini-derived column data, repaint it, and re-sort if the
+        active sort reads it. The reload pushes entries first and applies the
         meta async (reading one ini per mod is disk work).
 
         *descriptions* backs the name-column hover tooltip (no column repaint)."""
@@ -311,12 +361,42 @@ class ModListModel(QAbstractTableModel):
         self._categories = categories or {}
         self._descriptions = descriptions or {}
         self._authors = authors or {}
+        self._nexus_mod_ids = nexus_mod_ids or {}
+        self._nexus_file_ids = nexus_file_ids or {}
         if self._entries:
             self.dataChanged.emit(
                 self.index(0, COL_CATEGORY),
-                self.index(len(self._entries) - 1, COL_AUTHOR),
+                self.index(len(self._entries) - 1, COL_NEXUS_FILE_ID),
                 [Qt.DisplayRole])
-        self._resort_if_key("version", "installed", "category", "author")
+        self._resort_if_key(
+            "version", "installed", "category", "author",
+            "nexus_mod_id", "nexus_file_id")
+
+    def set_nexus_ids(self, mod_ids: dict[str, int],
+                      file_ids: dict[str, int]) -> None:
+        self._nexus_mod_ids = mod_ids or {}
+        self._nexus_file_ids = file_ids or {}
+        if self._entries:
+            self.dataChanged.emit(
+                self.index(0, COL_NEXUS_MOD_ID),
+                self.index(len(self._entries) - 1, COL_NEXUS_FILE_ID),
+                [Qt.DisplayRole])
+        self._resort_if_key("nexus_mod_id", "nexus_file_id")
+
+    def set_version(self, name: str, version: str) -> None:
+        version = (version or "").strip()
+        if self._versions.get(name, "") == version:
+            return
+        if version:
+            self._versions[name] = version
+        else:
+            self._versions.pop(name, None)
+        self._resort_if_key("version")
+        row = next((r for r, e in enumerate(self._entries)
+                    if not e.is_separator and e.name == name), -1)
+        if row >= 0:
+            idx = self.index(row, COL_VERSION)
+            self.dataChanged.emit(idx, idx, [Qt.DisplayRole])
 
     def set_sizes(self, sizes: dict[str, str],
                   size_bytes: dict[str, int] | None = None) -> None:
@@ -331,6 +411,16 @@ class ModListModel(QAbstractTableModel):
                                   self.index(len(self._entries) - 1, COL_SIZE),
                                   [Qt.DisplayRole])
         self._resort_if_key("size")
+
+    def set_content(self, content: dict) -> None:
+        """Set per-mod content badges (Content column). Repaints just that
+        column - used when the user enables Content from the column menu."""
+        self._content = content or {}
+        if self._entries:
+            self.dataChanged.emit(self.index(0, COL_CONTENT),
+                                  self.index(len(self._entries) - 1, COL_CONTENT),
+                                  [ContentRole, Qt.DisplayRole])
+        self._resort_if_key("content")
 
     def set_flags(self, flags: dict[str, int]) -> None:
         self._flags = flags or {}
@@ -387,6 +477,11 @@ class ModListModel(QAbstractTableModel):
             self.dataChanged.emit(self.index(0, COL_FLAGS),
                                   self.index(len(self._entries) - 1, COL_FLAGS),
                                   [FlagsRole, Qt.DisplayRole])
+            for row, entry in enumerate(self._entries):
+                if entry.name in _BOUNDARY_NAMES:
+                    index = self.index(row, COL_NAME)
+                    self.dataChanged.emit(
+                        index, index, [FlagsRole, Qt.DisplayRole])
         self._resort_if_key("flags")
 
     def set_filemap_results(self, conflicts: dict[str, int],
@@ -425,6 +520,52 @@ class ModListModel(QAbstractTableModel):
                                   [ConflictRole, BsaConflictRole,
                                    UuidConflictRole, Qt.DisplayRole])
         self._resort_if_key("conflicts")
+
+    def apply_conflict_delta(
+        self,
+        conflicts: dict[str, int],
+        bsa_conflicts: dict[str, int],
+        uuid_conflicts: dict[str, int],
+        changed_mods,
+        prertx_mods=None,
+        root_rule_mods=None,
+    ) -> None:
+        """Publish one native delta and repaint only affected mod rows."""
+        self._conflicts = conflicts or {}
+        self._bsa_conflicts = bsa_conflicts or {}
+        self._uuid_conflicts = uuid_conflicts or {}
+        capabilities_changed = (
+            prertx_mods is not None or root_rule_mods is not None)
+        if prertx_mods is not None:
+            self._prertx_mods = set(prertx_mods)
+        if root_rule_mods is not None:
+            self._root_rule_mods = set(root_rule_mods)
+        names = set(changed_mods or ())
+        rows = sorted(
+            index for index, entry in enumerate(self._entries)
+            if not entry.is_separator and entry.name in names
+        )
+        start = previous = None
+        for row in rows + [None]:
+            if start is None:
+                start = previous = row
+                continue
+            if row is not None and row == previous + 1:
+                previous = row
+                continue
+            roles = [ConflictRole, BsaConflictRole, UuidConflictRole]
+            if capabilities_changed:
+                roles.append(FlagsRole)
+            roles.append(Qt.DisplayRole)
+            self.dataChanged.emit(
+                self.index(start, COL_NAME),
+                self.index(previous, COL_CONFLICTS),
+                roles,
+            )
+            start = previous = row
+        sort_keys = (("conflicts", "flags") if capabilities_changed
+                     else ("conflicts",))
+        self._resort_if_key(*sort_keys)
 
     def set_bsa_conflicts(self, bsa_conflicts: dict[str, int]) -> None:
         """Update ONLY the BSA conflict codes, leaving loose conflicts + flags
@@ -469,10 +610,11 @@ class ModListModel(QAbstractTableModel):
             return 0
         if e.name in _BOUNDARY_NAMES:
             return 0
-        if e.display_name not in self._collapsed:
+        grouped = self.is_group_collapsed(e.name)
+        if not grouped and e.display_name not in self._collapsed:
             return 0
         anchor = requires = required_by = higher = lower = False
-        for r in self.sep_block_rows(row):
+        for r in (self.group_rows(e.name) if grouped else self.sep_block_rows(row)):
             name = self._entries[r].name
             if name in self._hl_anchor:
                 anchor = True
@@ -533,7 +675,8 @@ class ModListModel(QAbstractTableModel):
         # except Overwrite, which is covered by the name check).
         rows = [i for i, e in enumerate(self._entries)
                 if e.name in changed
-                or (e.is_separator and e.display_name in self._collapsed)]
+                or (e.is_separator and e.display_name in self._collapsed)
+                or self.is_group_collapsed(e.name)]
         if not rows:
             return
         self.dataChanged.emit(self.index(min(rows), 0),
@@ -564,26 +707,19 @@ class ModListModel(QAbstractTableModel):
         return None
 
     def _priority_for_row(self, row: int) -> int:
-        """Priority number for a display row. Normally the natural descending
-        number (top of natural order = largest); in reverse-priority mode the
-        display is the exact inversion, so counting non-separators ABOVE the
-        display row yields the same per-mod value with 0 at the top."""
+        """Natural-order priority number for a display row."""
         e = self._entries[row]
         if e.is_separator:
             return -1
-        if self.reverse_mode_active:
-            return sum(1 for x in self._entries[:row] if not x.is_separator)
-        if self._entries is self._natural:
-            below = sum(1 for x in self._entries[row:] if not x.is_separator)
-            return below - 1
-        # Non-priority sort: the number reflects the NATURAL position (Tk
-        # parity - sorting by name doesn't renumber priorities).
-        try:
-            ni = next(i for i, x in enumerate(self._natural) if x is e)
-        except StopIteration:
-            return -1
-        below = sum(1 for x in self._natural[ni:] if not x.is_separator)
-        return below - 1
+        if self._priority_by_entry is None:
+            priority = 0
+            cache = {}
+            for entry in reversed(self._natural):
+                if not entry.is_separator:
+                    cache[id(entry)] = priority
+                    priority += 1
+            self._priority_by_entry = cache
+        return self._priority_by_entry.get(id(e), -1)
 
     def _effective_flags(self, name: str) -> int:
         """Meta flag bits + the Mod-Files / filemap-derived overlays."""
@@ -600,6 +736,31 @@ class ModListModel(QAbstractTableModel):
             bits |= FLAG_RERUN_FOMOD
         return bits
 
+    def sep_block_content(self, block) -> tuple:
+        """Union of the content badges across *block* display rows, in
+        BADGE_ORDER - the collapsed-separator/group summary.
+
+        A badge is archive-toned only when every member carrying it got it from
+        an archive, the same loose-wins rule compute_badges applies to a single
+        mod. Walks the dict directly (like sep_block_summary) rather than going
+        back through data() per row."""
+        from gui_qt.modlist_content import BADGE_ORDER
+        loose, packed = set(), set()
+        for row in block:
+            entry = self._entries[row]
+            if entry.is_separator:
+                continue
+            for badge, from_archive in self._content.get(entry.name, ()):
+                (packed if from_archive else loose).add(badge)
+        return tuple(
+            (badge, badge not in loose)
+            for badge in BADGE_ORDER if badge in (loose | packed)
+        )
+
+    def _group_content(self, name) -> tuple:
+        """Union of a collapsed group's content badges."""
+        return self.sep_block_content(self.group_rows(name))
+
     def data(self, index, role=Qt.DisplayRole):
         if not index.isValid():
             return None
@@ -608,12 +769,30 @@ class ModListModel(QAbstractTableModel):
 
         if role == EntryRole:
             return e
+        if self.is_group_collapsed(e.name):
+            summary_roles = (FlagsRole, ConflictRole, BsaConflictRole, UuidConflictRole)
+            if role in summary_roles:
+                return self.group_summary(e.name)[summary_roles.index(role)]
+            if role == HighlightRole:
+                return self._separator_highlight(index.row(), e)
+            if role == ContentRole:
+                return self._group_content(e.name)
+        if role == ContentRole:
+            return () if e.is_separator else self._content.get(e.name, ())
         if role == ConflictRole:
-            return 0 if e.is_separator else self._conflicts.get(e.name, 0)
+            # Filegraph publishes the authoritative zero shortly after a
+            # toggle, but the row's enabled state changes synchronously.  A
+            # disabled provider must never retain its previous conflict icon
+            # while that reconcile is in flight (or if a stale presentation
+            # cache survives a profile switch).
+            return (0 if e.is_separator or not e.enabled
+                    else self._conflicts.get(e.name, 0))
         if role == BsaConflictRole:
-            return 0 if e.is_separator else self._bsa_conflicts.get(e.name, 0)
+            return (0 if e.is_separator or not e.enabled
+                    else self._bsa_conflicts.get(e.name, 0))
         if role == UuidConflictRole:
-            return 0 if e.is_separator else self._uuid_conflicts.get(e.name, 0)
+            return (0 if e.is_separator or not e.enabled
+                    else self._uuid_conflicts.get(e.name, 0))
         if role == HighlightRole:
             if e.is_separator:
                 return self._separator_highlight(index.row(), e)
@@ -629,7 +808,12 @@ class ModListModel(QAbstractTableModel):
                 return -1
             return 0
         if role == FlagsRole:
-            return 0 if e.is_separator else self._effective_flags(e.name)
+            if not e.is_separator:
+                return self._effective_flags(e.name)
+            if e.name in _BOUNDARY_NAMES and e.name in self._modified_mf:
+                from gui_qt.modlist_data import FLAG_MODIFIED_MF
+                return FLAG_MODIFIED_MF
+            return 0
         if role == PriorityRole:
             return self._priority_for_row(index.row())
 
@@ -648,6 +832,12 @@ class ModListModel(QAbstractTableModel):
                 return self._authors.get(e.name, "")
             if col == COL_SIZE:
                 return self._sizes.get(e.name, "")
+            if col == COL_NEXUS_MOD_ID:
+                value = self._nexus_mod_ids.get(e.name, 0)
+                return str(value) if value > 0 else ""
+            if col == COL_NEXUS_FILE_ID:
+                value = self._nexus_file_ids.get(e.name, 0)
+                return str(value) if value > 0 else ""
             if col == COL_PRIORITY:
                 p = self._priority_for_row(index.row())
                 return str(p) if p >= 0 else ""
@@ -662,15 +852,12 @@ class ModListModel(QAbstractTableModel):
         # (not selectable, not draggable, not a drop target).
         if e.name == DIVIDER_NAME:
             return Qt.ItemIsEnabled
-        f = Qt.ItemIsEnabled | Qt.ItemIsSelectable
         # Draggable unless pinned: boundary separators + locked MODS can't be
         # dragged (a regular separator reads as locked=True but IS draggable).
         pinned = e.name in _BOUNDARY_NAMES or (not e.is_separator and e.locked)
-        if not pinned:
-            f |= Qt.ItemIsDragEnabled
-        if not e.is_separator:
-            f |= Qt.ItemIsDropEnabled
-        return f
+        if e.is_separator:
+            return _ITEM_BASE if pinned else _ITEM_DRAG
+        return _ITEM_DROP if pinned else _ITEM_DRAG_DROP
 
     # ---- drop-validity (keep boundary separators pinned) ------------------
     def _movable_span(self) -> tuple[int, int]:
@@ -700,23 +887,43 @@ class ModListModel(QAbstractTableModel):
 
     # ---- toggling ---------------------------------------------------------
     def toggle(self, row: int) -> None:
-        from Utils.perftrace import span
+        from Utils.diagnostics.performance import span
         with span("model.toggle"):
             e = self._entries[row]
             if e.is_separator or e.locked:
                 return
+            timing = ConflictTimeline("toggle", [e.name])
+            phase_started = timing.now()
             e.enabled = not e.enabled
             # Whole row: the enabled state dims the text in EVERY column, not
             # just the Name cell with the checkbox.
             self.dataChanged.emit(self.index(row, 0),
                                   self.index(row, len(COLUMNS) - 1),
-                                  [EntryRole, Qt.DisplayRole])
-            self.save(edit_ctx=("toggle", [(e.name, e.enabled)]))
+                                  [EntryRole, ConflictRole, BsaConflictRole,
+                                   UuidConflictRole, Qt.DisplayRole])
+            timing.mark("mod row state and repaint notification updated",
+                        phase_started=phase_started)
+            self.save(edit_ctx=(
+                "toggle", [(e.name, e.enabled)], timing))
+            phase_started = timing.now()
             self.enabled_changed.emit([(e.name, e.enabled)])
+            timing.mark("plugin activation sync signal complete",
+                        phase_started=phase_started)
 
     def set_rows_enabled(self, rows, enabled: bool) -> None:
         """Enable/disable the mods at *rows* (skips separators + locked), then
         save + emit enabled_changed ONCE for the whole batch."""
+        rows = list(rows)
+        candidates = [
+            self._entries[r].name for r in rows
+            if not self._entries[r].is_separator
+            and not self._entries[r].locked
+            and self._entries[r].enabled != enabled
+        ]
+        if not candidates:
+            return
+        timing = ConflictTimeline("toggle", candidates)
+        phase_started = timing.now()
         changed: list[tuple[str, bool]] = []
         changed_rows: list[int] = []
         for r in rows:
@@ -734,14 +941,22 @@ class ModListModel(QAbstractTableModel):
             if prev is not None and (r is None or r != prev + 1):
                 self.dataChanged.emit(self.index(run_start, 0),
                                       self.index(prev, len(COLUMNS) - 1),
-                                      [EntryRole, Qt.DisplayRole])
+                                      [EntryRole, ConflictRole,
+                                       BsaConflictRole, UuidConflictRole,
+                                       Qt.DisplayRole])
                 run_start = None
             if r is not None and run_start is None:
                 run_start = r
             prev = r
         if changed:
-            self.save(edit_ctx=("toggle", list(changed)))
+            timing.mark(
+                f"{len(changed)} mod row state(s) and repaint notifications updated",
+                phase_started=phase_started)
+            self.save(edit_ctx=("toggle", list(changed), timing))
+            phase_started = timing.now()
             self.enabled_changed.emit(changed)
+            timing.mark("plugin activation sync signal complete",
+                        phase_started=phase_started)
 
     def entry(self, row: int) -> ModEntry:
         return self._entries[row]
@@ -850,7 +1065,8 @@ class ModListModel(QAbstractTableModel):
 
     def any_collapsed(self) -> bool:
         names = self.collapsible_separator_names()
-        return any(n in self._collapsed for n in names)
+        return (any(n in self._collapsed for n in names)
+                or any(g["collapsed"] for g in self._mod_groups.values()))
 
     def set_all_collapsed(self, collapsed: bool) -> set[str]:
         """Collapse or expand every (non-boundary) separator. Returns the new
@@ -860,6 +1076,7 @@ class ModListModel(QAbstractTableModel):
             self._collapsed |= names
         else:
             self._collapsed -= names
+        self.set_groups_collapsed(collapsed)
         return self._collapsed
 
     def all_mods_enabled(self) -> bool:
@@ -872,6 +1089,14 @@ class ModListModel(QAbstractTableModel):
 
     def set_all_enabled(self, enabled: bool) -> None:
         """Enable/disable every toggleable mod, then save once."""
+        candidates = [
+            e.name for e in self._entries
+            if not e.is_separator and not e.locked and e.enabled != enabled
+        ]
+        if not candidates:
+            return
+        timing = ConflictTimeline("toggle", candidates)
+        phase_started = timing.now()
         changed: list[tuple[str, bool]] = []
         for r, e in enumerate(self._entries):
             if e.is_separator or e.locked:
@@ -883,9 +1108,16 @@ class ModListModel(QAbstractTableModel):
             self.dataChanged.emit(
                 self.index(0, 0),
                 self.index(len(self._entries) - 1, len(COLUMNS) - 1),
-                [EntryRole, Qt.DisplayRole])
-            self.save(edit_ctx=("toggle", list(changed)))
+                [EntryRole, ConflictRole, BsaConflictRole,
+                 UuidConflictRole, Qt.DisplayRole])
+            timing.mark(
+                f"{len(changed)} mod row state(s) and repaint notification updated",
+                phase_started=phase_started)
+            self.save(edit_ctx=("toggle", list(changed), timing))
+            phase_started = timing.now()
             self.enabled_changed.emit(changed)
+            timing.mark("plugin activation sync signal complete",
+                        phase_started=phase_started)
 
     def hidden_rows(self) -> set[int]:
         """Rows to hide: mods that fall under a collapsed separator (up to the
@@ -900,15 +1132,17 @@ class ModListModel(QAbstractTableModel):
         at all, so their collapse state is meaningless - every mod stays visible
         (a collapsed separator must not swallow its mods behind a hidden header).
         """
-        if self._separators_hidden:
-            return set()
         hidden: set[int] = set()
         collapsing = False
         for i, e in enumerate(self._entries):
             if e.is_separator:
-                collapsing = (e.name not in _BOUNDARY_NAMES
+                collapsing = (not self._separators_hidden
+                              and e.name not in _BOUNDARY_NAMES
                               and e.display_name in self._collapsed)
             elif collapsing:
+                hidden.add(i)
+            elif (self.group_leader(e.name) != e.name
+                  and self.is_group_collapsed(self.group_leader(e.name))):
                 hidden.add(i)
         return hidden
 
@@ -948,6 +1182,8 @@ class ModListModel(QAbstractTableModel):
             if e.is_separator:
                 continue
             bits |= self._effective_flags(e.name)
+            if not e.enabled:
+                continue
             cc = self._conflicts.get(e.name, 0)
             if cc:
                 codes.add(cc)
@@ -960,8 +1196,8 @@ class ModListModel(QAbstractTableModel):
         return bits, codes, bsa, uuid
 
     # ---- persistence ------------------------------------------------------
-    def save(self, edit_ctx=None) -> None:
-        """Write the current entries back to modlist.txt (no-op if no path).
+    def save(self, edit_ctx=None) -> bool:
+        """Write the current entries back to modlist.txt; return success.
         The Overwrite / Root Folder boundary separators are UI-only and are
         stripped before writing. Fires on_saved(edit_ctx) so the view can
         rebuild. edit_ctx tells the app what kind of edit this save carries
@@ -970,16 +1206,25 @@ class ModListModel(QAbstractTableModel):
             set_priority / move-to-separator / sort-selection)
           ("toggle", [(name, enabled), ...])   - enable/disable only
           None - anything else (or an unclassifiable edit) → full rebuild."""
+        edit_ctx, timing = ensure_timeline(edit_ctx)
         if self.modlist_path is None:
-            return
+            if timing is not None:
+                timing.finish("modlist save skipped: no active profile")
+            return False
         # Every structural edit (drag, remove, add-separator, set_priority…)
         # funnels through here - row→block mapping may have changed.
         self._sep_hl_cache.clear()
-        from Utils.modlist import read_modlist, write_modlist, modlist_lock
-        from Utils.perftrace import span
+        from Utils.mods.modlist import read_modlist, write_modlist, modlist_lock
+        from Utils.diagnostics.performance import span
         # ALWAYS write the natural order - the display list may be a sorted /
         # inverted permutation (and contains the divider in reverse mode).
         body = [e for e in self._natural if e.name not in _PINNED_NAMES]
+        had_groups = bool(self._mod_groups or self._saved_mod_groups)
+        self._group_recovery_needed = False
+        if had_groups:
+            self._mod_groups = normalize_groups(self._mod_groups, self._natural)
+            self._index_groups()
+        phase_started = timing.now() if timing is not None else None
         try:
             # This model can be a stale snapshot - a background install writes
             # its new entry before our _reload_modlist lands - so writing body
@@ -989,7 +1234,8 @@ class ModListModel(QAbstractTableModel):
             with span("modlist.write_modlist"), modlist_lock(self.modlist_path):
                 body_names = {e.name for e in body}
                 known = body_names | self._baseline_names
-                external = [e for e in read_modlist(self.modlist_path)
+                previous = read_modlist(self.modlist_path)
+                external = [e for e in previous
                             if not e.is_separator and e.name not in known]
                 if external:
                     print(f"[gui_qt] modlist save: preserving "
@@ -997,13 +1243,52 @@ class ModListModel(QAbstractTableModel):
                           f"{', '.join(e.name for e in external[:5])}",
                           flush=True)
                 write_modlist(self.modlist_path, external + body)
+                try:
+                    self._save_groups()
+                except Exception as state_error:
+                    try:
+                        write_modlist(self.modlist_path, previous)
+                    except Exception as rollback_error:
+                        self._group_recovery_needed = True
+                        raise OSError(f"Group state save failed: {state_error}; "
+                                      f"restoring modlist failed: {rollback_error}") from rollback_error
+                    raise
         except Exception as exc:
             print(f"[gui_qt] modlist save failed: {exc}", flush=True)
             self.save_failed.emit(f"Modlist save failed: {exc}")
-            return
+            if self._group_recovery_needed:
+                from Utils.profiles.state import read_mod_groups
+                self.set_entries(read_modlist(self.modlist_path),
+                                 mod_groups=read_mod_groups(self.modlist_path.parent))
+                self.groups_changed.emit()
+                if self.on_saved:
+                    try:
+                        self.on_saved(None)
+                    except Exception as refresh_error:
+                        self.save_failed.emit(f"Modlist reloaded, but refresh failed: {refresh_error}")
+            if timing is not None:
+                timing.finish(f"modlist write failed: {exc}")
+            return False
+        if had_groups:
+            self._rebuild_display()
+            self.groups_changed.emit()
+        if timing is not None:
+            timing.mark(
+                f"modlist.txt committed ({len(body)} entries)",
+                phase_started=phase_started)
         if self.on_saved:
+            phase_started = timing.now() if timing is not None else None
             with span("modlist.on_saved(kickoff)"):
-                self.on_saved(edit_ctx)
+                try:
+                    self.on_saved(edit_ctx)
+                except Exception as exc:
+                    self.save_failed.emit(f"Modlist saved, but refresh failed: {exc}")
+            if timing is not None:
+                timing.mark("modlist on-saved callback returned",
+                            phase_started=phase_started)
+        elif timing is not None:
+            timing.finish("modlist saved; no conflict callback is connected")
+        return True
 
     # ---- structural edits (context-menu actions) --------------------------
     def rename(self, row: int, new_name: str) -> None:
@@ -1013,7 +1298,7 @@ class ModListModel(QAbstractTableModel):
         if e.name in _PINNED_NAMES or (not e.is_separator and e.locked):
             return
         # Separators keep their suffix so they stay separators on write-out.
-        from Utils.modlist import _SEPARATOR_SUFFIX
+        from Utils.mods.modlist import _SEPARATOR_SUFFIX
         e.name = (new_name + _SEPARATOR_SUFFIX) if e.is_separator else new_name
         idx = self.index(row, COL_NAME)
         self.dataChanged.emit(idx, idx, [Qt.DisplayRole, EntryRole])
@@ -1032,6 +1317,9 @@ class ModListModel(QAbstractTableModel):
         e = self._entries[row]
         if e.is_separator:
             return
+        if self._mod_groups:
+            self.set_group_priority(row, priority)
+            return
         nat = self._natural
         nonsep = [i for i, x in enumerate(nat) if not x.is_separator]
         n = len(nonsep)
@@ -1046,23 +1334,44 @@ class ModListModel(QAbstractTableModel):
         src = self._natural_row_of(e)
         if src < 0 or dest_row == src:
             return
+        timing = ConflictTimeline("move", [e.name])
+        phase_started = timing.now()
+        old_order = self._mod_name_order()
         nat.pop(src)
         # Pre-removal target is dest_row (moving up: before it) or dest_row+1
         # (moving down: after it); the pop shifts the latter down by one, so
         # both cases land at dest_row post-pop.
         nat.insert(dest_row, e)
         self._rebuild_display()
-        self.save()
+        ctx = self._move_ctx(old_order, self._mod_name_order(), [e.name])
+        timing.mark("priority edit reordered the Qt model",
+                    phase_started=phase_started)
+        save_ctx = (("move",) + ctx + (timing,) if ctx is not None
+                    else ("full", timing))
+        self.save(edit_ctx=save_ctx)
 
     def add_separator(self, row: int, name: str, above: bool) -> None:
-        from Utils.modlist import _SEPARATOR_SUFFIX
+        from Utils.mods.modlist import _SEPARATOR_SUFFIX
         from gui_qt.modlist_sort import insert_separator_display
         sep = ModEntry(name + _SEPARATOR_SUFFIX, True, False, True)
         ref = self._entries[row]
+        if self.group_leader(ref.name):
+            at = self.group_insert_slot(row, above)
+            entries = list(self._natural)
+            entries.insert(at, sep)
+            self._commit_group_edit(entries, self._mod_groups)
+            return
         if self.reverse_mode_active:
             # Inverted display reverses group/mod order, so a natural-order
             # insert mis-anchors - resolve in display space and uninvert
             # (Tk _add_separator_inverted).
+            if self._mod_groups:
+                display = build_display(self._natural, "priority", True, {},
+                                        divider=self._divider)
+                ref_row = next(i for i, entry in enumerate(display) if entry is ref)
+                entries = insert_separator_display(display, ref_row, above, sep)
+                self._commit_group_edit(entries, self._mod_groups)
+                return
             self._natural = insert_separator_display(self._entries, row,
                                                      above, sep)
             self._rebuild_display()
@@ -1084,21 +1393,30 @@ class ModListModel(QAbstractTableModel):
         self._rebuild_display()
         self.save()
 
-    def insert_mod(self, row: int, name: str, above: bool = False) -> None:
+    def insert_mod(self, row: int, name: str, above: bool = False) -> bool:
         """Insert an (enabled) mod entry named *name* relative to *row*. Used by
         'Create empty mod below' - the folder/meta.ini are created by the caller."""
         entry = ModEntry(name, True, False, False)
+        if self.group_leader(self.entry(row).name):
+            at = self.group_insert_slot(row, above)
+            entries = list(self._natural)
+            entries.insert(at, entry)
+            return self._commit_group_edit(entries, self._mod_groups)
         if self._entries is self._natural:
             at = row if above else row + 1
             self.beginInsertRows(QModelIndex(), at, at)
             self._entries.insert(at, entry)
             self.endInsertRows()
-            self.save()
-            return
+            if self.save():
+                return True
+            self.beginRemoveRows(QModelIndex(), at, at)
+            del self._entries[at]
+            self.endRemoveRows()
+            return False
         ref = self._entries[row]
         ni = self._natural_row_of(ref)
         if ni < 0:
-            return
+            return False
         if self.reverse_mode_active:
             # Inverted display: visually below *ref* = BEFORE it in natural
             # order (and vice versa) - mirror add_separator's reverse branch.
@@ -1107,13 +1425,18 @@ class ModListModel(QAbstractTableModel):
             at = ni if above else ni + 1
         self._natural.insert(at, entry)
         self._rebuild_display()
-        self.save()
+        if self.save():
+            return True
+        del self._natural[at]
+        self._rebuild_display()
+        return False
 
-    def insert_mod_at_body_edge(self, top: bool, name: str) -> None:
+    def insert_mod_at_body_edge(self, top: bool, name: str) -> bool:
         """Insert an (enabled) mod at the top or bottom of the natural body,
         just inside the boundary separators. Used by the boundary rows' 'Create
         an empty mod below' - normal mode drops it below Overwrite (top of the
-        body), reverse-priority mode below Root Folder (bottom of the body)."""
+        body), reverse-priority mode below Root Folder (bottom of the body).
+        Roll the model insertion back and return False when saving fails."""
         entry = ModEntry(name, True, False, False)
         # Natural layout is normally [Overwrite] + body + [Root Folder]; drop the
         # mod just inside whichever boundary the caller asked for. Anchor on the
@@ -1129,11 +1452,19 @@ class ModListModel(QAbstractTableModel):
             self.beginInsertRows(QModelIndex(), at, at)
             self._natural.insert(at, entry)
             self.endInsertRows()
-            self.save()
-            return
+            if self.save():
+                return True
+            self.beginRemoveRows(QModelIndex(), at, at)
+            del self._natural[at]
+            self.endRemoveRows()
+            return False
         self._natural.insert(at, entry)
         self._rebuild_display()
-        self.save()
+        if self.save():
+            return True
+        del self._natural[at]
+        self._rebuild_display()
+        return False
 
     def remove_row(self, row: int, save: bool = True) -> None:
         """Drop *row*. Pass save=False when removing several rows in a loop and
@@ -1250,6 +1581,8 @@ class ModListModel(QAbstractTableModel):
         permutation and row moves are meaningless here - the drag path clears
         a non-priority sort first, and reverse-priority drags go through
         move_block_display()."""
+        if self._mod_groups:
+            return self._move_group_rows(src_rows, dest)
         if not src_rows or self._entries is not self._natural:
             return False
         src_rows = sorted(src_rows)
@@ -1274,10 +1607,15 @@ class ModListModel(QAbstractTableModel):
         # Qt's beginMoveRows requires dest outside the moved range.
         if first <= dest <= last + 1:
             return False
+        preview = self._entries[first:last + 1]
+        moved_preview = [e.name for e in preview if not e.is_separator]
+        timing = ConflictTimeline("move", moved_preview)
+        phase_started = timing.now()
         if not self.beginMoveRows(QModelIndex(), first, last,
                                   QModelIndex(), dest):
+            timing.finish("Qt rejected the requested row move")
             return False
-        from Utils.perftrace import span
+        from Utils.diagnostics.performance import span
         with span("model.move_block"):
             old_order = self._mod_name_order()
             block = self._entries[first:last + 1]
@@ -1287,7 +1625,12 @@ class ModListModel(QAbstractTableModel):
             self.endMoveRows()
             moved = [e.name for e in block if not e.is_separator]
             ctx = self._move_ctx(old_order, self._mod_name_order(), moved)
-            self.save(edit_ctx=None if ctx is None else ("move",) + ctx)
+            timing.mark(
+                f"Qt model reordered ({len(moved)} moved mod(s))",
+                phase_started=phase_started)
+            save_ctx = (("move",) + ctx + (timing,) if ctx is not None
+                        else ("full", timing))
+            self.save(edit_ctx=save_ctx)
         return True
 
     def move_block_display(self, src_rows: list[int], slot: int,
@@ -1298,6 +1641,8 @@ class ModListModel(QAbstractTableModel):
         then re-derive the natural order via uninvert (Tk
         _uninvert_entries_order) and save."""
         from gui_qt.modlist_sort import resolve_reverse_drop
+        if self._mod_groups:
+            return self._move_group_rows(src_rows, slot, hidden)
         if not src_rows or not self.reverse_mode_active:
             return False
         src_rows = sorted(src_rows)
@@ -1324,8 +1669,13 @@ class ModListModel(QAbstractTableModel):
         ins = max(lo, min(ins, hi + 1))
         if first <= ins <= last + 1:
             return False
+        preview = self._entries[first:last + 1]
+        moved_preview = [e.name for e in preview if not e.is_separator]
+        timing = ConflictTimeline("move", moved_preview)
+        phase_started = timing.now()
         if not self.beginMoveRows(QModelIndex(), first, last,
                                   QModelIndex(), ins):
+            timing.finish("Qt rejected the requested reverse-order row move")
             return False
         old_order = self._mod_name_order()
         block = self._entries[first:last + 1]
@@ -1345,5 +1695,10 @@ class ModListModel(QAbstractTableModel):
         self._rebuild_display()
         moved = [e.name for e in block if not e.is_separator]
         ctx = self._move_ctx(old_order, self._mod_name_order(), moved)
-        self.save(edit_ctx=None if ctx is None else ("move",) + ctx)
+        timing.mark(
+            f"Qt reverse-order model reordered ({len(moved)} moved mod(s))",
+            phase_started=phase_started)
+        save_ctx = (("move",) + ctx + (timing,) if ctx is not None
+                    else ("full", timing))
+        self.save(edit_ctx=save_ctx)
         return True

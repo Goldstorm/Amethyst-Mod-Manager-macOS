@@ -7,6 +7,7 @@ from pathlib import Path
 
 from Games.base_game import WizardTool
 from Games.Bethesda.fallout_3 import Fallout_3
+from Games.Bethesda.skyrim_common import SKYRIM_MOD_REQUIRED_TOP_LEVEL_FOLDERS
 
 
 class Skyrim(Fallout_3):
@@ -41,6 +42,7 @@ class Skyrim(Fallout_3):
                 description="Download and run Wrye Bash.",
                 dialog_class_path="wizards.wrye_bash.WryeBashWizard",
             ),
+            self._xlodgen_wizard_tool("skyrim"),
             *self._xedit_wizard_tools(
                 build="TES5Edit", id_suffix="skyrim",
                 nexus_url="https://www.nexusmods.com/skyrim/mods/25859?tab=files",
@@ -86,6 +88,10 @@ class Skyrim(Fallout_3):
         return "skyrim"
 
     @property
+    def mod_required_top_level_folders(self) -> set[str]:
+        return set(SKYRIM_MOD_REQUIRED_TOP_LEVEL_FOLDERS)
+
+    @property
     def loot_game_type(self) -> str:
         return "Skyrim"
 
@@ -95,11 +101,11 @@ class Skyrim(Fallout_3):
 
     @property
     def custom_routing_rules(self) -> list:
-        from Utils.deploy import CustomRule
+        from Utils.deployment import CustomRule
         return [
-            CustomRule(dest="", filenames=["skse_loader.exe"], flatten=True, loose_only=True),
-            CustomRule(dest="", filenames=["skse*.dll"], flatten=True, loose_only=True),
-            CustomRule(dest="", folders=["Data"], flatten=True, loose_only=True),
+            CustomRule(rule_id='skyrim:b8e0b509d085', dest="", filenames=["skse_loader.exe"], flatten=True, loose_only=True),
+            CustomRule(rule_id='skyrim:7adf4e54d0d0', dest="", filenames=["skse*.dll"], flatten=True, loose_only=True),
+            CustomRule(rule_id='skyrim:42b2892ccb1f', dest="", folders=["Data"], flatten=True, loose_only=True),
             self._saves_routing_rule([".ess"]),
         ]
 

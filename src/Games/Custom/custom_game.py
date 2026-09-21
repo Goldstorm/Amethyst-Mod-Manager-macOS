@@ -7,13 +7,15 @@ JSON format (~/.config/AmethystModManager/custom_games/<game_id>.json):
   "name":              "My Game",
   "game_id":           "my_game",
   "exe_name":          "MyGame.exe",
+  "exe_name_alts":     ["MyGame.x86_64"], // optional alternate executable paths
   "deploy_type":       "standard",   // "standard" | "root" | "ue5"
   "mod_data_path":     "Data",       // relative path (standard only; ignored for root/ue5)
   "steam_id":          "",           // optional Steam App ID
   "nexus_game_domain": "",           // optional Nexus domain slug
   "additional_nexus_domains": [],     // optional extra Nexus domain slugs
   "thunderstore_community": "",      // optional Thunderstore community slug
-  "image_url":         ""            // optional banner image URL
+  "image_url":         "",           // optional banner image URL
+  "auto_install_deps": ["vcredist", "dotnet6"], // optional prefix dependencies
   "editable":          true          // false = skip definition editor on reconfigure (for repo handlers);
                                      // dev mode ignores this so repo handlers stay editable
 }
@@ -45,7 +47,7 @@ from pathlib import Path
 from Games.base_game import BaseGame
 from Games.ue5_game import UE5Game, UE5Rule
 from Utils.vfs import ProfileVFSGameMixin
-from Utils.deploy import (
+from Utils.deployment import (
     CustomRule,
     LinkMode,
     RestoreWhitelistRule,
@@ -64,7 +66,7 @@ from Utils.deploy import (
     restore_data_core,
     restore_filemap_from_root,
 )
-from Utils.modlist import read_modlist
+from Utils.mods.modlist import read_modlist
 from Utils.config_paths import get_profiles_dir, get_custom_games_dir, get_custom_game_images_dir
 
 _PROFILES_DIR = get_profiles_dir()
@@ -127,10 +129,10 @@ def _defn_to_custom_rules(defn: dict) -> list[CustomRule]:
     raw = defn.get("custom_routing_rules", [])
     if not isinstance(raw, list):
         return []
+    from Utils.games.routing_rules import definition_rule_ids
+    raw = [entry for entry in raw if isinstance(entry, dict)]
     rules: list[CustomRule] = []
-    for entry in raw:
-        if not isinstance(entry, dict):
-            continue
+    for entry, rule_id in zip(raw, definition_rule_ids(raw)):
         dest = entry.get("dest", "")
         extensions = [s.strip().lower() for s in entry.get("extensions", []) if s.strip()]
         folders = [s.strip() for s in entry.get("folders", []) if s.strip()]
@@ -148,7 +150,10 @@ def _defn_to_custom_rules(defn: dict) -> list[CustomRule]:
                                     companion_extensions=companion_extensions,
                                     flatten=flatten,
                                     include_siblings=include_siblings,
-                                    to_prefix=to_prefix))
+                                    to_prefix=to_prefix,
+                                    mirror_dests=list(entry.get("mirror_dests", [])),
+                                    exclude_extensions=list(entry.get("exclude_extensions", [])),
+                                    rule_id=rule_id))
     return rules
 
 
@@ -205,6 +210,7 @@ BUILTIN_GAME_TEMPLATES: list[dict] = [
         "name": "BepInEx",
         "game_id": "",
         "exe_name": "",
+        "exe_name_alts": [],
         "deploy_type": "standard",
         "mod_data_path": "BepInEx/plugins",
         "steam_id": "",
@@ -243,6 +249,7 @@ BUILTIN_GAME_TEMPLATES: list[dict] = [
         "name": "UE5 (ue4ss)",
         "game_id": "",
         "exe_name": "GAMEID/Binaries/Win64/EXENAME.exe",
+        "exe_name_alts": [],
         "deploy_type": "ue5",
         "mod_data_path": "GAMEID",
         "steam_id": "",
@@ -451,6 +458,11 @@ class StandardCustomGame(ProfileVFSGameMixin, BaseGame):
         return self._defn.get("exe_name", "").replace("\\", "/")
 
     @property
+    def exe_name_alts(self) -> list[str]:
+        return [name.replace("\\", "/")
+                for name in _defn_to_list(self._defn, "exe_name_alts")]
+
+    @property
     def steam_id(self) -> str:
         return self._defn.get("steam_id", "")
 
@@ -547,6 +559,12 @@ class StandardCustomGame(ProfileVFSGameMixin, BaseGame):
         return _defn_to_dll_overrides(self._defn)
 
     @property
+    def auto_install_deps(self) -> list[str]:
+        if "auto_install_deps" not in self._defn:
+            return list(super().auto_install_deps)
+        return _defn_to_list(self._defn, "auto_install_deps")
+
+    @property
     def restore_before_deploy(self) -> bool:
         return bool(self._defn.get("restore_before_deploy", True))
 
@@ -592,8 +610,10 @@ class StandardCustomGame(ProfileVFSGameMixin, BaseGame):
     @property
     def vfs_direct_shadow_launch(self) -> bool:
         # Native custom games need their executable and cwd inside the complete
-        # materialized view. Windows games continue through Proton/UMU/runtime.
-        return Path(self.exe_name).suffix.lower() not in (".exe", ".bat")
+        # materialized view. Resolve first so a native alternative is honoured.
+        from Utils.executables.launch import resolve_game_exe
+        executable = resolve_game_exe(self) or Path(self.exe_name)
+        return executable.suffix.lower() not in (".exe", ".bat")
 
     def get_mod_staging_path(self) -> Path:
         if self._staging_path is not None:
@@ -640,7 +660,8 @@ class StandardCustomGame(ProfileVFSGameMixin, BaseGame):
 
         if data_dir is None:
             raise RuntimeError("Mod data path could not be resolved.")
-        if not filemap.is_file():
+        from Utils.filegraph.deploy import input_ready
+        if not input_ready():
             raise RuntimeError(f"filemap.txt not found: {filemap}\nRun 'Build Filemap' before deploying.")
 
         if self.vfs_launch_enabled:
@@ -665,7 +686,7 @@ class StandardCustomGame(ProfileVFSGameMixin, BaseGame):
         per_mod_modes = expand_separator_link_modes(_sep_deploy, _sep_entries) or None
         per_mod_raw = expand_separator_raw_deploy(_sep_deploy, _sep_entries) or None
 
-        custom_rules = self.custom_routing_rules
+        custom_rules = self.effective_custom_routing_rules
         custom_exclude: set[str] = set()
         if custom_rules:
             _log("Step 1: Routing files via custom rules ...")
@@ -720,17 +741,15 @@ class StandardCustomGame(ProfileVFSGameMixin, BaseGame):
             raise RuntimeError("Mod data path could not be resolved.")
         _profile_dir = self._active_profile_dir
         _entries = read_modlist(_profile_dir / "modlist.txt") if _profile_dir else []
-        cleanup_custom_deploy_dirs(_profile_dir, _entries, log_fn=_log)
+        cleanup_custom_deploy_dirs(_profile_dir, _entries, log_fn=_log, game=self)
 
-        custom_rules = self.custom_routing_rules
-        if custom_rules:
-            _log("Restore: removing custom-routed files ...")
+        _log("Restore: removing custom-routed files ...")
         # The deployment log is authoritative and may outlive a definition
         # edit that removed its rules, so always give restore a chance to
         # consume both the log and backup-only interrupted state.
         restore_custom_rules(
             self.get_effective_filemap_path(), self._game_path,
-            rules=custom_rules, log_fn=_log,
+            rules=[], log_fn=_log,
             prefix_root=self.get_prefix_path(),
         )
 
@@ -751,6 +770,7 @@ class StandardCustomGame(ProfileVFSGameMixin, BaseGame):
             overwrite_dir=self.get_effective_overwrite_path(),
             log_fn=_log,
             restore_whitelist=self.restore_whitelist_matcher(rel_prefix=_prefix),
+            game=self, profile_dir=self._active_profile_dir,
         )
         _log(f"  Restored {restored} file(s). {data_dir.name}_Core/ removed.")
 
@@ -787,7 +807,8 @@ class RootCustomGame(StandardCustomGame):
         filemap   = self.get_effective_filemap_path()
         staging   = self.get_effective_mod_staging_path()
 
-        if not filemap.is_file():
+        from Utils.filegraph.deploy import input_ready
+        if not input_ready():
             raise RuntimeError(f"filemap.txt not found: {filemap}\nRun 'Build Filemap' before deploying.")
 
         if self.vfs_launch_enabled:
@@ -809,7 +830,7 @@ class RootCustomGame(StandardCustomGame):
         per_mod_modes = expand_separator_link_modes(_sep_deploy, _sep_entries) or None
         per_mod_raw = expand_separator_raw_deploy(_sep_deploy, _sep_entries) or None
 
-        custom_rules = self.custom_routing_rules
+        custom_rules = self.effective_custom_routing_rules
         custom_exclude: set[str] = set()
         if custom_rules:
             _log("Routing files via custom rules ...")
@@ -846,13 +867,11 @@ class RootCustomGame(StandardCustomGame):
 
         _profile_dir = self._active_profile_dir
         _entries = read_modlist(_profile_dir / "modlist.txt") if _profile_dir else []
-        cleanup_custom_deploy_dirs(_profile_dir, _entries, log_fn=_log)
+        cleanup_custom_deploy_dirs(_profile_dir, _entries, log_fn=_log, game=self)
 
-        custom_rules = self.custom_routing_rules
-        if custom_rules:
-            _log("Restore: removing custom-routed files ...")
+        _log("Restore: removing custom-routed files ...")
         restore_custom_rules(
-            filemap, game_root, rules=custom_rules, log_fn=_log,
+            filemap, game_root, rules=[], log_fn=_log,
             prefix_root=self.get_prefix_path())
 
         from Utils.vfs import cleanup_deployment, has_deployment_state
@@ -909,6 +928,11 @@ class Ue5CustomGame(UE5Game):
         # Normalise Windows-style separators so game_path / exe_name resolves
         # correctly on Linux (e.g. "Binaries\\NMS.exe" → "Binaries/NMS.exe").
         return self._defn.get("exe_name", "").replace("\\", "/")
+
+    @property
+    def exe_name_alts(self) -> list[str]:
+        return [name.replace("\\", "/")
+                for name in _defn_to_list(self._defn, "exe_name_alts")]
 
     @property
     def steam_id(self) -> str:
@@ -1038,6 +1062,12 @@ class Ue5CustomGame(UE5Game):
     @property
     def wine_dll_overrides(self) -> dict[str, str]:
         return _defn_to_dll_overrides(self._defn)
+
+    @property
+    def auto_install_deps(self) -> list[str]:
+        if "auto_install_deps" not in self._defn:
+            return list(super().auto_install_deps)
+        return _defn_to_list(self._defn, "auto_install_deps")
 
     @property
     def restore_before_deploy(self) -> bool:

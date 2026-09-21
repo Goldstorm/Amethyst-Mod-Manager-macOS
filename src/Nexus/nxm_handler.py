@@ -470,6 +470,21 @@ class NxmHandler:
         return f'{cls._quote_if_needed(exe)} {cls._quote_if_needed(script)} --nxm %u'
 
     @classmethod
+    def _desktop_contents(cls) -> str:
+        """Exact desktop entry expected for this running install."""
+        return (
+            "[Desktop Entry]\n"
+            "Type=Application\n"
+            "Name=Amethyst Mod Manager (NXM Handler)\n"
+            "Comment=Handle nxm:// download links from Nexus Mods\n"
+            f"Exec={cls._get_exec_command()}\n"
+            "Terminal=false\n"
+            "NoDisplay=true\n"
+            "MimeType=x-scheme-handler/nxm;\n"
+            "Categories=Game;\n"
+        )
+
+    @classmethod
     def _mimeapps_paths(cls) -> list[Path]:
         """
         Candidate mimeapps.list locations per the XDG MIME Applications spec.
@@ -632,6 +647,62 @@ class NxmHandler:
         return rc == 127
 
     @classmethod
+    def registration_is_current(cls) -> bool:
+        """Return whether registration already targets this exact install.
+
+        This is deliberately stronger than :meth:`is_registered`: a desktop
+        file left by another source checkout/AppImage must not suppress the
+        takeover performed by ``register()``. The inexpensive read-only check
+        covers the Exec line, direct mimeapps associations and the effective
+        XDG default; only a mismatch needs the destructive scrub and several
+        desktop-helper subprocesses.
+        """
+        try:
+            expected = cls._desktop_contents()
+            desktop_path = cls._desktop_path()
+            if (not desktop_path.is_file()
+                    or desktop_path.read_text(encoding="utf-8") != expected):
+                return False
+
+            flatpak_path = cls._flatpak_desktop_path()
+            if (flatpak_path.parent.exists()
+                    and (not flatpak_path.is_file()
+                         or flatpak_path.read_text(encoding="utf-8") != expected)):
+                return False
+
+            mimeapps_paths = cls._mimeapps_paths()
+            canonical = mimeapps_paths[0]
+            for path in mimeapps_paths:
+                if path != canonical and not path.exists():
+                    continue
+                if not path.is_file():
+                    return False
+                content = path.read_text(encoding="utf-8")
+                if cls._patch_mimeapps_content(content) != content:
+                    return False
+        except OSError:
+            return False
+
+        in_flatpak = Path("/.flatpak-info").exists()
+        base = cls._host_cmd(in_flatpak, "xdg-mime")
+        if base is None:
+            return False
+        try:
+            result = subprocess.run(
+                [*base, "query", "default", "x-scheme-handler/nxm"],
+                check=False,
+                capture_output=True,
+                timeout=10,
+            )
+            if in_flatpak and cls._is_host_tool_missing(result.returncode):
+                return False
+            return (result.returncode == 0
+                    and result.stdout.decode(errors="replace").strip()
+                    == _DESKTOP_FILE_NAME)
+        except (OSError, subprocess.SubprocessError):
+            return False
+
+    @classmethod
     def _gio_register(cls, in_flatpak: bool) -> None:
         """
         Register the handler via ``gio mime`` as well. Many GTK/GNOME tools
@@ -738,18 +809,7 @@ class NxmHandler:
         desktop_path.parent.mkdir(parents=True, exist_ok=True)
 
         exec_cmd = cls._get_exec_command()
-
-        desktop_content = (
-            "[Desktop Entry]\n"
-            "Type=Application\n"
-            "Name=Amethyst Mod Manager (NXM Handler)\n"
-            "Comment=Handle nxm:// download links from Nexus Mods\n"
-            f"Exec={exec_cmd}\n"
-            "Terminal=false\n"
-            "NoDisplay=true\n"
-            "MimeType=x-scheme-handler/nxm;\n"
-            "Categories=Game;\n"
-        )
+        desktop_content = cls._desktop_contents()
 
         desktop_path.write_text(desktop_content, encoding="utf-8")
         nxm_log(f"Wrote NXM .desktop file: {desktop_path} (Exec={exec_cmd})")
@@ -906,6 +966,7 @@ class NxmIPC:
     _servers: dict[Path, socket.socket] = {}
     _threads: list[threading.Thread] = []
     _callback: Optional[Callable[[str], None]] = None
+    _MAX_PAYLOAD = 256 * 1024
     # Serializes ensure_bound() against itself and shutdown() - ensure_bound
     # runs on a worker thread while shutdown comes from the UI thread.
     _lock = threading.Lock()
@@ -995,13 +1056,27 @@ class NxmIPC:
             except OSError:
                 break  # socket closed → shutting down
             try:
-                data = conn.recv(4096)
+                conn.settimeout(2)
+                chunks: list[bytes] = []
+                total = 0
+                while True:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > cls._MAX_PAYLOAD:
+                        raise ValueError("IPC payload exceeds 256 KiB")
+                    chunks.append(chunk)
+                data = b"".join(chunks)
                 if data:
                     msg = json.loads(data.decode("utf-8"))
                     url = msg.get("nxm_url", "")
                     cb = cls._callback
                     if url and cb is not None:
-                        nxm_log(f"Received NXM link from new instance: {url}")
+                        if url.lower().startswith("modl://"):
+                            nxm_log("Received modl link from new instance")
+                        else:
+                            nxm_log(f"Received NXM link from new instance: {url}")
                         cb(url)
             except Exception as exc:
                 nxm_log(f"Error handling IPC message: {exc}")

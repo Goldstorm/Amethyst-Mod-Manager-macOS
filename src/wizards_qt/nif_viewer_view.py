@@ -1,7 +1,7 @@
 """NIF Viewer - browse every mesh in the profile and the vanilla game, and
 preview it in 3D.
 
-Left: a unified meshes/… tree from Utils.mesh_catalog - every copy from mods,
+Left: a unified meshes/… tree from Utils.assets.catalog - every copy from mods,
 the data folder and BSA/BA2 archives, contested paths expanding into one row
 per copy with the game's winner tinted green. Right: the gui_qt.nif_preview
 viewport, fed raw bytes. Scans and tree builds run off-thread behind a
@@ -16,8 +16,8 @@ from typing import TYPE_CHECKING
 
 from PySide6.QtCore import QEvent, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QComboBox, QLabel, QLineEdit, QPushButton,
-    QSizePolicy, QSplitter, QTreeView, QVBoxLayout, QWidget,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QLabel, QLineEdit,
+    QPushButton, QSizePolicy, QSplitter, QTreeView, QVBoxLayout, QWidget,
 )
 
 from gui_qt.eliding_label import ElidingLabel
@@ -27,12 +27,13 @@ from gui_qt.path_tree import (
     Node, PathTreeDelegate, PathTreeModel, build_tree,
 )
 from gui_qt.safe_emit import safe_emit
-from gui_qt.theme_qt import active_palette, button_qss, _c
+from gui_qt.theme_qt import active_palette, button_qss, close_button, _c
 from gui_qt.nif_texture_sources import TextureSourceController
 from gui_qt.worker import LatestWorker
-from Utils.mesh_catalog import (
+from Utils.assets.resolver import DirCache
+from Utils.assets.catalog import (
     DATA_ARCHIVE, DATA_LOOSE, DEFAULT_PREFIX, MOD_ARCHIVE, MOD_LOOSE,
-    build_catalog, read_entry, source_label,
+    build_catalog_cached, read_entry, source_label,
 )
 
 if TYPE_CHECKING:
@@ -72,8 +73,11 @@ class NifViewerView(QWidget):
         self._gen = 0
         self._tree_gen = 0
         self._open_gen = 0
+        self._scanning = False
         self._entries: list = []
         self._resolver = None
+        self._dirs = DirCache()
+        self._archive_lookups: dict[Path, object] = {}
         self._current_entry = None
         self._current_data = None
         self._restore = None
@@ -158,9 +162,7 @@ class NifViewerView(QWidget):
         self._refresh_btn.clicked.connect(self._refresh)
         hb.addWidget(self._refresh_btn)
 
-        close = QPushButton(self.tr("✕ Close"))
-        close.setCursor(Qt.PointingHandCursor)
-        close.setStyleSheet(button_qss("BTN_DANGER", pal=pal, padding="5px 12px"))
+        close = close_button(self.tr("✕ Close"), pal=pal)
         close.clicked.connect(self._finish)
         hb.addWidget(close)
         v.addWidget(bar)
@@ -223,6 +225,13 @@ class NifViewerView(QWidget):
         self._debounce.setInterval(250)
         self._debounce.timeout.connect(self._rebuild_tree)
 
+        self._selection_timer = QTimer(self)
+        self._selection_timer.setSingleShot(True)
+        self._selection_timer.setInterval(150)
+        self._selection_timer.timeout.connect(self._preview_current)
+        self._tree.selectionModel().currentChanged.connect(self._on_current_changed)
+        self._tree.activated.connect(self._preview_current)
+
         self._scan_done.connect(self._guard(self._on_scan_done))
         self._tree_ready.connect(self._guard(self._on_tree_ready))
         self._mesh_ready.connect(self._guard(self._on_mesh_ready))
@@ -242,16 +251,18 @@ class NifViewerView(QWidget):
         """
         if self._closing:
             return
-        self._restore = (self._current_entry.rel_key
-                         if self._current_entry is not None else None)
+        if self._current_entry is not None:
+            self._restore = self._current_entry.rel_key
         self._current_entry = None
         self._current_data = None
+        self._dirs = DirCache()
+        self._archive_lookups.clear()
         self._open_gen += 1
         self._mesh_reads.discard_pending()
         self._tex_sources.cancel()
-        self._preview.cancel_load()
+        self._preview.clear(self.tr("Scanning…"))
         self._log("NIF Viewer: refreshing from the profile…")
-        self._start_scan()
+        self._start_scan(refresh=True)
 
     def _restore_selection(self):
         """Re-open the mesh that was on screen before a refresh, by PATH.
@@ -272,10 +283,11 @@ class NifViewerView(QWidget):
             return
         self._open_entry(match)
 
-    def _finish(self):
+    def _begin_close(self):
         if self._closing:
-            return
+            return False
         self._closing = True
+        self._selection_timer.stop()
         self._gen += 1            # abandon any in-flight scan
         self._tree_gen += 1
         self._open_gen += 1
@@ -283,7 +295,15 @@ class NifViewerView(QWidget):
         self._mesh_reads.discard_pending()
         self._tex_sources.cancel()
         self._preview.cancel_load()
+        return True
+
+    def _finish(self):
+        if not self._begin_close():
+            return
         self._on_close_cb()
+
+    def tab_closing(self):
+        self._begin_close()
 
     def event(self, e):
         # close_tab deleteLater()s THIS host; the embedded preview never gets
@@ -292,21 +312,30 @@ class NifViewerView(QWidget):
         # deref in QOpenGLTexture's destructor).
         if e.type() == QEvent.DeferredDelete:
             try:
-                self._preview.cancel_load()
+                self._begin_close()
                 self._preview._view.release_gl()
             except Exception:                            # noqa: BLE001
                 pass
         return super().event(e)
 
     # ---- scan -------------------------------------------------------------
-    def _start_scan(self):
+    def _start_scan(self, *, refresh: bool = False):
+        self._selection_timer.stop()
         self._gen += 1
         gen = self._gen
+        self._scanning = True
+        self._tree_gen += 1
+        self._tree_jobs.discard_pending()
+        self._debounce.stop()
+        self._tree.setEnabled(False)
         self._count.setText(self.tr("Scanning…"))
         try:
+            snapshot_hook = getattr(
+                self._ctx, "filegraph_snapshot", None) if self._ctx else None
+            snapshot = snapshot_hook() if callable(snapshot_hook) else None
             self._resolver = _resolver_for(
                 self._staging, self._modlist, self._profile_dir, self._data,
-                self._game)
+                self._game, snapshot=snapshot)
         except Exception as exc:                         # noqa: BLE001
             self._log(f"NIF Viewer: could not build the asset resolver: {exc}")
             self._resolver = None
@@ -315,10 +344,10 @@ class NifViewerView(QWidget):
 
         def worker():
             try:
-                entries = build_catalog(
+                entries = build_catalog_cached(
                     self._resolver, self._staging, self._modlist, self._data,
                     extra_mods=(self._mod,) if self._mod else (),
-                    cancel=lambda: gen != self._gen)
+                    cancel=lambda: gen != self._gen, refresh=refresh)
             except Exception as exc:                     # noqa: BLE001
                 self._log(f"NIF Viewer: scan failed: {exc}")
                 entries = []
@@ -330,12 +359,15 @@ class NifViewerView(QWidget):
         if gen != self._gen:
             return
         self._entries = entries
+        self._scanning = False
         self._rebuild_tree()
 
     # ---- tree -------------------------------------------------------------
     def _rebuild_tree(self):
         """Filter the cached catalogue and rebuild the tree off the UI thread."""
         self._debounce.stop()
+        if self._closing or self._scanning:
+            return
         self._tree_gen += 1
         gen = self._tree_gen
         query = self._search.text().strip().lower()
@@ -356,9 +388,10 @@ class NifViewerView(QWidget):
         self._tree_jobs.submit(worker)
 
     def _on_tree_ready(self, gen: int, root, count: int):
-        if gen != self._tree_gen:
+        if gen != self._tree_gen or self._scanning:
             return
         self._model.set_root(root)
+        self._tree.setEnabled(True)
         self._count.setText(self.tr("{0} meshes").format(f"{count:,}"))
         # A scoped open lands on one mod's handful of meshes: expand so they
         # are on screen instead of hidden under a collapsed 'meshes' root.
@@ -385,7 +418,26 @@ class NifViewerView(QWidget):
         finally:
             QApplication.restoreOverrideCursor()
 
+    def _on_current_changed(self, current, _previous):
+        self._selection_timer.stop()
+        if (self._closing or self._scanning or not current.isValid()
+                or QApplication.mouseButtons() != Qt.NoButton):
+            return
+        node = self._model.node(current)
+        if node is not None and node.payload is not None:
+            self._selection_timer.start()
+
+    def _preview_current(self, *_args):
+        self._selection_timer.stop()
+        if self._closing or self._scanning:
+            return
+        node = self._model.node(self._tree.currentIndex())
+        if (node is not None and node.payload is not None
+                and node.payload != self._current_entry):
+            self._open_entry(node.payload)
+
     def _on_clicked(self, index):
+        self._selection_timer.stop()
         node = self._model.node(index)
         if node is None:
             return
@@ -400,6 +452,7 @@ class NifViewerView(QWidget):
     def _open_entry(self, entry, tex_override=None, keep_view=False,
                     texture_reload=False):
         """Read THIS copy (not the winner) off-thread and hand it to the view."""
+        self._selection_timer.stop()
         self._open_gen += 1
         gen = self._open_gen
         # Same mesh path = a comparison: hold the camera so both versions land
@@ -430,7 +483,8 @@ class NifViewerView(QWidget):
             return
 
         def worker():
-            data = read_entry(entry, self._staging, self._data)
+            data = read_entry(
+                entry, self._staging, self._data, dirs=self._dirs)
             safe_emit(self._mesh_ready, gen, data, entry, (tex_override, keep))
 
         self._mesh_reads.submit(worker)
@@ -453,9 +507,13 @@ class NifViewerView(QWidget):
             # The archive's own folder often holds a sibling '- Textures.ba2'
             # that the resolver cannot see when the mod is not installed.
             try:
-                from Utils.archive_lookup import ArchiveLookup, find_archives
-                archives = ArchiveLookup(find_archives([Path(archive).parent]),
-                                         keep_prefix=ASSET_PREFIXES)
+                from Utils.archives.lookup import ArchiveLookup, find_archives
+                parent = Path(archive).parent
+                archives = self._archive_lookups.get(parent)
+                if archives is None:
+                    archives = ArchiveLookup(
+                        find_archives([parent]), keep_prefix=ASSET_PREFIXES)
+                    self._archive_lookups[parent] = archives
             except Exception:                            # noqa: BLE001
                 archives = None
         # Plugin TXST overrides: the copy's own mod folder first, then the
@@ -496,14 +554,14 @@ def _paths_for(game, profile: str):
     return staging, profile_dir, modlist, data
 
 
-def _resolver_for(staging, modlist, profile_dir, data, game):
+def _resolver_for(staging, modlist, profile_dir, data, game, snapshot=None):
     """One resolver for both the winner flags and the viewport's textures."""
     if staging is None:
         return None
-    from Utils.asset_resolver import AssetResolver
+    from Utils.assets.resolver import AssetResolver
     return AssetResolver(staging_dir=staging, modlist_path=modlist,
                          profile_dir=profile_dir, data_dir=data, game=game,
-                         keep_prefix=BROWSE_PREFIXES)
+                         keep_prefix=BROWSE_PREFIXES, snapshot=snapshot)
 
 
 def _title_for(entry) -> str:

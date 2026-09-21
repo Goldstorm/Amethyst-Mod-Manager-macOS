@@ -31,14 +31,14 @@ appid - the prefix path is user-configurable, with a best-effort search.
 from pathlib import Path
 
 from Games.base_game import BaseGame
-from Utils.deploy import (
+from Utils.deployment import (
     CustomRule, LinkMode, deploy_filemap, deploy_core, move_to_core,
     restore_data_core, deploy_custom_rules, load_per_mod_strip_prefixes,
     load_separator_deploy_paths, expand_separator_deploy_paths,
     expand_separator_link_modes, expand_separator_raw_deploy,
     cleanup_custom_deploy_dirs, restore_custom_rules,
 )
-from Utils.modlist import read_modlist
+from Utils.mods.modlist import read_modlist
 from Utils.config_paths import get_profiles_dir
 
 _PROFILES_DIR = get_profiles_dir()
@@ -134,7 +134,7 @@ class DragonAgeOrigins(BaseGame):
         # normalized into the data-folder layout at install time and deploys
         # via the normal filemap path.
         return [
-            CustomRule(dest="", folders=["bin_ship"], flatten=False),
+            CustomRule(rule_id='dragon_age_origins:05687dde5f05', dest="", folders=["bin_ship"], flatten=False),
         ]
 
     @property
@@ -260,7 +260,8 @@ class DragonAgeOrigins(BaseGame):
 
         deploy_dir.mkdir(parents=True, exist_ok=True)
 
-        if not filemap.is_file():
+        from Utils.filegraph.deploy import input_ready
+        if not input_ready():
             raise RuntimeError(
                 f"filemap.txt not found: {filemap}\n"
                 "Run 'Build Filemap' before deploying."
@@ -277,7 +278,7 @@ class DragonAgeOrigins(BaseGame):
         per_mod_modes = expand_separator_link_modes(_sep_deploy, _sep_entries) or None
         per_mod_raw = expand_separator_raw_deploy(_sep_deploy, _sep_entries) or None
 
-        custom_rules = self.custom_routing_rules
+        custom_rules = self.effective_custom_routing_rules
         custom_exclude: set[str] = set()
         if custom_rules and self._game_path:
             _log("Step 1a: Routing bin_ship/ files to game root ...")
@@ -290,6 +291,7 @@ class DragonAgeOrigins(BaseGame):
                 per_mod_link_modes=per_mod_modes,
                 log_fn=_log,
                 raw_mods=per_mod_raw,
+                prefix_root=self.get_prefix_path(),
             )
             _log(f"  Routed {len(custom_exclude)} file(s) to game root.")
 
@@ -372,19 +374,18 @@ class DragonAgeOrigins(BaseGame):
             )
 
         if self._game_path:
-            custom_rules = self.custom_routing_rules
-            if custom_rules:
-                _log("Restore: removing custom-routed bin_ship/ files ...")
-                restore_custom_rules(
-                    self.get_effective_filemap_path(),
-                    self._game_path,
-                    rules=custom_rules,
-                    log_fn=_log,
-                )
+            _log("Restore: removing custom-routed bin_ship/ files ...")
+            restore_custom_rules(
+                self.get_effective_filemap_path(),
+                self._game_path,
+                rules=[],
+                log_fn=_log,
+                prefix_root=self.get_prefix_path(),
+            )
 
         _profile_dir = self._active_profile_dir
         _entries = read_modlist(_profile_dir / "modlist.txt") if _profile_dir else []
-        cleanup_custom_deploy_dirs(_profile_dir, _entries, log_fn=_log)
+        cleanup_custom_deploy_dirs(_profile_dir, _entries, log_fn=_log, game=self)
 
         # Filemap-driven cleanup. DAO mods deploy as bare, mod-relative paths
         # under the data root (e.g. "50 Tactics Slots/exptable.gda"), so we
@@ -413,6 +414,7 @@ class DragonAgeOrigins(BaseGame):
                 overwrite_dir=overwrite_dir / sub if overwrite_dir else None,
                 index_path=index_path,
                 log_fn=_log,
+                game=self, profile_dir=self._active_profile_dir,
             )
             _log(f"  {sub}: restored {n} vanilla file(s).")
             restored += n
@@ -446,22 +448,18 @@ class DragonAgeOrigins(BaseGame):
         that aren't in the filemap. Returns the count removed.
         """
         _log = log_fn or (lambda _: None)
-        filemap = self.get_effective_filemap_path()
-        if not filemap.is_file():
-            _log("  No filemap found - nothing to remove.")
+        if self._active_profile_dir is None:
+            _log("  No active profile - nothing to remove.")
             return 0
         removed = 0
         try:
-            lines = filemap.read_text(encoding="utf-8").splitlines()
-        except OSError as exc:
-            _log(f"  Warning: could not read filemap: {exc}")
+            from Utils.filegraph.deploy import deployed_paths_below
+            deployed_paths = deployed_paths_below(
+                self, self._active_profile_dir, data_root)
+        except Exception as exc:
+            _log(f"  Warning: could not read deployed catalog state: {exc}")
             return 0
-        for line in lines:
-            if not line.strip():
-                continue
-            rel = line.split("\t", 1)[0].strip()
-            if not rel:
-                continue
+        for rel in deployed_paths:
             target = data_root / rel
             try:
                 if target.is_symlink() or target.is_file():

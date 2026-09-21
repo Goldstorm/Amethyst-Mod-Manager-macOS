@@ -5,9 +5,9 @@ Version). Qt port of the Tk gui/dialogs.py SepSettingsPanel, merged with the
 SepColorPanel colour picker: the separator colour is edited here instead of via a
 separate "Change separator color" menu item.
 
-Persistence is neutral (Utils.profile_state read/write helpers), keyed by the
+Persistence is neutral (Utils.profiles.state read/write helpers), keyed by the
 separator's internal `..._separator` name - the same shape the Tk app writes, so
-existing data round-trips and the deploy pipeline (Utils.deploy_shared) picks the
+existing data round-trips and the deploy pipeline (Utils.deployment.shared) picks the
 paths up unchanged.
 
 on_save(color: str | None, deploy: dict | None) is called on Save:
@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
     QCheckBox, QRadioButton, QButtonGroup, QFrame,
 )
 
-from gui_qt.theme_qt import active_palette, _c, danger_close_button
+from gui_qt.theme_qt import active_palette, _c, close_button
 
 
 def _hline(color: str) -> QFrame:
@@ -90,7 +90,7 @@ class SeparatorSettingsView(QWidget):
         title = QLabel(self.tr("Separator Settings - {0}").format(self._display_name()))
         title.setStyleSheet(f"color:{text_main}; font-weight:bold;")
         tb.addWidget(title, 1)
-        close_btn = danger_close_button(pal=p)
+        close_btn = close_button(pal=p)
         close_btn.clicked.connect(self._on_close)
         tb.addWidget(close_btn)
         root.addWidget(title_bar)
@@ -284,7 +284,7 @@ class SeparatorSettingsView(QWidget):
 
     # ---- deploy handling -------------------------------------------------
     def _on_browse(self):
-        from Utils.portal_filechooser import pick_folder
+        from Utils.ui.portal import pick_folder
         pick_folder("Select deployment directory",
                     lambda chosen: self._folder_picked.emit(chosen))
 

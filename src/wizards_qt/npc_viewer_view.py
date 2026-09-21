@@ -1,8 +1,8 @@
 """View NPCs - browse every NPC with a baked FaceGen head and see the face in 3D.
 
-The mesh side is the NIF Viewer's: Utils.mesh_catalog finds every copy of every
+The mesh side is the NIF Viewer's: Utils.assets.catalog finds every copy of every
 FaceGeom head and flags the one the game loads, and gui_qt.nif_preview renders
-it. What this adds is IDENTITY - Utils.npc_catalog joins those meshes to their
+it. What this adds is IDENTITY - Utils.npc.catalog joins those meshes to their
 NPC_ records, so the list reads "Nazeem" rather than "00013BBF.nif", and a
 contested head shows which overhaul actually wins.
 
@@ -19,8 +19,8 @@ from typing import TYPE_CHECKING
 from PySide6.QtCore import QEvent, Qt, QTimer, Signal
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QComboBox, QLabel, QLineEdit, QPushButton,
-    QSizePolicy, QSplitter, QTreeView, QVBoxLayout, QWidget,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QLabel, QLineEdit,
+    QPushButton, QSizePolicy, QSplitter, QTreeView, QVBoxLayout, QWidget,
 )
 
 from gui_qt.eliding_label import ElidingLabel
@@ -30,12 +30,13 @@ from gui_qt.nif_preview import ASSET_PREFIXES, NifPreview
 from gui_qt.nif_texture_sources import TextureSourceController
 from gui_qt.path_tree import Node, PathTreeDelegate, PathTreeModel
 from gui_qt.safe_emit import safe_emit
-from gui_qt.theme_qt import active_palette, button_qss, _c
+from gui_qt.theme_qt import active_palette, button_qss, close_button, _c
 from gui_qt.worker import LatestWorker
-from Utils.mesh_catalog import (
+from Utils.assets.resolver import DirCache
+from Utils.assets.catalog import (
     DATA_ARCHIVE, DATA_LOOSE, MOD_ARCHIVE, MOD_LOOSE, read_entry,
 )
-from Utils.npc_catalog import build_npc_catalog, npc_label
+from Utils.npc.catalog import build_npc_catalog, npc_label
 
 if TYPE_CHECKING:
     from Games.base_game import BaseGame
@@ -83,8 +84,10 @@ class NpcViewerView(QWidget):
         self._gen = 0
         self._list_gen = 0
         self._open_gen = 0
+        self._scanning = False
         self._npcs: list = []
         self._resolver = None
+        self._dirs = DirCache()
         self._records = None
         self._records_gen = -1
         # The catalogue worker preloads the complete record stack while the
@@ -95,6 +98,7 @@ class NpcViewerView(QWidget):
         self._mod_archives: dict = {}
         self._archive_mod_list = None
         self._archive_owner: dict = {}
+        self._entry_archive_lookups: dict = {}
         self._current = None
         self._current_data = None
         self._pending_export = None
@@ -202,9 +206,7 @@ class NpcViewerView(QWidget):
         self._refresh_btn.clicked.connect(self._refresh)
         hb.addWidget(self._refresh_btn)
 
-        close = QPushButton(self.tr("✕ Close"))
-        close.setCursor(Qt.PointingHandCursor)
-        close.setStyleSheet(button_qss("BTN_DANGER", pal=pal, padding="5px 12px"))
+        close = close_button(self.tr("✕ Close"), pal=pal)
         close.clicked.connect(self._finish)
         hb.addWidget(close)
         v.addWidget(bar)
@@ -266,6 +268,13 @@ class NpcViewerView(QWidget):
         self._debounce.setInterval(250)
         self._debounce.timeout.connect(self._rebuild_list)
 
+        self._selection_timer = QTimer(self)
+        self._selection_timer.setSingleShot(True)
+        self._selection_timer.setInterval(150)
+        self._selection_timer.timeout.connect(self._preview_current)
+        self._tree.selectionModel().currentChanged.connect(self._on_current_changed)
+        self._tree.activated.connect(self._preview_current)
+
         # Keep feedback's delayed reset inside this widget's lifetime.  A
         # static QTimer.singleShot retains its Python callback after a tab has
         # deleteLater()d the view, at which point touching _save_btn raises
@@ -303,19 +312,21 @@ class NpcViewerView(QWidget):
         self._mod_archives = {}
         self._archive_mod_list = None
         self._archive_owner = {}
+        self._entry_archive_lookups.clear()
         self._current_data = None
+        self._dirs = DirCache()
         # Who was on screen, so the refresh lands back on them rather than
         # dumping the user at the top of a 4000-row list. Kept by IDENTITY,
         # not by entry: the mod providing the winning face may have changed,
         # which is the whole reason for refreshing.
-        self._restore = ((self._current.plugin, self._current.formid)
-                         if self._current is not None else None)
+        if self._current is not None:
+            self._restore = (self._current.plugin, self._current.formid)
         self._current = None
         # In-flight reads belong to the old profile state.
         self._open_gen += 1
         self._mesh_reads.discard_pending()
         self._tex_sources.cancel()
-        self._preview.cancel_load()
+        self._preview.clear(self.tr("Scanning…"))
         self._portrait.hide()
         self._save_btn.setEnabled(False)
         self._log("View NPCs: refreshing from the profile…")
@@ -346,6 +357,7 @@ class NpcViewerView(QWidget):
         if self._closing:
             return False
         self._closing = True
+        self._selection_timer.stop()
         timer = getattr(self, "_save_feedback_timer", None)
         if timer is not None:
             timer.stop()
@@ -383,13 +395,22 @@ class NpcViewerView(QWidget):
 
     # ---- scan -------------------------------------------------------------
     def _start_scan(self):
+        self._selection_timer.stop()
         self._gen += 1
         gen = self._gen
+        self._scanning = True
+        self._list_gen += 1
+        self._list_jobs.discard_pending()
+        self._debounce.stop()
+        self._tree.setEnabled(False)
         self._count.setText(self.tr("Scanning…"))
         try:
+            snapshot_hook = getattr(
+                self._ctx, "filegraph_snapshot", None) if self._ctx else None
+            snapshot = snapshot_hook() if callable(snapshot_hook) else None
             self._resolver = _resolver_for(
                 self._staging, self._modlist, self._profile_dir, self._data,
-                self._game)
+                self._game, snapshot=snapshot)
         except Exception as exc:                         # noqa: BLE001
             self._log(f"View NPCs: could not build the asset resolver: {exc}")
             self._resolver = None
@@ -427,12 +448,15 @@ class NpcViewerView(QWidget):
         if gen != self._gen:
             return
         self._npcs = npcs
+        self._scanning = False
         self._rebuild_list()
 
     # ---- list -------------------------------------------------------------
     def _rebuild_list(self):
         """Filter the cached catalogue and rebuild the list off the UI thread."""
         self._debounce.stop()
+        if self._closing or self._scanning:
+            return
         self._list_gen += 1
         gen = self._list_gen
         query = self._search.text().strip().lower()
@@ -453,14 +477,34 @@ class NpcViewerView(QWidget):
         self._list_jobs.submit(worker)
 
     def _on_list_ready(self, gen: int, root, count: int):
-        if gen != self._list_gen:
+        if gen != self._list_gen or self._scanning:
             return
         self._model.set_root(root)
+        self._tree.setEnabled(True)
         self._count.setText(self.tr("{0} NPCs").format(f"{count:,}"))
         if self._restore is not None:
             self._restore_selection()
 
+    def _on_current_changed(self, current, _previous):
+        self._selection_timer.stop()
+        if (self._closing or self._scanning or not current.isValid()
+                or QApplication.mouseButtons() != Qt.NoButton):
+            return
+        node = self._model.node(current)
+        if node is not None and node.payload is not None:
+            self._selection_timer.start()
+
+    def _preview_current(self, *_args):
+        self._selection_timer.stop()
+        if self._closing or self._scanning:
+            return
+        node = self._model.node(self._tree.currentIndex())
+        if (node is not None and node.payload is not None
+                and node.payload != self._current):
+            self._open_npc(node.payload)
+
     def _on_clicked(self, index):
+        self._selection_timer.stop()
         node = self._model.node(index)
         if node is None:
             return
@@ -475,6 +519,7 @@ class NpcViewerView(QWidget):
     def _open_npc(self, npc, tex_override=None, keep_view=False,
                   texture_reload=False):
         """Read THIS copy of the head off-thread and hand it to the viewport."""
+        self._selection_timer.stop()
         self._open_gen += 1
         gen = self._open_gen
         previous = self._current
@@ -509,7 +554,8 @@ class NpcViewerView(QWidget):
         outfit = self._outfit.isChecked()
 
         def worker():
-            data = read_entry(entry, self._staging, self._data)
+            data = read_entry(
+                entry, self._staging, self._data, dirs=self._dirs)
             # FO4 can override a face entirely through NPC_/HDPT records, with
             # no replacement FaceGeom file.  Appearance therefore has to be
             # resolved even for the head-only view.
@@ -592,7 +638,7 @@ class NpcViewerView(QWidget):
         self._log(f"View NPCs: captured {image.width()}x{image.height()}")
         self._pending_export = image
         self._save_btn.setText(self.tr("Choose location…"))
-        from Utils.portal_filechooser import pick_save_file
+        from Utils.ui.portal import pick_save_file
         pick_save_file(
             self.tr("Save NPC image"),
             lambda path: safe_emit(self._save_path_picked, path),
@@ -659,11 +705,21 @@ class NpcViewerView(QWidget):
         """
         with self._records_lock:
             if self._records is None or self._records_gen != self._gen:
-                from Utils.npc_body import load_order_records
+                from Utils.npc.body import load_order_records
                 gen = self._gen
+                plugin_paths = None
+                try:
+                    from Utils.filegraph.service import plugin_source_paths
+                    indexed = plugin_source_paths(
+                        getattr(self._resolver, "snapshot", None), self._game)
+                    if indexed:
+                        plugin_paths = indexed
+                except Exception:                        # noqa: BLE001
+                    pass
                 records = load_order_records(
                     self._profile_dir, self._staging, self._data,
-                    cancel=lambda: gen != self._gen) or []
+                    cancel=lambda: gen != self._gen,
+                    plugin_paths=plugin_paths) or []
                 # A refresh can invalidate the profile while the background
                 # parse is running. Never publish that old stack into the new
                 # generation; its warm-up will acquire this lock next.
@@ -688,7 +744,7 @@ class NpcViewerView(QWidget):
         """
         if self._staging is None:
             return None
-        from Utils.archive_lookup import ArchiveLookup, find_archives
+        from Utils.archives.lookup import ArchiveLookup, find_archives
         for mod in self._archive_mods():
             look = self._mod_archives.get(mod)
             if look is None:
@@ -716,7 +772,7 @@ class NpcViewerView(QWidget):
         if self._archive_mod_list is None:
             mods = []
             try:
-                from Utils.modlist import read_modlist
+                from Utils.mods.modlist import read_modlist
                 for e in read_modlist(Path(self._modlist)):
                     if e.is_separator or not e.enabled:
                         continue
@@ -758,7 +814,7 @@ class NpcViewerView(QWidget):
     def _read_body(self, npc, outfit: bool = True, whole: bool = True):
         """Resolve runtime face changes and optional body off the UI thread."""
         try:
-            from Utils.npc_body import resolve_body, resolve_face, scope_records
+            from Utils.npc.body import resolve_body, resolve_face, scope_records
             all_records = self._body_records()
             if not all_records:
                 return None
@@ -831,6 +887,8 @@ class NpcViewerView(QWidget):
                         low_rel = part.rel[:-6] + "_0.nif"
                         low_blob = (self._resolver.read(low_rel)
                                     if self._resolver else None)
+                        if not low_blob:
+                            low_blob = self._from_mod_archives(low_rel)
                     parts.append((blob, part.rel, part.attach,
                                   low_blob, weight, part.textures,
                                   self._part_plugin_dirs(part.rel)))
@@ -840,6 +898,8 @@ class NpcViewerView(QWidget):
             skeleton = None
             for rel in got["skeleton"]:
                 skeleton = self._resolver.read(rel) if self._resolver else None
+                if not skeleton:
+                    skeleton = self._from_mod_archives(rel)
                 if skeleton:
                     break
             if not skeleton:
@@ -870,7 +930,8 @@ class NpcViewerView(QWidget):
         # reload path can pass the complete three-part payload back here.
         self._current_data = (npc, data, body)
         entry = npc.entry
-        archives = _entry_archives(entry, self._staging)
+        archives = _entry_archives(
+            entry, self._staging, self._entry_archive_lookups)
         # Hair colour and TXST overrides both need the plugins: the face's own
         # mod first, then the data folder holding the masters.
         dirs = []
@@ -921,7 +982,7 @@ class NpcViewerView(QWidget):
 
 # ---- helpers ---------------------------------------------------------------
 
-def _entry_archives(entry, staging):
+def _entry_archives(entry, staging, cache=None):
     """Archives to search beside a head's own copy, or None.
 
     A replacer commonly ships a LOOSE FaceGeom head plus a private BSA of its
@@ -931,7 +992,7 @@ def _entry_archives(entry, staging):
     way - a '- Textures.ba2' next to it is invisible to the resolver when the
     mod is not installed.
     """
-    from Utils.archive_lookup import ArchiveLookup, find_archives
+    from Utils.archives.lookup import ArchiveLookup, find_archives
     root = None
     if getattr(entry, "mod", "") and staging is not None:
         root = Path(staging) / entry.mod
@@ -939,10 +1000,15 @@ def _entry_archives(entry, staging):
         root = Path(entry.archive).parent
     if root is None:
         return None
+    if cache is not None and root in cache:
+        return cache[root]
     try:
-        return ArchiveLookup(find_archives([root]), keep_prefix=ASSET_PREFIXES)
+        lookup = ArchiveLookup(find_archives([root]), keep_prefix=ASSET_PREFIXES)
     except Exception:                                    # noqa: BLE001
-        return None
+        lookup = None
+    if cache is not None:
+        cache[root] = lookup
+    return lookup
 
 
 def _load_options(load_opts):
@@ -966,7 +1032,7 @@ def _string_languages_for(game) -> tuple[str, ...]:
     return "english", "en"
 
 
-def _resolver_for(staging, modlist, profile_dir, data, game):
+def _resolver_for(staging, modlist, profile_dir, data, game, snapshot=None):
     """One resolver for both the winner flags and the viewport's textures.
 
     Built with the FaceGeom prefix in keep_prefix from the start - the NIF
@@ -974,10 +1040,10 @@ def _resolver_for(staging, modlist, profile_dir, data, game):
     """
     if staging is None:
         return None
-    from Utils.asset_resolver import AssetResolver
+    from Utils.assets.resolver import AssetResolver
     return AssetResolver(staging_dir=staging, modlist_path=modlist,
                          profile_dir=profile_dir, data_dir=data, game=game,
-                         keep_prefix=BROWSE_PREFIXES)
+                         keep_prefix=BROWSE_PREFIXES, snapshot=snapshot)
 
 
 def _title_for(npc) -> str:

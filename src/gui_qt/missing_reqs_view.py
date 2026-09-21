@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
     QScrollArea, QFrame,
 )
 
-from gui_qt.theme_qt import active_palette, _c, danger_close_button, button_qss
+from gui_qt.theme_qt import active_palette, _c, close_button, button_qss
 from gui_qt.safe_emit import safe_emit
 
 
@@ -117,7 +117,7 @@ class _ReqCard(QFrame):
 
     def _install_label(self) -> str:
         """Install, or Download while 'Download only' is on."""
-        from Utils.ui_config import load_download_only
+        from Utils.ui.config import load_download_only
         try:
             dl_only = bool(load_download_only())
         except Exception:
@@ -190,7 +190,7 @@ class MissingReqsView(QWidget):
         self._ignore_cb.toggled.connect(self._on_ignore_toggled)
         hb.addWidget(self._ignore_cb)
 
-        close = danger_close_button(pal=p)
+        close = close_button(pal=p)
         close.clicked.connect(lambda: self._on_close())
         hb.addWidget(close)
         v.addWidget(bar)
@@ -377,7 +377,7 @@ class MissingReqsView(QWidget):
         if not url:
             return
         try:
-            from Utils.xdg import open_url
+            from Utils.environment.xdg import open_url
             open_url(url)
         except Exception:
             pass

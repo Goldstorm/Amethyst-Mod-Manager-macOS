@@ -157,7 +157,7 @@ class ProtonRunner(WineRunner):
         host_cwd: str | Path | None = None,
         verb: str = "runinprefix",
     ) -> list[str]:
-        from Utils.steam_finder import proton_run_command, find_any_installed_proton
+        from Utils.launchers.steam import proton_run_command, find_any_installed_proton
 
         proton_script = find_any_installed_proton()
         if proton_script is None:
@@ -186,7 +186,7 @@ class ProtonRunner(WineRunner):
         value_type: str = "REG_SZ",
         env: dict | None = None,
     ) -> list[str]:
-        from Utils.steam_finder import proton_run_command, find_any_installed_proton
+        from Utils.launchers.steam import proton_run_command, find_any_installed_proton
 
         proton_script = find_any_installed_proton()
         if proton_script is None:
@@ -204,11 +204,11 @@ class ProtonRunner(WineRunner):
         return proton_run_command(proton_script, *cmd_args, env=run_env)
 
     def find_wine_binary(self) -> Path | None:
-        from Utils.steam_finder import find_any_installed_proton
+        from Utils.launchers.steam import find_any_installed_proton
         return find_any_installed_proton()
 
     def list_available_versions(self) -> list[str]:
-        from Utils.steam_finder import list_installed_proton
+        from Utils.launchers.steam import list_installed_proton
         return [s.parent.name for s in list_installed_proton()]
 
     def install_dependency(
@@ -219,9 +219,9 @@ class ProtonRunner(WineRunner):
         env: dict | None = None,
     ) -> bool:
         """Install a dependency using protontricks infrastructure."""
-        from Utils.protontricks import is_dep_installed, install_winetricks_verb
-        from Utils.protontricks import D3D_DEP_KEY, VCREDIST_DEP_KEY
-        from Utils.protontricks import install_d3dcompiler_47, install_vcredist
+        from Utils.wine.protontricks import is_dep_installed, install_winetricks_verb
+        from Utils.wine.protontricks import D3D_DEP_KEY, VCREDIST_DEP_KEY
+        from Utils.wine.protontricks import install_d3dcompiler_47, install_vcredist
 
         if is_dep_installed(prefix, component):
             return True
@@ -576,12 +576,12 @@ class LutrisRunner(WineRunner):
         return cmd
 
     def find_wine_binary(self) -> Path | None:
-        from Utils.lutris_finder import find_lutris_wine_for_prefix
+        from Utils.launchers.lutris import find_lutris_wine_for_prefix
         prefix = self._prefix_path
         if prefix:
             return find_lutris_wine_for_prefix(prefix)
         # Try to find any lutris wine
-        from Utils.lutris_finder import find_lutris_roots
+        from Utils.launchers.lutris import find_lutris_roots
         for root in find_lutris_roots():
             wine_dir = root.data_dir / "wine"
             if wine_dir.is_dir():
@@ -594,7 +594,7 @@ class LutrisRunner(WineRunner):
         return None
 
     def list_available_versions(self) -> list[str]:
-        from Utils.lutris_finder import find_lutris_roots
+        from Utils.launchers.lutris import find_lutris_roots
         versions: list[str] = []
         for root in find_lutris_roots():
             wine_dir = root.data_dir / "wine"
@@ -677,7 +677,7 @@ class HeroicRunner(WineRunner):
         run_env["WINEPREFIX"] = str(prefix)
 
         # Heroic uses Proton scripts, so go through proton_run_command
-        from Utils.steam_finder import proton_run_command
+        from Utils.launchers.steam import proton_run_command
         return proton_run_command(
             proton_script,
             "runinprefix",
@@ -703,7 +703,7 @@ class HeroicRunner(WineRunner):
         run_env = env.copy() if env else {}
         run_env["WINEPREFIX"] = str(prefix)
 
-        from Utils.steam_finder import proton_run_command
+        from Utils.launchers.steam import proton_run_command
         cmd_args = ["runinprefix", "reg", "add", key]
         if value_name:
             cmd_args.extend(["/v", value_name])
@@ -711,16 +711,16 @@ class HeroicRunner(WineRunner):
         return proton_run_command(proton_script, *cmd_args, env=run_env)
 
     def find_wine_binary(self) -> Path | None:
-        from Utils.heroic_finder import find_heroic_proton_for_prefix
+        from Utils.launchers.heroic import find_heroic_proton_for_prefix
         prefix = self._prefix_path
         if prefix:
             return find_heroic_proton_for_prefix(prefix)
-        from Utils.heroic_finder import list_heroic_proton_scripts
+        from Utils.launchers.heroic import list_heroic_proton_scripts
         scripts = list_heroic_proton_scripts()
         return scripts[0] if scripts else None
 
     def list_available_versions(self) -> list[str]:
-        from Utils.heroic_finder import list_heroic_proton_scripts
+        from Utils.launchers.heroic import list_heroic_proton_scripts
         return [s.parent.name for s in list_heroic_proton_scripts()]
 
     def install_dependency(
@@ -731,9 +731,9 @@ class HeroicRunner(WineRunner):
         env: dict | None = None,
     ) -> bool:
         """Install a dependency using winetricks via Heroic's Wine."""
-        from Utils.protontricks import is_dep_installed, install_winetricks_verb
-        from Utils.protontricks import D3D_DEP_KEY, VCREDIST_DEP_KEY
-        from Utils.protontricks import install_d3dcompiler_47, install_vcredist
+        from Utils.wine.protontricks import is_dep_installed, install_winetricks_verb
+        from Utils.wine.protontricks import D3D_DEP_KEY, VCREDIST_DEP_KEY
+        from Utils.wine.protontricks import install_d3dcompiler_47, install_vcredist
 
         if is_dep_installed(prefix, component):
             return True
@@ -776,19 +776,19 @@ def get_runner(launcher_type: str | None = None) -> WineRunner:
         return SystemWineRunner()
     else:
         # Linux: try Proton first, then Lutris, then Heroic, then system Wine
-        from Utils.steam_finder import steam_client_installed, list_installed_proton
+        from Utils.launchers.steam import steam_client_installed, list_installed_proton
         if list_installed_proton():
             return ProtonRunner()
         # Check Lutris
         try:
-            from Utils.lutris_finder import find_lutris_roots
+            from Utils.launchers.lutris import find_lutris_roots
             if find_lutris_roots():
                 return LutrisRunner()
         except Exception:
             pass
         # Check Heroic
         try:
-            from Utils.heroic_finder import list_heroic_proton_scripts
+            from Utils.launchers.heroic import list_heroic_proton_scripts
             if list_heroic_proton_scripts():
                 return HeroicRunner()
         except Exception:
@@ -805,17 +805,17 @@ def get_default_runner_type() -> str:
             return "crossover"
         return "system_wine"
     else:
-        from Utils.steam_finder import list_installed_proton
+        from Utils.launchers.steam import list_installed_proton
         if list_installed_proton():
             return "proton"
         try:
-            from Utils.lutris_finder import find_lutris_roots
+            from Utils.launchers.lutris import find_lutris_roots
             if find_lutris_roots():
                 return "lutris"
         except Exception:
             pass
         try:
-            from Utils.heroic_finder import list_heroic_proton_scripts
+            from Utils.launchers.heroic import list_heroic_proton_scripts
             if list_heroic_proton_scripts():
                 return "heroic"
         except Exception:

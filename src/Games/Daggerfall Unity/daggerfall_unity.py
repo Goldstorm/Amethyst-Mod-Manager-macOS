@@ -46,7 +46,7 @@ from pathlib import Path
 
 from Games.base_game import BaseGame
 from Utils.vfs import ProfileVFSGameMixin
-from Utils.deploy import (
+from Utils.deployment import (
     LinkMode,
     cleanup_custom_deploy_dirs,
     deploy_core,
@@ -59,7 +59,7 @@ from Utils.deploy import (
     restore_custom_rules,
     restore_data_core,
 )
-from Utils.modlist import read_modlist
+from Utils.mods.modlist import read_modlist
 from Utils.config_paths import get_profiles_dir
 
 _PROFILES_DIR = get_profiles_dir()
@@ -327,8 +327,8 @@ class DaggerfallUnity(ProfileVFSGameMixin, BaseGame):
 
     @property
     def custom_routing_rules(self) -> list:
-        from Utils.deploy import CustomRule
-        return [CustomRule(dest=f"{_DATA_DIR}/{_MANAGED}",
+        from Utils.deployment import CustomRule
+        return [CustomRule(rule_id='daggerfall_unity:74b1991261fa', dest=f"{_DATA_DIR}/{_MANAGED}",
                            extensions=[".dll"], flatten=True)]
 
     @property
@@ -634,15 +634,8 @@ class DaggerfallUnity(ProfileVFSGameMixin, BaseGame):
                              if (parent / name).is_symlink()]
                 for name in (*link_dirs, *filenames):
                     excluded.add((parent / name).relative_to(overwrite).as_posix())
-        try:
-            lines = filemap.read_text(
-                encoding="utf-8", errors="surrogateescape").splitlines()
-        except OSError:
-            return excluded
-        for line in lines:
-            if "\t" not in line:
-                continue
-            relative, owner = line.split("\t", 1)
+        from Utils.filegraph.deploy import legacy_rows
+        for relative, owner in legacy_rows():
             normalized = relative.replace("\\", "/")
             if owner == "[Overwrite]" and normalized.casefold().startswith(prefix):
                 excluded.add(normalized)
@@ -925,7 +918,8 @@ class DaggerfallUnity(ProfileVFSGameMixin, BaseGame):
                 f"'{_DATA_DIR}' not found in {self._game_path} - the game path "
                 "must be the folder containing DaggerfallUnity.x86_64."
             )
-        if not filemap.is_file():
+        from Utils.filegraph.deploy import input_ready
+        if not input_ready():
             raise RuntimeError(
                 f"filemap.txt not found: {filemap}\n"
                 "Run 'Build Filemap' before deploying."
@@ -971,12 +965,13 @@ class DaggerfallUnity(ProfileVFSGameMixin, BaseGame):
         _log(f"Step 1b: Routing managed assemblies into {_MANAGED}/ ...")
         custom_exclude = deploy_custom_rules(
             filemap, self._game_path, staging,
-            rules=self.custom_routing_rules,
+            rules=self.effective_custom_routing_rules,
             mode=mode,
             strip_prefixes=self.mod_folder_strip_prefixes,
             per_mod_strip_prefixes=per_mod_strip,
             log_fn=_log,
             progress_fn=progress_fn,
+            prefix_root=self.get_prefix_path(),
         )
 
         _log(f"Step 2: Transferring mod files into {data_dir} ({mode.name}) ...")
@@ -1029,7 +1024,7 @@ class DaggerfallUnity(ProfileVFSGameMixin, BaseGame):
 
         _profile_dir = self._active_profile_dir
         _entries = read_modlist(_profile_dir / "modlist.txt") if _profile_dir else []
-        cleanup_custom_deploy_dirs(_profile_dir, _entries, log_fn=_log)
+        cleanup_custom_deploy_dirs(_profile_dir, _entries, log_fn=_log, game=self)
 
         # Managed assemblies live outside StreamingAssets/, so the _Core swap
         # below never touches them.  A VFS deploy routes them inside its private
@@ -1040,8 +1035,9 @@ class DaggerfallUnity(ProfileVFSGameMixin, BaseGame):
         restore_custom_rules(
             self.get_effective_filemap_path(),
             self._game_path,
-            rules=self.custom_routing_rules,
+            rules=[],
             log_fn=_log,
+            prefix_root=self.get_prefix_path(),
         )
 
         _mj = _mods_json()
@@ -1110,6 +1106,7 @@ class DaggerfallUnity(ProfileVFSGameMixin, BaseGame):
                 staging_root=self.get_effective_mod_staging_path(),
                 strip_prefixes=self.mod_folder_strip_prefixes,
                 log_fn=_log,
+                game=self, profile_dir=self._active_profile_dir,
             )
             _log(f"  Restored {restored} file(s). {core}/ removed.")
         else:

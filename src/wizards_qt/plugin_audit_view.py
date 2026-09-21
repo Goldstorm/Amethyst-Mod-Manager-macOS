@@ -6,7 +6,7 @@ A modlist-panel-scoped tab, three pages:
      records / blocked by dependents) with a checkbox + columns; actions:
      Re-Scan, Select All Safe, Disable Selected, Clean Orphaned INIs.
   3. Cleanup result - summary + Re-Scan.
-The scan/disable/cleanup logic lives in Utils/plugin_audit_core.py.
+The scan/disable/cleanup logic lives in Utils/plugins/audit.py.
 """
 
 from __future__ import annotations
@@ -21,9 +21,9 @@ from PySide6.QtWidgets import (
 )
 
 from gui_qt.safe_emit import safe_emit
-from gui_qt.theme_qt import active_palette, _c
+from gui_qt.theme_qt import active_palette, close_button, _c
 from wizards_qt._view_base import GREEN, RED, WizardViewBase
-import Utils.plugin_audit_core as core
+import Utils.plugins.audit as core
 
 if TYPE_CHECKING:
     from Games.base_game import BaseGame
@@ -286,8 +286,7 @@ class PluginAuditView(WizardViewBase):
         rescan = self._accent_btn(self.tr("Re-Scan to Verify"))
         rescan.clicked.connect(lambda: self._stack.setCurrentIndex(_PG_SCAN))
         lay.addWidget(rescan, 0, Qt.AlignHCenter)
-        close = self._green_btn(self.tr("Close"))
-        close.setEnabled(True)
+        close = close_button(self.tr("Close"))
         close.clicked.connect(self._finish)
         lay.addWidget(close, 0, Qt.AlignHCenter)
         return page

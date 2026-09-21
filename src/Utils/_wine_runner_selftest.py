@@ -245,7 +245,7 @@ def test_heroic_run_in_prefix_command() -> None:
 
     with mock.patch.object(runner, "find_wine_binary", return_value=fake_script):
         with mock.patch(
-            "Utils.steam_finder.proton_run_command",
+            "Utils.launchers.steam.proton_run_command",
             return_value=["python3", str(fake_script), "runinprefix", "/game.exe"],
         ):
             cmd = runner.run_in_prefix(
@@ -472,10 +472,10 @@ def test_proton_run_in_prefix_uses_proton_run_command() -> None:
     fake_script = Path("/steam/compatibilitytools.d/Proton/proton")
 
     with mock.patch(
-        "Utils.steam_finder.find_any_installed_proton",
+        "Utils.launchers.steam.find_any_installed_proton",
         return_value=fake_script,
     ), mock.patch(
-        "Utils.steam_finder.proton_run_command",
+        "Utils.launchers.steam.proton_run_command",
         return_value=["python3", str(fake_script), "runinprefix", "/game.exe"],
     ) as mock_proton:
         cmd = runner.run_in_prefix(
@@ -496,7 +496,7 @@ def test_proton_run_in_prefix_no_proton() -> None:
     runner = ProtonRunner()
 
     with mock.patch(
-        "Utils.steam_finder.find_any_installed_proton",
+        "Utils.launchers.steam.find_any_installed_proton",
         return_value=None,
     ):
         cmd = runner.run_in_prefix(

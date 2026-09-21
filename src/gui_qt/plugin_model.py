@@ -1,7 +1,7 @@
 """Plugin-tab model - QAbstractTableModel over PluginRow list.
 
-Columns: Plugin Name, Flags, Lock, Index (checkbox painted into col 0 by the
-delegate). Toggling enable writes back to plugins.txt via plugin_state.save.
+Columns: Plugin Name, Flags, Lock, Priority, Index (checkbox painted into col 0
+by the delegate). Toggling enable writes back via plugin_state.save.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from PySide6.QtCore import (
 from gui_qt.plugin_state import (
     PluginRow, save_plugins, compute_game_indexes,
     enforce_master_block, master_block_enabled, plugin_rank,
-    movable_bounds, dependency_bounds,
+    movable_bounds, dependency_bounds, PF_MISSING,
 )
 
 COL_NAME = 0
@@ -39,6 +39,7 @@ _COL_TR = (
 RowRole = Qt.UserRole + 1      # the PluginRow
 PFlagsRole = Qt.UserRole + 2   # int flag bitmask
 PHighlightRole = Qt.UserRole + 3  # 0 none, 3 master(green), 2 anchor(orange), 1 higher, -1 lower
+_ITEM_FLAGS = Qt.ItemIsEnabled | Qt.ItemIsSelectable
 
 
 class PluginModel(QAbstractTableModel):
@@ -48,6 +49,8 @@ class PluginModel(QAbstractTableModel):
     order_changed = Signal()
     # plugins.txt write failed - the window surfaces a toast.
     save_failed = Signal(str)
+    # A toggle changed whether a missing-masters warning is visible.
+    missing_flags_changed = Signal()
 
     def __init__(self, rows: list[PluginRow] | None = None):
         super().__init__()
@@ -90,7 +93,7 @@ class PluginModel(QAbstractTableModel):
         self._rows = self._derive_display()
         if profile_dir is not None:
             try:
-                from Utils.profile_state import read_plugin_locks
+                from Utils.profiles.state import read_plugin_locks
                 self._locks = read_plugin_locks(profile_dir) or {}
             except Exception:
                 self._locks = {}
@@ -226,7 +229,7 @@ class PluginModel(QAbstractTableModel):
         self.dataChanged.emit(idx, idx, [])
         if self._profile_dir is not None:
             try:
-                from Utils.profile_state import write_plugin_locks
+                from Utils.profiles.state import write_plugin_locks
                 write_plugin_locks(self._profile_dir, self._locks)
             except Exception as exc:
                 print(f"[gui_qt] plugin locks save failed: {exc}", flush=True)
@@ -287,20 +290,24 @@ class PluginModel(QAbstractTableModel):
     def flags(self, index):
         if not index.isValid():
             return Qt.NoItemFlags
-        return Qt.ItemIsEnabled | Qt.ItemIsSelectable
+        return _ITEM_FLAGS
 
     def toggle(self, i: int):
         r = self._rows[i]
         if r.vanilla:
             return   # vanilla plugins are always-on; can't be disabled
         r.enabled = not r.enabled
+        missing_changed = self._sync_missing_flag(r)
         # Whole row: enabled state dims the text in every column.
         self.dataChanged.emit(self.index(i, 0),
                               self.index(i, len(COLUMNS) - 1),
-                              [RowRole, Qt.DisplayRole])
+                              [RowRole, PFlagsRole, Qt.DisplayRole])
         # Disabling/enabling a plugin renumbers every following plugin's game
         # index, so refresh the whole column (not just this row).
         self._refresh_game_indexes()
+        if missing_changed:
+            self.flags_changed()
+            self.missing_flags_changed.emit()
         self._save()
 
     def set_enabled(self, indices, enabled: bool):
@@ -310,14 +317,29 @@ class PluginModel(QAbstractTableModel):
                    if 0 <= i < len(self._rows) and not self._rows[i].vanilla]
         if not changed:
             return
+        missing_changed = False
         for i in changed:
-            self._rows[i].enabled = enabled
+            row = self._rows[i]
+            row.enabled = enabled
+            missing_changed |= self._sync_missing_flag(row)
         lo, hi = min(changed), max(changed)
         self.dataChanged.emit(self.index(lo, 0),
                               self.index(hi, len(COLUMNS) - 1),
-                              [RowRole, Qt.DisplayRole])
+                              [RowRole, PFlagsRole, Qt.DisplayRole])
         self._refresh_game_indexes()
+        if missing_changed:
+            self.flags_changed()
+            self.missing_flags_changed.emit()
         self._save()
+
+    @staticmethod
+    def _sync_missing_flag(row: PluginRow) -> bool:
+        before = bool(row.flags & PF_MISSING)
+        if row.enabled and row.missing_masters:
+            row.flags |= PF_MISSING
+        else:
+            row.flags &= ~PF_MISSING
+        return before != bool(row.flags & PF_MISSING)
 
     def is_movable(self, i: int) -> bool:
         """A row may be dragged unless it's vanilla (pinned) or user-locked."""
@@ -335,13 +357,15 @@ class PluginModel(QAbstractTableModel):
             i += 1
         return i
 
-    def _clamp_dest(self, src: list[int], dest: int) -> int:
+    def _clamp_dest(self, src: list[int], dest: int,
+                    rows: list[PluginRow] | None = None) -> int:
         """Clamp an insert-before *dest* for the contiguous block *src*."""
         # Works on the "rest" list (rows minus the block) so every bound is a
         # plain insertion point. MO2's order: rank region, then dependencies.
+        rows = self._rows if rows is None else rows
         first, last = src[0], src[-1]
-        block = self._rows[first:last + 1]
-        rest = self._rows[:first] + self._rows[last + 1:]
+        block = rows[first:last + 1]
+        rest = rows[:first] + rows[last + 1:]
         d = dest if dest <= first else dest - len(block)
         d = max(0, min(d, len(rest)))
         ranks = {plugin_rank(r) for r in block}
@@ -412,6 +436,37 @@ class PluginModel(QAbstractTableModel):
             self._rows[insert_at:insert_at] = block
             self.endMoveRows()
         self._refresh_game_indexes()
+        self._save()
+        return True
+
+    def set_priority(self, row: int, priority: int) -> bool:
+        """Move one plugin to a constrained natural-order priority."""
+        if not self.is_movable(row):
+            return False
+        plugin = self._rows[row]
+        src = self.natural_index(plugin.name)
+        if src < 0:
+            return False
+        target = max(0, min(len(self._natural) - 1, priority))
+        if target == src:
+            return False
+        dest = target if target < src else target + 1
+        if self.display_is_natural:
+            return self.move_rows([src], dest)
+
+        insert_at = self._clamp_dest([src], dest, self._natural)
+        if insert_at == src:
+            return False
+        self._natural.pop(src)
+        self._natural.insert(insert_at, plugin)
+        self._refresh_natural_caches()
+        self._rebuild_display()
+        if self._rows:
+            self.dataChanged.emit(
+                self.index(0, COL_PRIORITY),
+                self.index(len(self._rows) - 1, COL_GAME_INDEX),
+                [Qt.DisplayRole],
+            )
         self._save()
         return True
 

@@ -8,14 +8,13 @@ longer scans the staging tree. Entries are manual custom exes, plus
 auto-detected framework launchers (installed script extenders) for which
 Remove becomes "Hide from dropdown" (they aren't in custom_exes.json).
 
-All persistence goes through Utils.exe_launch (same files the Tk app uses).
+All persistence goes through Utils.executables.launch (same files the Tk app uses).
 The prefix tool workers run on daemon threads and only touch log_fn (the
 app's thread-safe _append_log) - never widgets.
 """
 
 from __future__ import annotations
 
-import subprocess
 import threading
 from pathlib import Path
 
@@ -26,12 +25,12 @@ from PySide6.QtWidgets import (
 )
 
 from gui_qt.safe_emit import safe_emit
-from gui_qt.theme_qt import active_palette, _c, danger_close_button, button_qss
+from gui_qt.theme_qt import active_palette, _c, close_button, button_qss
 from gui_qt.help_marker import tip_text, make_help_marker, help_mark_qss
 from gui_qt.wheel_guard import no_wheel
 from gui_qt.worker import run_in_worker
-from Utils import exe_launch
-from Utils.wine_paths import to_wine_path
+from Utils.executables import launch as exe_launch
+from Utils.wine.paths import to_wine_path
 
 
 class ExeSettingsView(QWidget):
@@ -55,7 +54,7 @@ class ExeSettingsView(QWidget):
         self._is_framework = exe_launch.is_framework_launch_exe(
             game, exe_path.name)
 
-        from Utils.steam_finder import list_installed_proton
+        from Utils.launchers.steam import list_installed_proton
         self._proton_versions = (
             ["Game default"] + [p.parent.name for p in list_installed_proton()]
         )
@@ -91,7 +90,7 @@ class ExeSettingsView(QWidget):
         title.setStyleSheet(f"color:{_c(p,'TEXT_MAIN')}; font-weight:600;")
         hb.addWidget(title)
         hb.addStretch(1)
-        close = danger_close_button(pal=p)
+        close = close_button(pal=p)
         close.clicked.connect(lambda: self._on_close(False))
         hb.addWidget(close)
         v.addWidget(bar)
@@ -456,20 +455,15 @@ class ExeSettingsView(QWidget):
                     log(f"Prefix tools: file not found: {exe}")
                     return
                 log(f"Prefix tools: launching {exe.name} …")
-                from Utils.steam_finder import proton_run_command
-                try:
-                    subprocess.Popen(
-                        # runinprefix: isolated tool prefix - no steam.exe
-                        # shim, so Steam doesn't show the game as "Running".
-                        proton_run_command(proton_script, "runinprefix",
-                                           str(exe), env=env),
-                        env=env, cwd=exe.parent,
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    )
-                except Exception as e:
-                    log(f"Prefix tools error: {e}")
+                from Utils.launchers.steam import proton_run_command
+                from Utils.processes.watch import spawn_process_logged
+                spawn_process_logged(
+                    proton_run_command(proton_script, "runinprefix",
+                                       str(exe), env=env),
+                    env=env, cwd=exe.parent,
+                    label=f"Prefix tools {exe.name}", log_fn=log)
 
-            from Utils.portal_filechooser import pick_exe_file
+            from Utils.ui.portal import pick_exe_file
             pick_exe_file("Select EXE to run in prefix", on_picked)
 
         threading.Thread(target=worker, daemon=True,
@@ -533,7 +527,7 @@ class ExeSettingsView(QWidget):
                         "version or deploy/launch the game once first.")
                     return
                 _script, compat_data, _env = result
-                from Utils.jre_prefix import install_windows_jre
+                from Utils.wine.jre import install_windows_jre
                 install_windows_jre(compat_data, log_fn=log)
             finally:
                 safe_emit(self._install_java_done)
@@ -545,7 +539,7 @@ class ExeSettingsView(QWidget):
         selected = self._selected_proton()
         if selected is None:
             return
-        from Utils.steam_finder import find_any_installed_proton
+        from Utils.launchers.steam import find_any_installed_proton
         proton_script = find_any_installed_proton(selected)
         if proton_script is None:
             self._log(f"Prefix tools: could not find Proton '{selected}'.")
@@ -555,5 +549,5 @@ class ExeSettingsView(QWidget):
             self._log("Prefix tools: no prefix exists yet for this version - "
                       "run the exe once first.")
             return
-        from Utils.xdg import xdg_open
+        from Utils.environment.xdg import xdg_open
         xdg_open(prefix_dir, log_fn=self._log)

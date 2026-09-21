@@ -2,26 +2,31 @@
 
 A QTreeView over PluginModel with a delegate that paints: enable checkbox, name
 (dimmed when disabled), the ESL 'L' cyan badge + master indicator in the Flags
-column, the lock column, and the load-order index. Single-click the checkbox to
-toggle (persists to plugins.txt).
+column, the lock column, priority, and load-order index. Single-click the
+checkbox to toggle, or the priority number to reposition the plugin.
 """
 
 from __future__ import annotations
 
-import textwrap
+from time import perf_counter
 
 from PySide6.QtCore import (
     Qt, QRect, QSize, QEvent, QTimer, QCoreApplication, QT_TRANSLATE_NOOP)
-from PySide6.QtGui import QColor, QFont, QPen, QBrush, QPainter, QAction
+from PySide6.QtGui import (
+    QColor, QFont, QFontMetrics, QPen, QBrush, QPainter, QAction,
+)
 from PySide6.QtWidgets import (
     QTreeView, QStyledItemDelegate, QStyle, QAbstractItemView,
     QToolTip, QToolButton,
 )
 
+from Utils.diagnostics import performance as perftrace
 from gui_qt import column_state
 
-from gui_qt.theme_qt import active_palette, bind_theme, _c, qc, qc_contrast
+from gui_qt.theme_qt import (active_palette, bind_theme, _c, qc,
+                             qc_contrast, link_on)
 from gui_qt.icons import icon
+from gui_qt.tooltips import wrap_tooltip
 from gui_qt.modlist_header import TkStyleHeader
 from gui_qt.plugin_model import (
     PluginModel, RowRole, PFlagsRole, PHighlightRole,
@@ -29,11 +34,14 @@ from gui_qt.plugin_model import (
 )
 from gui_qt.plugin_state import (
     PF_MISSING, PF_LATE, PF_VMM, PF_ESL, PF_LOOT, PF_DIRTY, PF_TAGS,
-    PF_USERLIST, PF_UL_CYCLE, format_loot_tooltip, is_master_group,
+    PF_USERLIST, PF_UL_CYCLE, PF_GROUNDCOVER, format_loot_tooltip,
+    is_master_group,
 )
 
 _FLAG_SZ = 18
 _FLAG_GAP = 4
+_ALIGN_CENTER = Qt.AlignVCenter | Qt.AlignHCenter
+_ALIGN_LEFT = Qt.AlignVCenter | Qt.AlignLeft
 
 # Header line for each master-check flag's bulleted tooltip (Tk parity).
 # Wrapped in self.tr() at show time (see _flag_tip); registered for lupdate.
@@ -44,8 +52,8 @@ _MASTER_TIP_HEADERS = {
 }
 
 # Flag bit → icon filename, painted left→right (order matches the Tk app:
-# missing, late, vmm, userlist dot, esl, loot, dirty, tags). The userlist dot
-# and the ESL cyan "L" badge are drawn specially, not as icons.
+# missing, late, vmm, userlist dot, groundcover, esl, loot, dirty, tags). The
+# userlist dot and letter badges are drawn specially, not as icons.
 _PLUGIN_FLAG_ICONS_PRE = [
     (PF_MISSING, "warning2.png"),
     (PF_LATE, "warning.png"),
@@ -95,11 +103,18 @@ _TWO_STATE_KEYS = {"priority", "index"}
 class PluginDelegate(QStyledItemDelegate):
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.f_row = QFont()
+        self.f_row.setPixelSize(FONT_PX)
+        self.f_bold = QFont(self.f_row)
+        self.f_bold.setBold(True)
+        self.fm_row = QFontMetrics(self.f_row)
+        self.fm_bold = QFontMetrics(self.f_bold)
+        self._name_widths: dict[tuple[str, bool], int] = {}
         bind_theme(self, roles={
             "BG_ROW", "BG_ROW_ALT", "BG_SELECT", "BG_ROW_HOVER",
             "TEXT_MAIN", "TEXT_DIM", "TEXT_ON_ACCENT", "TEXT_ERR",
             "CHECK_FILL", "BORDER", "BG_DEEP", "TONE_BLUE_SOFT",
-            "TEXT_WARN", "TEXT_WHITE", "STATUS_BADGE_RED", "FILE_WIN",
+            "TONE_GREEN", "TEXT_WARN", "TEXT_WHITE", "STATUS_BADGE_RED", "FILE_WIN",
             "FILE_LOSE", "FILE_ANCHOR", "BG_GREEN_ROW",
         })
 
@@ -118,6 +133,7 @@ class PluginDelegate(QStyledItemDelegate):
         self.c_check = qc(p, "CHECK_FILL")   # checkbox fill when enabled
         self.c_check_off = qc(p, "BG_DEEP")
         self.c_esl = qc(p, "TONE_BLUE_SOFT")
+        self.c_groundcover = qc(p, "TONE_GREEN")
         self.c_master = qc(p, "TEXT_WARN")
         # Userlist dot (Tk parity: TEXT_WHITE fill, STATUS_BADGE_RED when the
         # plugin's userlist rules form a cycle).
@@ -130,6 +146,20 @@ class PluginDelegate(QStyledItemDelegate):
         # Masters of the selected plugin get their own green row tint (Tk
         # BG_GREEN_ROW), distinct from the conflict-higher green.
         self.c_hl_master = qc(p, "BG_GREEN_ROW")
+        # Hovered clickable Priority number - reads as a link. The tint has to
+        # clear the fill behind it AND differ from the text it replaces, so each
+        # entry names both. The plain-row base uses BG_ROW_HOVER (the tint only
+        # paints on a hovered row); highlighted rows paint TEXT_ON_ACCENT.
+        # Vanilla/disabled plugins draw dim, so they get their own tint.
+        self.c_action_hover = link_on(p, "BG_ROW_HOVER", "TEXT_MAIN")
+        self.c_action_hover_dim = link_on(p, "BG_ROW_HOVER", "TEXT_DIM")
+        self._action_hover_by_fill = {
+            "sel": link_on(p, "BG_SELECT", "TEXT_ON_ACCENT"),
+            3: link_on(p, "BG_GREEN_ROW", "TEXT_ON_ACCENT"),
+            2: link_on(p, "FILE_ANCHOR", "TEXT_ON_ACCENT"),
+            1: link_on(p, "FILE_WIN", "TEXT_ON_ACCENT"),
+            -1: link_on(p, "FILE_LOSE", "TEXT_ON_ACCENT"),
+        }
         parent = self.parent()
         if parent is not None:
             try:
@@ -142,12 +172,15 @@ class PluginDelegate(QStyledItemDelegate):
 
     def paint(self, p, opt, index):
         r = opt.rect
-        row = index.data(RowRole)
+        model = index.model()
+        row_number = index.row()
+        row = model.row(row_number)
+        bits = row.flags
         p.save()
         p.setRenderHint(p.RenderHint.Antialiasing, False)
 
         selected = bool(opt.state & QStyle.State_Selected)
-        hl = index.data(PHighlightRole) or 0
+        hl = model._highlights.get(row.name.lower(), 0)
         highlighted = False
         if selected:
             p.fillRect(r, self.c_sel)
@@ -172,20 +205,23 @@ class PluginDelegate(QStyledItemDelegate):
         # A broken userlist cycle overrides the name colour with error-red, so
         # the plugin reads as a problem even when not selected/highlighted.
         if not (selected or highlighted) and (
-                (index.data(PFlagsRole) or 0) & PF_UL_CYCLE):
+                bits & PF_UL_CYCLE):
             text_color = self.c_text_cycle
         col = index.column()
 
         if col == COL_NAME:
             self._paint_name(p, r, row, enabled, vanilla, text_color)
         elif col == COL_FLAGS:
-            self._paint_flags(p, r, index.data(PFlagsRole) or 0)
+            self._paint_flags(p, r, bits)
         elif col == COL_LOCK:
-            self._paint_lock(p, r, index.model().is_locked(index.row()))
+            self._paint_lock(p, r, model.is_locked(row_number))
         elif col in (COL_PRIORITY, COL_GAME_INDEX):
+            if self._is_hover_action_cell(index):
+                text_color = self._action_hover_color(
+                    selected, highlighted, hl, enabled and not vanilla)
             p.setPen(text_color)
-            _f = QFont(); _f.setPixelSize(FONT_PX); p.setFont(_f)
-            p.drawText(r, Qt.AlignVCenter | Qt.AlignHCenter,
+            p.setFont(self.f_row)
+            p.drawText(r, _ALIGN_CENTER,
                        index.data(Qt.DisplayRole) or "")
         p.restore()
 
@@ -226,16 +262,20 @@ class PluginDelegate(QStyledItemDelegate):
 
         tx = box.right() + 10
         p.setPen(text_color)
-        _f = QFont(); _f.setPixelSize(FONT_PX)
-        # MO2 parity: bold reads as "in the master block".
-        if row is not None and self._row_is_master(row):
-            _f.setBold(True)
-        p.setFont(_f)
+        is_master = row is not None and self._row_is_master(row)
+        p.setFont(self.f_bold if is_master else self.f_row)
         name_rect = QRect(tx, r.top(), r.right() - tx - 6, r.height())
-        # Elide with the bold metrics just installed, or the name overflows.
-        elided = p.fontMetrics().elidedText(row.name if row else "",
-                                            Qt.ElideRight, name_rect.width())
-        p.drawText(name_rect, Qt.AlignVCenter | Qt.AlignLeft, elided)
+        name = row.name if row else ""
+        metrics = self.fm_bold if is_master else self.fm_row
+        cache_key = (name, is_master)
+        text_width = self._name_widths.get(cache_key)
+        if text_width is None:
+            text_width = metrics.horizontalAdvance(name)
+            self._name_widths[cache_key] = text_width
+        shown = (name if text_width <= name_rect.width()
+                 else metrics.elidedText(name, Qt.ElideRight,
+                                         name_rect.width()))
+        p.drawText(name_rect, _ALIGN_LEFT, shown)
 
     def _row_is_master(self, row) -> bool:
         """Whether *row* is in the master block (gated on the game flag)."""
@@ -256,6 +296,8 @@ class PluginDelegate(QStyledItemDelegate):
                 items.append(("icon", bit, name))
         if bits & PF_USERLIST:
             items.append(("uldot", PF_USERLIST, None))
+        if bits & PF_GROUNDCOVER:
+            items.append(("groundcover", PF_GROUNDCOVER, None))
         if bits & PF_ESL:
             items.append(("esl", PF_ESL, None))
         for bit, name in _PLUGIN_FLAG_ICONS_POST:
@@ -281,6 +323,10 @@ class PluginDelegate(QStyledItemDelegate):
                 f = QFont(); f.setBold(True); f.setPixelSize(13); p.setFont(f)
                 p.setPen(self.c_esl)
                 p.drawText(cell, Qt.AlignCenter, "L")
+            elif kind == "groundcover":
+                f = QFont(); f.setBold(True); f.setPixelSize(12); p.setFont(f)
+                p.setPen(self.c_groundcover)
+                p.drawText(cell, Qt.AlignCenter, "G")
             elif kind == "uldot":
                 # Small filled circle: white = managed in userlist.yaml,
                 # red = its rules currently form a broken cycle (Tk parity).
@@ -314,12 +360,41 @@ class PluginDelegate(QStyledItemDelegate):
             x += sz + _FLAG_GAP
         return 0
 
+    def _action_hover_color(self, selected, highlighted, hl, enabled=True):
+        """Link tint for the hovered number, matched to the fill behind it."""
+        if selected:
+            return self._action_hover_by_fill["sel"]
+        if highlighted:
+            return self._action_hover_by_fill.get(
+                hl, self._action_hover_by_fill["sel"])
+        return self.c_action_hover if enabled else self.c_action_hover_dim
+
+    def _is_hover_action_cell(self, index):
+        """True when the view says this Priority number is hovered."""
+        cell = getattr(self.parent(), "_hover_action_cell", None)
+        return cell is not None and cell == (index.row(), index.column())
+
+    def _hit_centered_text(self, pos, rect, index):
+        text = str(index.data(Qt.DisplayRole) or "")
+        if not text:
+            return False
+        width = min(self.fm_row.horizontalAdvance(text),
+                    max(0, rect.width() - 12))
+        hit = QRect(0, 0, width, self.fm_row.height())
+        hit.moveCenter(rect.center())
+        return hit.contains(pos)
+
     def _flag_tip(self, hit, index):
         """Tooltip text for the hovered flag bit *hit* (Tk parity). Master-check
         and LOOT flags render the captured per-plugin detail; ESL/userlist use
         fixed strings. Returns None when there's nothing to show."""
         if hit == PF_ESL:
             return "This plugin is marked as Light (ESL)"
+        if hit == PF_GROUNDCOVER:
+            return self.tr(
+                "This plugin is classified as OpenMW groundcover. When enabled, "
+                "it loads as groundcover instead of normal content. OpenMW's "
+                "settings.cfg must also contain [Groundcover] enabled = true.")
 
         row = index.data(RowRole)
         if hit == PF_USERLIST:
@@ -358,23 +433,6 @@ class PluginDelegate(QStyledItemDelegate):
             return format_loot_tooltip(row.loot_info, enabled_lower) or None
         return None
 
-    @staticmethod
-    def _wrap_tip(text, width=100):
-        """Cap tooltip line length: Qt doesn't word-wrap plain-text tooltips, so
-        a long LOOT message stretches the tip across the screen. Wrap each line
-        to *width* chars, indenting continuations past the bullet/leading
-        whitespace so the section structure stays readable."""
-        out = []
-        for line in text.split("\n"):
-            if len(line) <= width:
-                out.append(line)
-                continue
-            lead = line[:len(line) - len(line.lstrip())]
-            cont = lead + ("  " if line.lstrip().startswith(("-", "[")) else "")
-            out.append(textwrap.fill(line, width=width, subsequent_indent=cont,
-                                     break_long_words=False, break_on_hyphens=False))
-        return "\n".join(out)
-
     def helpEvent(self, event, view, opt, index):
         """Show the per-flag tooltip when hovering a flag glyph (Tk parity)."""
         try:
@@ -387,7 +445,7 @@ class PluginDelegate(QStyledItemDelegate):
                     if tip:
                         # Pass the flags-cell rect so Qt hides the tooltip as soon
                         # as the cursor leaves the cell.
-                        QToolTip.showText(event.globalPos(), self._wrap_tip(tip),
+                        QToolTip.showText(event.globalPos(), wrap_tooltip(tip),
                                           view, opt.rect)
                         return True
                 QToolTip.hideText()
@@ -418,6 +476,14 @@ class PluginDelegate(QStyledItemDelegate):
                     row = index.data(RowRole)
                     cb(row.name if row is not None else "")
                     return True
+        elif index.column() == COL_PRIORITY:
+            if (event.button() != Qt.LeftButton
+                    or not model.is_movable(index.row())
+                    or not self._hit_centered_text(pos, opt.rect, index)):
+                return False
+            from gui_qt.plugin_menu import _set_priority
+            _set_priority(self.parent(), model, index.row())
+            return True
         return False
 
 
@@ -433,6 +499,10 @@ class PluginView(QTreeView):
         self.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self._perf_resize_paint_pending = False
+        # (row, column) of the clickable Priority number under the cursor, so
+        # the delegate can tint that one cell's text like a link.
+        self._hover_action_cell: tuple[int, int] | None = None
 
         # Set by the app: called with the plugin name when the dirty-edit brush
         # glyph is clicked (opens the xEdit QAC wizard).
@@ -777,9 +847,9 @@ class PluginView(QTreeView):
         finally:
             self.setUpdatesEnabled(True)
         self._applied_hidden = hidden
-        sb = self.verticalScrollBar()
-        if sb is not None:
-            sb.update()
+        marker = getattr(self, "_marker_strip", None)
+        if marker is not None:
+            marker.invalidate_geometry()
 
     def set_search_hidden(self, rows: set[int]) -> None:
         """Hide the given rows (search box). Empty set shows everything."""
@@ -795,6 +865,13 @@ class PluginView(QTreeView):
     def set_plugin_owner(self, owner: dict):
         """owner maps plugin filename (lower) → owning mod name."""
         self._plugin_owner = dict(owner or {})
+
+    def apply_plugin_owner_delta(self, changed: dict) -> None:
+        for plugin, owner in (changed or {}).items():
+            if owner is None:
+                self._plugin_owner.pop(plugin, None)
+            else:
+                self._plugin_owner[plugin] = owner
 
     def selected_owner_mods(self, owner: dict) -> set:
         """The mods that own the currently-selected plugins."""
@@ -851,7 +928,7 @@ class PluginView(QTreeView):
 
     def set_highlight_from_mods(self, mod_names: set, bsa_higher: set,
                                 bsa_lower: set, owner: dict,
-                                bsa_index_path=None):
+                                archive_plugin_stems=None):
         """Highlight plugins from a modlist selection (Tk parity):
           - orange (anchor): plugins of the selected mod(s) - unconditional.
           - green/red: plugins of mods in a *BSA* conflict with the selection,
@@ -865,7 +942,7 @@ class PluginView(QTreeView):
 
         bsa_filter = self._bsa_owning_plugins(
             (bsa_higher or set()) | (bsa_lower or set()),
-            mod_to_plugins, bsa_index_path)
+            mod_to_plugins, archive_plugin_stems or {})
 
         hl: dict[str, int] = {}
         for mod in (bsa_lower or set()):
@@ -883,30 +960,14 @@ class PluginView(QTreeView):
         self.viewport().update()
 
     def _bsa_owning_plugins(self, mods: set, mod_to_plugins: dict,
-                            bsa_index_path) -> set:
-        """{plugin filename(lower)} for plugins in *mods* that own a BSA via
-        basename match - reuses the backend's _bsa_owning_plugin (Tk parity)."""
-        if not mods or bsa_index_path is None:
-            return set()
-        try:
-            from Utils.bsa_filemap import read_bsa_index, _bsa_owning_plugin
-        except Exception:
-            return set()
-        idx = read_bsa_index(bsa_index_path) or {}
+                            archive_plugin_stems) -> set:
+        """Plugin rows owning archives, from the pinned Filegraph generation."""
         result: set = set()
         for mod in mods:
-            archives = idx.get(mod)
-            if not archives:
-                continue
-            plugins = mod_to_plugins.get(mod, [])
-            stems = {p.rsplit(".", 1)[0].lower(): p for p in plugins}
-            if not stems:
-                continue
-            for bsa_name, _mt, _paths in archives:
-                bsa_stem = bsa_name.rsplit(".", 1)[0]
-                owning = _bsa_owning_plugin(bsa_stem, set(stems.keys()))
-                if owning is not None and owning in stems:
-                    result.add(stems[owning])
+            owning = archive_plugin_stems.get(mod, ())
+            for plugin in mod_to_plugins.get(mod, []):
+                if plugin.rsplit(".", 1)[0].lower() in owning:
+                    result.add(plugin)
         return result
 
     # ---- custom drag-reorder ---------------------------------------------
@@ -922,10 +983,9 @@ class PluginView(QTreeView):
                 return carry
         return [row]
 
-    def _update_flag_cursor(self, pos):
-        """Pointing-hand over the clickable dirty-edit brush glyph, so it reads
-        as a button rather than a static badge."""
+    def _update_action_cursor(self, pos):
         over = False
+        cell = None
         try:
             idx = self.indexAt(pos)
             if (idx.isValid() and idx.column() == COL_FLAGS
@@ -935,12 +995,48 @@ class PluginView(QTreeView):
                     deleg = self.itemDelegate()
                     over = deleg._hit_flag_bit(
                         pos, self.visualRect(idx), bits) == PF_DIRTY
+            elif (idx.isValid() and idx.column() == COL_PRIORITY
+                  and self.model().is_movable(idx.row())):
+                deleg = self.itemDelegate()
+                over = deleg._hit_centered_text(
+                    pos, self.visualRect(idx), idx)
+                if over:
+                    cell = (idx.row(), idx.column())
         except Exception:
             over = False
+            cell = None
+        self._set_hover_action_cell(cell)
         if over:
             self.viewport().setCursor(Qt.PointingHandCursor)
         else:
             self.viewport().unsetCursor()
+
+    def _set_hover_action_cell(self, cell):
+        """Track the hovered Priority number, repainting what changed."""
+        if cell == self._hover_action_cell:
+            return
+        old, self._hover_action_cell = self._hover_action_cell, cell
+        m = self.model()
+        for c in (old, cell):
+            if c is not None:
+                idx = m.index(c[0], c[1])
+                if idx.isValid():
+                    self.viewport().update(self.visualRect(idx))
+
+    def leaveEvent(self, event):
+        self._set_hover_action_cell(None)
+        super().leaveEvent(event)
+
+    def keyPressEvent(self, event):
+        # Ctrl+Up/Down extends the selection like Shift+Up/Down does. Qt's
+        # default only walks the current index, which is invisible here.
+        if event.modifiers() & Qt.ControlModifier and not (
+                event.modifiers() & Qt.ShiftModifier):
+            from gui_qt.shortcuts import ctrl_arrow_extend
+            if ctrl_arrow_extend(self, event.key()):
+                event.accept()
+                return
+        super().keyPressEvent(event)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -951,7 +1047,7 @@ class PluginView(QTreeView):
 
     def mouseMoveEvent(self, event):
         if not (event.buttons() & Qt.LeftButton) or self._press_row < 0:
-            self._update_flag_cursor(event.position().toPoint())
+            self._update_action_cursor(event.position().toPoint())
             super().mouseMoveEvent(event)
             return
         if not self._drag_active:
@@ -1083,7 +1179,20 @@ class PluginView(QTreeView):
             self.viewport().update()
 
     def paintEvent(self, event):
+        tracing = perftrace.is_enabled()
+        paint_started = perf_counter() if tracing else 0.0
         super().paintEvent(event)
+        if tracing:
+            elapsed = perf_counter() - paint_started
+            kind = ("full" if event.rect().contains(self.viewport().rect())
+                    else "partial")
+            perftrace.mark("ui.paint.plugins.viewport", elapsed)
+            perftrace.mark(f"ui.paint.plugins.{kind}", elapsed)
+            if kind == "full":
+                source = ("after_resize" if self._perf_resize_paint_pending
+                          else "other")
+                self._perf_resize_paint_pending = False
+                perftrace.mark(f"ui.paint.plugins.full.{source}", elapsed)
         if not self._drag_active or self._drop_slot < 0:
             return
         m = self.model()
@@ -1112,11 +1221,46 @@ class PluginView(QTreeView):
         self._position_column_menu_button()
 
     def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self._fit_name_to_width()
-        if hasattr(self, "_marker_strip"):
-            self._reposition_marker_strip()
-        self._position_column_menu_button()
+        tracing = perftrace.is_enabled()
+        trace_started = perf_counter() if tracing else 0.0
+        viewport = self.viewport()
+        coalesce_paint = viewport.updatesEnabled()
+        if coalesce_paint:
+            viewport.setUpdatesEnabled(False)
+        try:
+            super().resizeEvent(event)
+            qt_finished = perf_counter() if tracing else 0.0
+            h = self.header()
+            widths_before = tuple(self.columnWidth(c)
+                                  for c in range(len(COLUMNS)))
+            # QTreeView otherwise queues another viewport update for the
+            # automatic section resize; the re-enable below already repaints it.
+            signals_were_blocked = h.blockSignals(True)
+            try:
+                self._fit_name_to_width()
+            finally:
+                h.blockSignals(signals_were_blocked)
+            if (widths_before != tuple(self.columnWidth(c)
+                                       for c in range(len(COLUMNS)))
+                    and hasattr(self, "_save_timer")):
+                self._schedule_save()
+            columns_finished = perf_counter() if tracing else 0.0
+            if hasattr(self, "_marker_strip"):
+                self._reposition_marker_strip()
+            self._position_column_menu_button()
+        finally:
+            if coalesce_paint:
+                if tracing:
+                    self._perf_resize_paint_pending = True
+                viewport.setUpdatesEnabled(True)
+        if tracing:
+            finished = perf_counter()
+            perftrace.mark("ui.resize.plugins.qt", qt_finished - trace_started)
+            perftrace.mark("ui.resize.plugins.columns",
+                           columns_finished - qt_finished)
+            perftrace.mark("ui.resize.plugins.overlays",
+                           finished - columns_finished)
+            perftrace.mark("ui.resize.plugins.total", finished - trace_started)
 
     def _fit_name_to_width(self):
         vp = self.viewport().width()

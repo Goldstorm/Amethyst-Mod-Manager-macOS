@@ -17,13 +17,13 @@ import io
 import threading
 
 from PySide6.QtCore import Qt, Signal, QObject, QT_TRANSLATE_NOOP, QCoreApplication
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QAction, QFont
 
 from gui_qt.wheel_guard import no_wheel
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QLineEdit,
     QPushButton, QScrollArea, QFrame, QRadioButton, QCheckBox, QButtonGroup,
-    QComboBox, QPlainTextEdit, QGroupBox,
+    QComboBox, QPlainTextEdit, QGroupBox, QMenu,
 )
 
 from gui_qt.theme_qt import active_palette, bind_theme_icon, _c
@@ -42,6 +42,7 @@ from Games.Custom.custom_game import (
     save_custom_game_definition,
 )
 from Utils.config_paths import get_custom_game_images_dir
+from Utils.wine.proton import DOTNET_VERSIONS
 
 
 # Runtime passthrough used in the local _adv_fields list. The strings are
@@ -182,6 +183,65 @@ class _ImageSignals(QObject):
     status = Signal(str, str)   # (text, tone_key)
 
 
+class _StayOpenCheckMenu(QMenu):
+    def mouseReleaseEvent(self, event):
+        action = self.activeAction()
+        if action is not None and action.isEnabled() and action.isCheckable():
+            action.trigger()
+            return
+        super().mouseReleaseEvent(event)
+
+
+class _DependencyPicker(QPushButton):
+    def __init__(self, options, none_text: str, count_text: str, parent=None):
+        super().__init__(parent)
+        self._none_text = none_text
+        self._count_text = count_text
+        self._actions: dict[str, QAction] = {}
+        menu = _StayOpenCheckMenu(self)
+        for label, token in options:
+            if token is None:
+                menu.addSeparator()
+                continue
+            action = QAction(label, menu)
+            action.setCheckable(True)
+            action.toggled.connect(
+                lambda checked, dep=token: self._on_toggled(dep, checked))
+            menu.addAction(action)
+            self._actions[token] = action
+        self.setMenu(menu)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setMinimumWidth(230)
+        self._refresh_text()
+
+    def selected_tokens(self) -> list[str]:
+        return [token for token, action in self._actions.items()
+                if action.isChecked()]
+
+    def set_selected(self, tokens) -> None:
+        if isinstance(tokens, str):
+            tokens = [part.strip() for part in tokens.split(",") if part.strip()]
+        wanted = set(tokens or ())
+        for token, action in self._actions.items():
+            action.blockSignals(True)
+            action.setChecked(token in wanted)
+            action.blockSignals(False)
+        self._refresh_text()
+
+    def _on_toggled(self, _token: str, _checked: bool) -> None:
+        self._refresh_text()
+
+    def _refresh_text(self) -> None:
+        selected = [action.text() for action in self._actions.values()
+                    if action.isChecked()]
+        if not selected:
+            self.setText(self._none_text)
+        elif len(selected) == 1:
+            self.setText(selected[0])
+        else:
+            self.setText(self._count_text.format(len(selected)))
+
+
 class CustomGameView(QWidget):
     """*on_done(saved_defn: dict | None, deleted: bool)* is called after
     Save/Delete/Cancel so the window can refresh the game list and close the
@@ -252,6 +312,28 @@ class CustomGameView(QWidget):
         if placeholder:
             e.setPlaceholderText(placeholder)
         return e
+
+    def _dependency_options(self):
+        return [
+            (self.tr("VC++ Redistributable (x64)"), "vcredist"),
+            (None, None),
+            *[(self.tr(".NET {0} Desktop Runtime").format(version),
+               f"dotnet{version}") for version in DOTNET_VERSIONS],
+            (None, None),
+            (self.tr("d3dcompiler_47 (shader compiler)"), "d3dcompiler_47"),
+            (self.tr("LAV Filters (DirectShow codecs)"), "lavfilters"),
+            (self.tr("d3dx9 (all legacy DirectX 9 runtimes)"), "d3dx9"),
+            (self.tr("d3dx10 (all legacy DirectX 10 runtimes)"), "d3dx10"),
+            (self.tr("d3dx9_43 (legacy DirectX 9 runtime)"), "d3dx9_43"),
+            (self.tr("d3dx10_43 (legacy DirectX 10 runtime)"), "d3dx10_43"),
+            (self.tr("d3dx11_42 (legacy DirectX 11 runtime)"), "d3dx11_42"),
+            (self.tr("d3dx11_43 (legacy DirectX 11 runtime)"), "d3dx11_43"),
+            (self.tr("d3dcompiler_42 (legacy shader compiler)"), "d3dcompiler_42"),
+            (self.tr("d3dcompiler_43 (legacy shader compiler)"), "d3dcompiler_43"),
+            (self.tr("d3dcompiler_46 (legacy shader compiler)"), "d3dcompiler_46"),
+            (self.tr("quartz (DirectShow runtime)"), "quartz"),
+            (self.tr("dx8vb (DirectX 8 Visual Basic runtime)"), "dx8vb"),
+        ]
 
     # ---- section + row builders (settings_view look) ----------------------
     def _section(self, title: str) -> QGridLayout:
@@ -407,6 +489,13 @@ class CustomGameView(QWidget):
             g, self.tr("Executable Filename"), self._exe_edit,
             self.tr("The .exe location from the game's root folder. e.g. bin/bg3.exe "
             "for BG3 or SkyrimSELauncher.exe for Skyrim SE"))
+        self._exe_alts_edit = self._mono_edit(
+            self.tr("e.g. MyGame.x86_64, Bin/alternate-launcher.exe"))
+        self._field_row(
+            g, self.tr("Additional Executables"), self._exe_alts_edit,
+            self.tr("Comma-separated alternate executable paths relative to the "
+                    "game root. Use these for native Linux builds or store-specific "
+                    "executables."))
 
         # --- Deployment ---
         g = self._section(self.tr("Deployment"))
@@ -442,6 +531,19 @@ class CustomGameView(QWidget):
             self.tr("Path relative to the game root where mod files are installed. "
             "e.g. 'Data' for Bethesda games, 'BepInEx/plugins' for BepInEx. "
             "Leave empty to target the game root directly."))
+
+        # --- Windows Prefix ---
+        g = self._section(self.tr("Windows Prefix"))
+        self._dependency_picker = _DependencyPicker(
+            self._dependency_options(), self.tr("None selected"),
+            self.tr("{0} dependencies selected"))
+        self._dependency_picker.set_selected(["vcredist"])
+        self._field_row(
+            g, self.tr("Auto-install Dependencies"), self._dependency_picker,
+            self.tr("Selected components are installed automatically after the "
+                    "game and prefix configuration is saved. They are skipped "
+                    "when no Windows prefix is configured and are also shown "
+                    "in Prefix Health Check."))
 
         # --- Store & Artwork ---
         g = self._section(self.tr("Store & Artwork"))
@@ -746,7 +848,8 @@ class CustomGameView(QWidget):
     # ---- routing-rule rows ------------------------------------------------
     def _add_routing_rule(self, dest="", match_type="extensions", match_value="",
                           loose_only=False, flatten=False, include_siblings=False,
-                          to_prefix=False):
+                          to_prefix=False, rule_id="", original=None):
+        from uuid import uuid4
         row = QFrame(); row.setObjectName("RuleRow")
         row.setFrameShape(QFrame.StyledPanel)
         hb = QHBoxLayout(row); hb.setContentsMargins(4, 4, 4, 4); hb.setSpacing(4)
@@ -797,7 +900,9 @@ class CustomGameView(QWidget):
 
         rd = {"frame": row, "dest": dest_edit, "type": type_combo,
               "value": value_edit, "loose_only": cb_loose, "flatten": cb_flat,
-              "include_siblings": cb_sib, "to_prefix": cb_pfx}
+              "include_siblings": cb_sib, "to_prefix": cb_pfx,
+              "rule_id": rule_id or "user:" + uuid4().hex,
+              "original": dict(original or {}), "original_type": match_type}
         self._routing_rows.append(rd)
         self._routing_vbox.addWidget(row)
         self._routing_header.setVisible(True)
@@ -843,7 +948,13 @@ class CustomGameView(QWidget):
             values = [v.strip() for v in raw_value.split(",") if v.strip()]
             if not values and not dest:
                 continue
-            rule: dict = {"dest": dest}
+            rule = dict(rd["original"])
+            rule.pop(rd["original_type"], None)
+            if rd["original_type"] == "extensions":
+                rule.pop("companion_extensions", None)
+            for key in ("loose_only", "flatten", "include_siblings", "to_prefix"):
+                rule.pop(key, None)
+            rule.update(dest=dest, rule_id=rd["rule_id"])
             if match_type == "extensions":
                 rule["extensions"] = values
                 if companions:
@@ -1050,6 +1161,7 @@ class CustomGameView(QWidget):
         if keep_name:
             self._name_edit.setText(e.get("name", ""))
         self._exe_edit.setText(e.get("exe_name", ""))
+        self._exe_alts_edit.setText(_set_to_str(e.get("exe_name_alts", [])))
         dep = e.get("deploy_type", "standard")
         if dep in self._deploy_buttons:
             self._deploy_buttons[dep].setChecked(True)
@@ -1060,6 +1172,8 @@ class CustomGameView(QWidget):
             _set_to_str(e.get("additional_nexus_domains", [])))
         self._thunderstore_edit.setText(e.get("thunderstore_community", ""))
         self._image_edit.setText(e.get("image_url", ""))
+        self._dependency_picker.set_selected(
+            e.get("auto_install_deps", ["vcredist"]))
 
         self._adv_edits["mod_folder_strip_prefixes"].setText(
             _set_to_str(e.get("mod_folder_strip_prefixes", [])))
@@ -1090,9 +1204,10 @@ class CustomGameView(QWidget):
 
         self._dll_edit.setPlainText(_dll_to_str(e.get("wine_dll_overrides", {})))
 
-        for rule in e.get("custom_routing_rules", []) or []:
-            if not isinstance(rule, dict):
-                continue
+        from Utils.games.routing_rules import definition_rule_ids
+        routing_rules = [rule for rule in e.get("custom_routing_rules", []) or []
+                         if isinstance(rule, dict)]
+        for rule, rule_id in zip(routing_rules, definition_rule_ids(routing_rules)):
             companions = rule.get("companion_extensions") or []
             if rule.get("filenames"):
                 mt, mv = "filenames", ", ".join(rule["filenames"])
@@ -1108,7 +1223,8 @@ class CustomGameView(QWidget):
                 loose_only=bool(rule.get("loose_only", False)),
                 flatten=bool(rule.get("flatten", False)),
                 include_siblings=bool(rule.get("include_siblings", False)),
-                to_prefix=bool(rule.get("to_prefix", False)))
+                to_prefix=bool(rule.get("to_prefix", False)),
+                rule_id=rule_id, original=rule)
 
         for rule in e.get("restore_whitelist", []) or []:
             if not isinstance(rule, dict):
@@ -1214,6 +1330,7 @@ class CustomGameView(QWidget):
             "name":              name,
             "game_id":           game_id,
             "exe_name":          exe,
+            "exe_name_alts":     _str_to_list(self._exe_alts_edit.text()),
             "deploy_type":       deploy,
             "mod_data_path":     data_path,
             "steam_id":          self._steam_edit.text().strip(),
@@ -1225,6 +1342,7 @@ class CustomGameView(QWidget):
             "thunderstore_community":
                 self._thunderstore_edit.text().strip().lower(),
             "image_url":         image_url,
+            "auto_install_deps": self._dependency_picker.selected_tokens(),
             "mod_folder_strip_prefixes":
                 _str_to_list(self._adv_edits["mod_folder_strip_prefixes"].text()),
             "conflict_ignore_filenames":

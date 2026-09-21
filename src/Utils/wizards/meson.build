@@ -1,0 +1,15 @@
+py.install_sources(
+  '__init__.py',
+  'archives.py',
+  'catalog.py',
+  'cet.py',
+  'dtkit.py',
+  'gates.py',
+  'plugins.py',
+  'reshade.py',
+  'smapi.py',
+  'textures.py',
+  'witchybnd.py',
+  'workshop.py',
+  subdir: 'Utils/wizards',
+)
