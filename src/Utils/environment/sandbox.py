@@ -16,6 +16,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Iterable
 
@@ -51,6 +52,8 @@ def _has_writable_ancestor(path: Path, stop_at: Path | None = None) -> bool:
 
 
 def _flatpak_required_grant(path) -> Path | None:
+    if sys.platform == "darwin":
+        return None
     if not in_flatpak():
         return None
     try:
@@ -98,7 +101,15 @@ def _flatpak_required_grant(path) -> Path | None:
 
 
 def flatpak_blocked_path_hint(path) -> str | None:
-    """Return a `flatpak override` command when *path* looks sandbox-blocked."""
+    """Return a `flatpak override` command when *path* looks sandbox-blocked.
+
+    Returns None when not sandboxed, when the path exists (thus reachable),
+    or when the path lies inside a granted tree (a missing path there is a
+    genuine missing path, not a permission problem). Otherwise returns the
+    command the user can run (or replicate in Flatseal) to grant access.
+
+    macOS:   Always returns None (no Flatpak sandbox on macOS).
+    """
     grant = _flatpak_required_grant(path)
     if grant is None:
         return None

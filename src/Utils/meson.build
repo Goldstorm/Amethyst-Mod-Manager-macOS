@@ -38,12 +38,19 @@ subdir('wabbajack')
 
 py.install_sources(
   '__init__.py',
+  '_crossover_finder_selftest.py',
+  '_wine_prefix_finder_selftest.py',
+  '_wine_runner_selftest.py',
   'app_log.py',
   'atomic_write.py',
   'ca_bundle.py',
   'config_paths.py',
+  'crossover_finder.py',
   'fs_check.py',
   'hardlink_check.py',
   'memory_cache.py',
+  'proton_compat.py',
+  'wine_prefix_finder.py',
+  'wine_runner.py',
   subdir: 'Utils',
 )

@@ -928,7 +928,7 @@ def install_vcredist(
         rc, output = run_prefix_installer(
             proton_run_command(proton_script, "runinprefix",
              str(cache_path), "/install", "/quiet", "/norestart",
-             env=env),
+    env=env),
             env, cache_path.parent,
             label="VC++ Redistributable", log_fn=_log,
             proton_script=proton_script, compat_data=compat_data,

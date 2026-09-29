@@ -26,4 +26,6 @@ src/appimage/dist/
 /tests
 /native/amethyst_filegraph/target/
 /assets
+*.DS_Store
+PLAN.md
 result

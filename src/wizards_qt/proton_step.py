@@ -15,6 +15,7 @@ the choices are saved.
 
 from __future__ import annotations
 
+import sys
 import threading
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -44,6 +45,22 @@ if TYPE_CHECKING:
     from Games.base_game import BaseGame
 
 
+def _list_runner_versions() -> list[str]:
+    """Runner names for this platform.
+
+    Linux: installed Proton versions. macOS: CrossOver bottles plus a
+    "System Wine" entry when a Homebrew/system wine binary is found.
+    """
+    if sys.platform == "darwin":
+        from Utils.crossover_finder import list_crossover_bottles
+        from Utils.wine_runner import SystemWineRunner
+        versions = [b.name for b in list_crossover_bottles()]
+        if SystemWineRunner().find_wine_binary():
+            versions.append("System Wine")
+        return versions
+    from Utils.launchers.steam import list_installed_proton
+    return [b.parent.name for b in list_installed_proton()]
+
 
 class ProtonStepWidget(QWidget):
     """Choose Proton version + prefix placement for a wizard tool."""
@@ -69,7 +86,9 @@ class ProtonStepWidget(QWidget):
                  wizard_label_args: tuple = ()):
         super().__init__()
         if title is None:
-            title = self.tr("Choose Proton Version")
+            title = (self.tr("Choose Wine Runner")
+                     if sys.platform == "darwin"
+                     else self.tr("Choose Proton Version"))
         if deps_note is None:
             deps_note = self.tr("Each version gets its own prefix; "
                                 "dependencies are installed into it "
@@ -161,11 +180,17 @@ class ProtonStepWidget(QWidget):
             add_help_control(self._use_64bit_chk, help_text)
             self._use_64bit_chk.toggled.connect(self._on_64bit_toggle)
 
-        from Utils.launchers.steam import list_installed_proton
-        self._versions = [s.parent.name for s in list_installed_proton()]
-        self._no_versions_label = QLabel(self.tr(
-            "No Proton versions were found. Install one through Steam or "
-            "Heroic, or add a custom Proton build below."))
+        self._versions = _list_runner_versions()
+        if sys.platform == "darwin":
+            _no_versions_msg = self.tr(
+                "No CrossOver bottles or system Wine were found. Install "
+                "CrossOver (codeweavers.com) or Wine via Homebrew "
+                "(`brew install --cask wine-stable`), then reopen this wizard.")
+        else:
+            _no_versions_msg = self.tr(
+                "No Proton versions were found. Install one through Steam or "
+                "Heroic, or add a custom Proton build below.")
+        self._no_versions_label = QLabel(_no_versions_msg)
         self._no_versions_label.setAlignment(Qt.AlignHCenter)
         self._no_versions_label.setWordWrap(True)
         self._no_versions_label.setStyleSheet(f"color:{err_text()};")
@@ -355,9 +380,10 @@ class ProtonStepWidget(QWidget):
 
     def _initial_version(self) -> str:
         """Saved per-exe override, else the game's own Proton, else first."""
-        from Utils.launchers.steam import find_proton_for_game, game_steam_id
         saved = load_proton_override(self._game, self._tool_exe_name) or ""
-        if not saved:
+        if not saved and sys.platform != "darwin":
+            from Utils.launchers.steam import (
+                find_proton_for_game, game_steam_id)
             steam_id = game_steam_id(self._game)
             script = find_proton_for_game(steam_id) if steam_id else None
             if script is not None:
@@ -368,9 +394,8 @@ class ProtonStepWidget(QWidget):
         return self._versions[0] if self._versions else ""
 
     def _reload_versions(self, selected: str = ""):
-        from Utils.launchers.steam import list_installed_proton
         current = selected or self._proton_combo.currentText()
-        self._versions = [s.parent.name for s in list_installed_proton()]
+        self._versions = _list_runner_versions()
         self._proton_combo.blockSignals(True)
         self._proton_combo.clear()
         self._proton_combo.addItems(self._versions)

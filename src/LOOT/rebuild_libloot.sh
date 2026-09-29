@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
-# Rebuild the libloot Python extension (loot.cpython-313-x86_64-linux-gnu.so) from
-# https://github.com/loot/libloot and place it so the Mod Manager and AppImage can use it.
+# Rebuild the libloot Python extension from
+# https://github.com/loot/libloot and place it so the Mod Manager can use it.
 #
 # Usage:
 #   ./LOOT/rebuild_libloot.sh              # clone/update and build latest master
 #   ./LOOT/rebuild_libloot.sh v0.29.0      # build a specific release tag
 #
-# Requires: bash, git, Python 3, Rust (cargo), and a C toolchain (cc/gcc).
+# Requires: bash, git, Python 3, Rust (cargo), and a C toolchain (cc/gcc/clang).
 # The script creates/uses a .venv in the project root and installs maturin there.
 # The extension targets whatever Python version `python3` resolves to.
+#
+# Platforms: Linux (x86_64), macOS (arm64/x86_64)
 
 set -euo pipefail
 
@@ -20,8 +22,17 @@ PYTHON_DIR="${LIBLOOT_DIR}/python"
 # Build for whatever Python version is the system default
 PY_TAG="$(python3 -c 'import sys; print(f"cpython-{sys.version_info.major}{sys.version_info.minor}")')"
 PY_TAG_SHORT="$(python3 -c 'import sys; print(f"cp{sys.version_info.major}{sys.version_info.minor}")')"
-OUT_SO_NAME="loot.${PY_TAG}-x86_64-linux-gnu.so"
-OUT_PRIMARY="${PROJECT_DIR}/${OUT_SO_NAME}"
+
+# Detect platform for wheel pattern matching
+PLATFORM="$(python3 -c 'import sys; print(sys.platform)')"
+
+if [ "$PLATFORM" = "darwin" ]; then
+    # macOS: maturin produces wheels like loot-*-cp313-macosx_14_0_arm64.whl
+    WHEEL_PATTERN="*macosx*.whl"
+else
+    # Linux: maturin produces wheels like loot-*-cp313-linux_x86_64.whl
+    WHEEL_PATTERN="*linux*.whl"
+fi
 
 # Optional: build a specific tag or commit (e.g. v0.29.0)
 REF="${1:-}"
@@ -30,12 +41,18 @@ echo "=== Rebuilding libloot Python extension ==="
 echo "  Project root: $PROJECT_DIR"
 echo "  venv: $VENV_DIR"
 echo "  libloot clone: $LIBLOOT_DIR"
-echo "  Output: $OUT_PRIMARY"
+echo "  Platform: $PLATFORM"
 echo ""
 
 # ── Require C toolchain (Rust needs it to link) ───────────────────────
-if ! command -v cc >/dev/null 2>&1 && ! command -v gcc >/dev/null 2>&1; then
-    echo "=== No C compiler found. Attempting to install base-devel... ==="
+if ! command -v cc >/dev/null 2>&1 && ! command -v gcc >/dev/null 2>&1 && ! command -v clang >/dev/null 2>&1; then
+    if [ "$PLATFORM" = "darwin" ]; then
+        echo "ERROR: No C compiler (cc/gcc/clang) found. Rust needs it to build the extension." >&2
+        echo "Install Xcode Command Line Tools: xcode-select --install" >&2
+        exit 1
+    fi
+
+    echo "=== No C compiler found. Attempting to install build tools... ==="
 
     if ! command -v pacman >/dev/null 2>&1; then
         echo "ERROR: No C compiler (cc/gcc) found. Rust needs it to build the extension." >&2
@@ -123,7 +140,7 @@ cd "$PYTHON_DIR"
 # ── Locate the built wheel ────────────────────────────────────────────
 # Maturin may put target/wheels under python/ or under the repo root
 for WHEEL_DIR in "${PYTHON_DIR}/target/wheels" "${LIBLOOT_DIR}/target/wheels"; do
-    WHEEL=( "$WHEEL_DIR"/libloot-*-${PY_TAG_SHORT}-*linux*.whl "$WHEEL_DIR"/loot-*-${PY_TAG_SHORT}-*linux*.whl )
+    WHEEL=( "$WHEEL_DIR"/libloot-*-${PY_TAG_SHORT}-*${WHEEL_PATTERN} "$WHEEL_DIR"/loot-*-${PY_TAG_SHORT}-*${WHEEL_PATTERN} )
     for w in "${WHEEL[@]}"; do
         if [ -f "$w" ]; then
             WHEEL="$w"
@@ -132,7 +149,7 @@ for WHEEL_DIR in "${PYTHON_DIR}/target/wheels" "${LIBLOOT_DIR}/target/wheels"; d
     done
 done
 if [ -z "${WHEEL:-}" ] || [ ! -f "$WHEEL" ]; then
-    echo "ERROR: No ${PY_TAG_SHORT} linux wheel found in target/wheels under libloot or libloot/python." >&2
+    echo "ERROR: No ${PY_TAG_SHORT} ${PLATFORM} wheel found in target/wheels under libloot or libloot/python." >&2
     for d in "${PYTHON_DIR}/target/wheels" "${LIBLOOT_DIR}/target/wheels"; do
         [ -d "$d" ] && ls -la "$d" 2>/dev/null || true
     done
@@ -147,16 +164,8 @@ TMP_EXTRACT="$(mktemp -d)"
 trap 'rm -rf "$TMP_EXTRACT"' EXIT
 unzip -q -o "$WHEEL" -d "$TMP_EXTRACT"
 
-# Wheel may have .so at top level or under a package dir; module may be "loot" or "libloot"
-SO_FILE=""
-for candidate in "$TMP_EXTRACT/${OUT_SO_NAME}" \
-                 "$TMP_EXTRACT/loot/${OUT_SO_NAME}" \
-                 "$TMP_EXTRACT/libloot/${OUT_SO_NAME}"; do
-    if [ -f "$candidate" ]; then
-        SO_FILE="$candidate"
-        break
-    fi
-done
+# Find the .so — it's the only .so in the wheel, regardless of platform-specific naming
+SO_FILE="$(find "$TMP_EXTRACT" -name "loot*.so" -type f | head -1)"
 if [ -z "$SO_FILE" ]; then
     SO_FILE="$(find "$TMP_EXTRACT" -name "*.so" -type f | head -1)"
 fi
@@ -166,8 +175,9 @@ if [ -z "$SO_FILE" ] || [ ! -f "$SO_FILE" ]; then
     exit 1
 fi
 
-cp -f "$SO_FILE" "$OUT_PRIMARY"
-echo "  Installed: $OUT_PRIMARY"
+# Place it next to src/LOOT/ so `import loot` works (it's a top-level module)
+cp -f "$SO_FILE" "${PROJECT_DIR}/"
+echo "  Installed: $(basename "$SO_FILE") -> ${PROJECT_DIR}/"
 echo ""
 
 # ── Cleanup build directories ─────────────────────────────────────────

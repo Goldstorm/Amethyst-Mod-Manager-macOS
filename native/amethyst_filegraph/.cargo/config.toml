@@ -1,0 +1,18 @@
+# PyO3 extension modules leave the Python C-API symbols (_PyBaseObject_Type, etc.)
+# unresolved on purpose: they are filled in at runtime when the interpreter loads
+# the module. The macOS linker (ld) will not emit a dylib that still has undefined
+# symbols unless told to allow them, so we must pass `-undefined dynamic_lookup` for
+# every Apple target. This is scoped to darwin only; Linux/x86 linkers reject the
+# flag and do not need it.
+
+[target.aarch64-apple-darwin]
+rustflags = [
+    "-C", "link-arg=-undefined",
+    "-C", "link-arg=dynamic_lookup",
+]
+
+[target.x86_64-apple-darwin]
+rustflags = [
+    "-C", "link-arg=-undefined",
+    "-C", "link-arg=dynamic_lookup",
+]

@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 import threading
 import traceback
 import uuid
@@ -584,10 +585,17 @@ def _run_waterfall(
 def pick_folder(title: str, callback: Callable[[Path | None], None]) -> None:
     """
     Open a native folder picker via XDG portal (or zenity fallback).
+    On macOS, skips portal/zenity/kdialog and uses the toolkit picker directly.
     Runs in a background thread; callback is invoked on the worker thread
     with the selected Path or None.
     """
     def _worker() -> None:
+        if sys.platform == "darwin":
+            chosen = _tkinter_folder(title)
+            if chosen is None:
+                chosen = None
+            callback(chosen)
+            return
         chosen = _run_waterfall(
             [
                 ("XDG portal (jeepney/gi)", lambda: _run_portal_folder_impl(title, "")),
@@ -610,6 +618,12 @@ _MOD_ARCHIVE_FILTERS = [
 
 def _run_file_picker_worker(title: str, filters: list[tuple[str, list[str]]], cb: Callable[[Path | None], None]) -> None:
     """Worker for file picker; runs in background thread."""
+    if sys.platform == "darwin":
+        chosen = _tkinter_file(title, filters)
+        if chosen is None:
+            chosen = None
+        cb(chosen)
+        return
     chosen = _run_waterfall(
         [
             ("XDG portal (jeepney/gi)", lambda: _run_portal_file_impl(title, "", filters)),
@@ -712,6 +726,10 @@ def _tkinter_files(
 
 def _run_file_picker_worker_multi(title: str, filters: list[tuple[str, list[str]]], cb: "Callable[[list[Path]], None]") -> None:
     """Worker for multi-file picker; runs in background thread."""
+    if sys.platform == "darwin":
+        chosen = _tkinter_files(title)
+        cb(chosen if chosen else [])
+        return
     # tkinter fallback returns [] (never None), which the waterfall treats
     # as "unavailable" - so wrap it to keep the empty-list semantics intact.
     def _tkinter_step() -> "list[Path] | None":
@@ -850,6 +868,11 @@ def _run_save_worker(
     filters: "list[tuple[str, list[str]]]",
     cb: "Callable[[Path | None], None]",
 ) -> None:
+    if sys.platform == "darwin":
+        tk_filters = [(label, " ".join(pats)) for label, pats in filters]
+        chosen = _tkinter_save(title, current_name, tk_filters)
+        cb(chosen)
+        return
     tk_filters = [(label, " ".join(pats)) for label, pats in filters]
     chosen = _run_waterfall(
         [

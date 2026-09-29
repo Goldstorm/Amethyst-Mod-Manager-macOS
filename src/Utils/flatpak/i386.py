@@ -23,6 +23,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 from typing import Callable
 
 from Utils.app_log import safe_log as _safe_log
@@ -61,8 +62,12 @@ def i386_support_missing() -> bool:
     /lib/ld-linux.so.2 is a runtime symlink into the extension mount point
     (/app/lib/i386-linux-gnu); ``os.path.exists`` follows it, so a dangling
     link correctly reads as missing. Outside Flatpak this always returns
-    False - native/AppImage hosts manage their own 32-bit userland.
+    False — native/AppImage hosts manage their own 32-bit userland.
+
+    macOS:   Always returns False (no Flatpak sandbox on macOS).
     """
+    if sys.platform == "darwin":
+        return False
     return _in_flatpak_sandbox() and not os.path.exists("/lib/ld-linux.so.2")
 
 
@@ -139,7 +144,11 @@ def install_i386_extensions(log_fn: "Callable[[str], None] | None" = None) -> bo
     ref is attempted best-effort and never fails the operation. The extensions
     only MOUNT on the next app launch, so callers should tell the user to
     restart.
+
+    macOS:   Always returns False (no Flatpak sandbox on macOS).
     """
+    if sys.platform == "darwin":
+        return False
     _log = _safe_log(log_fn)
     if not _in_flatpak_sandbox():
         _log("i386 extensions: not running inside a Flatpak sandbox - nothing to do.")

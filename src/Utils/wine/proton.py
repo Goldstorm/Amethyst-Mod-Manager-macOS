@@ -109,7 +109,7 @@ def install_dotnet_runtime(
         # the game as "Running" in Steam (the prefix already exists here).
         proton_run_command(proton_script, "runinprefix",
                            str(cache_path), "/quiet", "/norestart",
-                           env=env),
+    env=env),
         env, cache_path.parent,
         label=f".NET {version}", log_fn=log_fn,
         proton_script=proton_script, compat_data=compat_data,

@@ -6,7 +6,14 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPOSITORY_DIR="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 MANIFEST_PATH="${SCRIPT_DIR}/Cargo.toml"
 TARGET_DIR="${SCRIPT_DIR}/target"
-BUILT_EXTENSION="${TARGET_DIR}/release/libamethyst_filegraph.so"
+if [[ "$(uname)" == "Darwin" ]]; then
+    BUILT_EXTENSION="${TARGET_DIR}/release/libamethyst_filegraph.dylib"
+else
+    BUILT_EXTENSION="${TARGET_DIR}/release/libamethyst_filegraph.so"
+fi
+# Run cargo from the crate directory so it discovers .cargo/config.toml, which
+# supplies the macOS `-undefined dynamic_lookup` linker flag for extension modules.
+cd -- "${SCRIPT_DIR}" || exit 1
 OUTPUT_EXTENSION="${REPOSITORY_DIR}/src/amethyst_filegraph.abi3.so"
 FLATPAK_SDK="org.kde.Sdk//6.11"
 
