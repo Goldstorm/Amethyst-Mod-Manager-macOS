@@ -9,6 +9,7 @@ when reusing the game's own prefix).
 
 from __future__ import annotations
 
+import sys
 import threading
 from typing import TYPE_CHECKING
 
@@ -115,6 +116,12 @@ class BethiniView(WizardViewBase):
                             self.tr("Could not resolve the Proton version for the "
                             "game's own prefix - launch the game once, or pick a "
                             "different prefix option."), RED)
+                    elif sys.platform == "darwin":
+                        safe_emit(self._run_status_sig,
+                            self.tr("Could not find the CrossOver bottle or "
+                            "system Wine '{0}' - check the bottle name in "
+                            "CrossOver, or pick a different runner.").format(
+                                proton_name), RED)
                     else:
                         safe_emit(self._run_status_sig,
                             self.tr("Could not find Proton '{0}' - check that it "

@@ -278,7 +278,10 @@ class CrossOverRunner(WineRunner):
         run_env = env.copy() if env else {}
         run_env["WINEPREFIX"] = str(prefix)
 
-        cmd = [str(wine_bin), "start", "/unix", str(exe)]
+        # `start.exe /wait /unix` blocks until the tool exits (winetricks'
+        # form); the raw wine binary honours WINEPREFIX for both bottles and
+        # plain tool prefixes without the bottle-management wrapper.
+        cmd = [str(wine_bin), "start.exe", "/wait", "/unix", str(exe)]
         if args:
             cmd.extend(map(str, args))
 
@@ -308,8 +311,12 @@ class CrossOverRunner(WineRunner):
         return cmd
 
     def find_wine_binary(self) -> Path | None:
-        from Utils.crossover_finder import find_crossover_wine_binary
-        return find_crossover_wine_binary()
+        """Prefer the raw wine binary: plain Wine semantics (WINEPREFIX selects
+        the prefix) for both bottles and Amethyst's plain tool prefixes."""
+        from Utils.crossover_finder import (
+            find_crossover_wine_binary, find_raw_wine,
+        )
+        return find_raw_wine() or find_crossover_wine_binary()
 
     def list_available_versions(self) -> list[str]:
         from Utils.crossover_finder import list_crossover_bottles

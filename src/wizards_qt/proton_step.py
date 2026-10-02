@@ -444,7 +444,21 @@ class ProtonStepWidget(QWidget):
         try:
             pfx = (self._game.get_prefix_path()
                    if hasattr(self._game, "get_prefix_path") else None)
-            return pfx is not None and Path(pfx).is_dir()
+            if pfx is not None and Path(pfx).is_dir():
+                return True
+            # macOS: a saved Linux-style prefix path can't exist - offer the
+            # game prefix when a CrossOver bottle containing the game's exe
+            # can be found (fast: high-probability Steam/GOG roots first).
+            if sys.platform == "darwin":
+                from Utils import crossover_finder as cxf
+                exe = ""
+                try:
+                    exe = getattr(self._game, "exe_name", "") or ""
+                except Exception:
+                    exe = ""
+                if exe and cxf.find_crossover_bottle_for_exe(exe) is not None:
+                    return True
+            return False
         except Exception:
             return False
 

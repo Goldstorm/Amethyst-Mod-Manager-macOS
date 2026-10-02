@@ -16,6 +16,7 @@ all. Registering ourselves covers both cases.
 from __future__ import annotations
 
 import subprocess
+import sys
 from Utils.launchers.steam import proton_run_command
 from pathlib import Path
 from typing import Callable
@@ -88,15 +89,27 @@ def register_bethesda_game_path(
             if (Path(prefix_dir) / "pfx" / "user.reg").is_file() else "run")
     all_ok = True
     for key in keys:
-        cmd = proton_run_command(
-            proton_script, verb,
-            "reg", "add", key,
-            "/v", "Installed Path",
-            "/t", "REG_SZ",
-            "/d", wine_value,
-            "/f",
-            env=env,
-        )
+        if sys.platform == "darwin":
+            # macOS: proton_script is the wine binary, env carries WINEPREFIX
+            # (or the bottle is selected in the CrossOver environment).
+            cmd = [
+                str(proton_script),
+                "reg", "add", key,
+                "/v", "Installed Path",
+                "/t", "REG_SZ",
+                "/d", wine_value,
+                "/f",
+            ]
+        else:
+            cmd = proton_run_command(
+                proton_script, verb,
+                "reg", "add", key,
+                "/v", "Installed Path",
+                "/t", "REG_SZ",
+                "/d", wine_value,
+                "/f",
+                env=env,
+            )
         try:
             result = subprocess.run(
                 cmd, env=env,
