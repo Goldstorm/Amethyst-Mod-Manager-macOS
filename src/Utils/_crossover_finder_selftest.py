@@ -23,12 +23,20 @@ if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
 from Utils.crossover_finder import (  # noqa: E402
+    CrossoverApp,
     _is_macos,
+    app_for_bottle,
+    bottle_timestamp,
     crossover_installed,
     find_crossover_bottle,
     find_crossover_wine_binary,
+    find_raw_wine,
+    find_wineserver_for_wine,
     get_crossover_version,
+    is_crossover_bottle,
+    list_crossover_apps,
     list_crossover_bottles,
+    primary_crossover_app,
 )
 
 
@@ -269,6 +277,132 @@ def test_mock_wine_binary_candidates() -> None:
         cf._CX_WINE_CANDIDATES = original_wine
 
     print("✓ Deep wine binary search handles nested layouts")
+
+
+# ---------------------------------------------------------------------------
+# CrossOver build (app) discovery
+# ---------------------------------------------------------------------------
+
+def _fake_app(root: Path, name: str, version: str) -> Path:
+    """Create a minimal fake CrossOver app bundle with a raw wine binary."""
+    app = root / name
+    bin_dir = app / "Contents" / "SharedSupport" / "CrossOver" / "bin"
+    raw_dir = app / "Contents" / "SharedSupport" / "CrossOver" / "lib" / "wine" / "x86_64-unix"
+    bin_dir.mkdir(parents=True)
+    raw_dir.mkdir(parents=True)
+    (bin_dir / "wine").write_text("#!/bin/sh\n")
+    (bin_dir / "wine").chmod(0o755)
+    (bin_dir / "wineserver").write_text("#!/bin/sh\n")
+    (bin_dir / "wineserver").chmod(0o755)
+    (raw_dir / "wine").write_text("#!/bin/sh\n")
+    (raw_dir / "wine").chmod(0o755)
+    (app / "Contents" / "Info.plist").write_bytes(b"<xml></xml>")
+    import plistlib
+    with open(app / "Contents" / "Info.plist", "wb") as fh:
+        plistlib.dump({"CFBundleShortVersionString": version}, fh)
+    return app
+
+
+def test_list_apps_shape() -> None:
+    """list_crossover_apps(): list of CrossoverApp, official-first ordering."""
+    import Utils.crossover_finder as cf
+
+    apps = cf.list_crossover_apps()
+    assert isinstance(apps, list)
+    for app in apps:
+        assert isinstance(app, cf.CrossoverApp)
+        assert app.name.endswith(".app")
+    if len(apps) >= 2:
+        # Official builds must sort before preview builds.
+        preview_idx = next(i for i, a in enumerate(apps) if a.is_preview) \
+            if any(a.is_preview for a in apps) else len(apps)
+        official_idx = next((i for i, a in enumerate(apps) if not a.is_preview), len(apps))
+        assert official_idx < preview_idx
+    print(f"✓ list_crossover_apps() returns {len(apps)} build(s), official first")
+
+
+def test_build_ordering_official_first_newest_first() -> None:
+    """The two stable sorts used by list_crossover_apps()."""
+    import Utils.crossover_finder as cf
+
+    apps = [
+        cf.CrossoverApp(Path("/a/CrossOver 24.app"), "24.0", False),
+        cf.CrossoverApp(Path("/a/CrossOver.app"), "26.3", False),
+        cf.CrossoverApp(Path("/a/CrossOver Preview.app"), "20260821", True),
+    ]
+    apps.sort(key=lambda a: cf._version_sort_key(a.version), reverse=True)
+    apps.sort(key=lambda a: a.is_preview)
+    assert [a.version for a in apps] == ["26.3", "24.0", "20260821"]
+    assert cf.primary_crossover_app.__name__ == "primary_crossover_app"
+    print("✓ build ordering: official first, newest first")
+
+
+def test_app_for_bottle_timestamp_match() -> None:
+    import Utils.crossover_finder as cf
+
+    apps = [
+        cf.CrossoverApp(Path("/a/CrossOver.app"), "26.3", False),
+        cf.CrossoverApp(Path("/a/CrossOver Preview Ros.app"), "20260821", True),
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        bottle = Path(tmp) / "Steam"
+        bottle.mkdir()
+        (bottle / "cxbottle.conf").write_text(
+            '[Bottle]\n"Timestamp" = "20260821T113304Z"\n', encoding="utf-8")
+        with mock.patch.object(cf, "list_crossover_apps", return_value=apps):
+            match = cf.app_for_bottle(bottle)
+            assert match is not None and match.version == "20260821"
+            # A bottle with an unknown timestamp falls back to the primary app.
+            (bottle / "cxbottle.conf").write_text(
+                '[Bottle]\n"Timestamp" = "19990101T000000Z"\n', encoding="utf-8")
+            fallback = cf.app_for_bottle(bottle)
+            assert fallback is not None and fallback.version == "26.3"
+    print("✓ app_for_bottle() matches cxbottle.conf Timestamp, falls back to primary")
+
+
+def test_bottle_timestamp_parse() -> None:
+    import Utils.crossover_finder as cf
+
+    with tempfile.TemporaryDirectory() as tmp:
+        bottle = Path(tmp) / "B"
+        bottle.mkdir()
+        (bottle / "cxbottle.conf").write_text(
+            '"Timestamp" = "20260821T113304Z"\n', encoding="utf-8")
+        assert cf.bottle_timestamp(bottle) == "20260821T113304Z"
+        (bottle / "cxbottle.conf").unlink()
+        assert cf.bottle_timestamp(bottle) == ""
+    print("✓ bottle_timestamp() parses cxbottle.conf / empty when absent")
+
+
+def test_fake_app_layout_discovery() -> None:
+    """CrossoverApp.finders + find_raw_wine/wineserver on a fake bundle."""
+    import Utils.crossover_finder as cf
+
+    with tempfile.TemporaryDirectory() as tmp:
+        real = _fake_app(Path(tmp), "CrossOver.app", "26.3")
+        real_app = cf.CrossoverApp(real, "26.3", False)
+        raw = real_app.raw_wine()
+        assert raw is not None and "lib/wine/x86_64-unix/wine" in str(raw)
+        launcher = real_app.wine_launcher()
+        assert launcher is not None and str(launcher).endswith("bin/wine")
+        ws = real_app.wineserver()
+        assert ws is not None and str(ws).endswith("bin/wineserver")
+        # find_raw_wine() with the primary app patched:
+        with mock.patch.object(cf, "_is_macos", return_value=True), \
+                mock.patch.object(cf, "primary_crossover_app",
+                                  return_value=real_app):
+            found = cf.find_raw_wine()
+            assert found == raw
+        # wineserver lookup for the raw binary (not next to it):
+        ws_found = cf.find_wineserver_for_wine(raw)
+        assert ws_found == ws
+        # is_crossover_bottle with a controlled bottle list:
+        (real / "drive_c").mkdir(exist_ok=True)
+        with mock.patch.object(cf, "list_crossover_bottles",
+                               return_value=[real]):
+            assert cf.is_crossover_bottle(real / "drive_c")
+            assert not cf.is_crossover_bottle(Path("/somewhere/else"))
+    print("✓ raw wine / launcher / wineserver discovery + is_crossover_bottle")
 
 
 def test_mock_find_bottle_from_custom_dir() -> None:

@@ -16,6 +16,10 @@
     <img width="800" src="src/icons/ui.png" alt="ui">
 </p>
 
+# FOR macOS -> READ [THE MACOS README](README_macOS.md)
+
+# To anyone finding this repository, this is a vibe coded port made for purely selfish reasons. I do not offer support, but I am uploading this so that people can find it, and maybe use it.
+
 ## Key Features
 
 - **Mo2 style interface** - If it's not broke, don't fix it

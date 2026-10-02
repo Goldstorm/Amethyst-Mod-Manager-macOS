@@ -12,6 +12,7 @@ identical to the Tk app so settings are shared between both:
       "__deploy_before_launch" → bool (default True)
       "__launch_with_wayland" → bool (default False)
       "__lsfg_vk" → per-game LSFG-VK environment settings
+      "__mangohud" → per-game MangoHud environment settings
       "__proton_override_<exe>" → Proton dir name ('' = game default)
       "__launch_options_<exe>" → Steam-style launch options string
       "__hidden_auto_exes" → [exe names] hidden auto-detected framework exes
@@ -30,6 +31,7 @@ import shlex
 import shutil
 import signal
 import subprocess
+import sys
 import threading
 import re
 from pathlib import Path
@@ -530,6 +532,49 @@ def save_lsfg_settings(game, settings: dict) -> None:
     _write_launch_mode_key(game, "__lsfg_vk", _normalize_lsfg_settings(settings))
 
 
+_MANGOHUD_DEFAULTS = {
+    "enabled": False,
+    "display": "default",
+    "position": "default",
+    "fps_limit": 0,
+    "extra_options": "",
+}
+_MANGOHUD_POSITIONS = (
+    "default", "top-left", "top-right", "middle-left", "middle-right",
+    "bottom-left", "bottom-right", "top-center", "bottom-center",
+)
+
+
+def _normalize_mangohud_settings(settings) -> dict:
+    raw = settings if isinstance(settings, dict) else {}
+    result = dict(_MANGOHUD_DEFAULTS)
+    enabled = raw.get("enabled", False)
+    result["enabled"] = enabled if isinstance(enabled, bool) else str(
+        enabled).lower() in ("1", "true", "yes", "on")
+    display = str(raw.get("display", "default") or "default")
+    result["display"] = display if display in (
+        "default", "fps_only", "full") else "default"
+    position = str(raw.get("position", "default") or "default")
+    result["position"] = position if position in _MANGOHUD_POSITIONS \
+        else "default"
+    try:
+        result["fps_limit"] = max(0, min(1000, int(raw.get("fps_limit", 0))))
+    except (TypeError, ValueError):
+        pass
+    result["extra_options"] = str(raw.get("extra_options", "") or "").strip()
+    return result
+
+
+def load_mangohud_settings(game) -> dict:
+    return _normalize_mangohud_settings(
+        _read_launch_mode_data(game).get("__mangohud", {}))
+
+
+def save_mangohud_settings(game, settings: dict) -> None:
+    _write_launch_mode_key(
+        game, "__mangohud", _normalize_mangohud_settings(settings))
+
+
 def lsfg_config_path(game_or_name) -> Path:
     name = getattr(game_or_name, "name", game_or_name)
     return get_game_config_dir(str(name)) / _LSFG_CONFIG_FILE
@@ -933,6 +978,32 @@ def apply_lsfg_launch_setting(game, env: dict, *, log_fn=_noop_log,
         f"performance={'on' if settings['performance_mode'] else 'off'}).")
 
 
+def apply_mangohud_launch_setting(game, env: dict, *, log_fn=_noop_log,
+                                  log_prefix: str = "Play") -> None:
+    settings = load_mangohud_settings(game)
+    if not settings["enabled"]:
+        return
+
+    env["MANGOHUD"] = "1"
+    options = []
+    if settings["display"] == "fps_only":
+        options.append("preset=1")
+    elif settings["display"] == "full":
+        options.append("full")
+    if settings["position"] != "default":
+        options.append(f"position={settings['position']}")
+    if settings["fps_limit"]:
+        options.append(f"fps_limit={settings['fps_limit']}")
+    extra = settings["extra_options"].strip(" ,")
+    if extra:
+        options.append(extra)
+    if options:
+        existing = env.get("MANGOHUD_CONFIG", "").strip(" ,")
+        env["MANGOHUD_CONFIG"] = ",".join(
+            [existing or "read_cfg", *options])
+    log_fn(f"{log_prefix}: MangoHud enabled.")
+
+
 def _forward_env_through_flatpak_spawn(
         command: list[str], env: dict, keys: tuple[str, ...]) -> list[str]:
     command = list(command)
@@ -964,7 +1035,9 @@ def forward_manager_env_through_flatpak_spawn(
         command: list[str], env: dict) -> list[str]:
     """Carry manager-owned game settings across a native host portal."""
     return _forward_env_through_flatpak_spawn(
-        command, env, (*_WAYLAND_ENV_KEYS, *_LSFG_ENV_KEYS))
+        command, env, (*_WAYLAND_ENV_KEYS, *_LSFG_ENV_KEYS,
+                       "MANGOHUD", "MANGOHUD_CONFIG",
+                       "MANGOHUD_CONFIGFILE", "MANGOHUD_DLSYM"))
 
 
 # ---------------------------------------------------------------------------
@@ -1199,6 +1272,7 @@ def _prepare_native_game_launch(game, exe_path: Path, env: dict,
     command = apply_wayland_launch_setting(
         game, env, command, native=True, exe_path=exe_path, log_fn=log_fn)
     apply_lsfg_launch_setting(game, env, log_fn=log_fn)
+    apply_mangohud_launch_setting(game, env, log_fn=log_fn)
 
     if (is_steam_install and steam_id
             and getattr(game, "native_steam_client_required", False)):
@@ -1809,6 +1883,24 @@ def launch_via_faugus(gameids: list, log_fn=_noop_log) -> bool:
 # imports customtkinter and therefore can't be reused from Qt)
 # ---------------------------------------------------------------------------
 
+def _tool_prefix_root(pfx: Path) -> Path:
+    """Normalise a caller's prefix path to the WINEPREFIX dir (drive_c parent).
+
+    Callers pass either the WINEPREFIX dir itself (``…/pfx`` on Linux, the
+    prefix root on macOS) or the compat-data dir that contains it. New
+    prefixes may not have drive_c yet - in that case the path is returned
+    unchanged.
+    """
+    p = Path(pfx)
+    if (p / "drive_c").is_dir():
+        return p
+    if (p / "pfx" / "drive_c").is_dir():
+        return p / "pfx"
+    if p.name == "pfx" and (p.parent / "drive_c").is_dir():
+        return p.parent
+    return p
+
+
 def link_plugins_txt(game, pfx: Path, log_fn=_noop_log) -> None:
     """Symlink the deployed profile's plugins.txt into a tool prefix.
 
@@ -1816,6 +1908,7 @@ def link_plugins_txt(game, pfx: Path, log_fn=_noop_log) -> None:
     """
     if not hasattr(game, "_symlink_plugins_txt"):
         return
+    pfx = _tool_prefix_root(pfx)
     profile = ""
     try:
         profile = game.get_last_deployed_profile() or ""
@@ -1833,12 +1926,31 @@ def link_mygames(game, pfx: Path, log_fn=_noop_log) -> None:
     Gives tools that read the game INIs (xEdit needs Skyrim.ini or it exits
     with a fatal error) the same files the game itself uses.
     """
+    pfx = _tool_prefix_root(pfx)
     game_pfx = game.get_prefix_path() if hasattr(game, "get_prefix_path") else None
     docs = getattr(game, "_MYGAMES_DOCS", None)
     sub = getattr(game, "_MYGAMES_SUBPATH", None)
     if game_pfx is None or docs is None or sub is None:
         return
-    src = game_pfx / docs / sub
+    game_root = _tool_prefix_root(game_pfx)
+    src = game_root / docs / sub
+    if not src.is_dir():
+        # CrossOver bottles and non-Steam prefixes may use a different
+        # Windows user name than the one baked into _MYGAMES_DOCS (e.g.
+        # 'crossover' instead of 'steamuser') - scan the prefix's users dir.
+        rel = Path(docs)
+        if len(rel.parts) >= 3 and rel.parts[:2] == ("drive_c", "users"):
+            users = game_root / "drive_c" / "users"
+            if users.is_dir():
+                tail = Path(*rel.parts[3:]) / sub
+                try:
+                    for user_dir in sorted(users.iterdir(), key=lambda p: p.name):
+                        cand = user_dir / tail
+                        if cand.is_dir():
+                            src = cand
+                            break
+                except OSError:
+                    pass
     if not src.is_dir():
         log_fn(f"game-prefix My Games folder not found ({src}) - skipping link.")
         return
@@ -1866,13 +1978,14 @@ def link_game_documents(game, pfx: Path, subpath, log_fn=_noop_log) -> None:
     prefix's real one in (keeping the load order in sync).  If the game prefix
     doesn't have it either, create an empty directory so the watcher is happy.
     """
+    pfx = _tool_prefix_root(pfx)
     sub = Path(subpath)
     dst = pfx / _DOCUMENTS_REL / sub
     if dst.is_symlink() or dst.exists():
         return
     game_pfx = game.get_prefix_path() if hasattr(game, "get_prefix_path") else None
-    src = (Path(game_pfx) / "pfx" / _DOCUMENTS_REL / sub
-    if game_pfx is not None else None)
+    src = (_tool_prefix_root(game_pfx) / _DOCUMENTS_REL / sub
+           if game_pfx is not None else None)
     try:
         dst.parent.mkdir(parents=True, exist_ok=True)
         if src is not None and src.is_dir():
@@ -2004,20 +2117,36 @@ def get_tool_prefix_env(
 
 
 def prepare_tool_prefix(exe_path: Path, proton_name: str, game,
-                        log_fn=_noop_log) -> tuple[Path, Path, dict] | None:
+                        log_fn=_noop_log, *,
+                        prefix_mode: str = "isolated") -> tuple[Path, Path, dict] | None:
     """get_tool_prefix_env + the Bethesda registry/plugins.txt/My Games setup.
 
     Mirrors Tk's ExeConfigPanel._get_selected_tool_env. Synchronous (wineboot
     on first use) - call from a worker thread.
     """
-    result = get_tool_prefix_env(
-        exe_path, proton_name, steam_id=effective_steam_id(game),
-    )
+    if sys.platform == "darwin":
+        result = _resolve_tool_prefix_macos(
+            exe_path, game, proton_name, prefix_mode, log_fn)
+    else:
+        prefix_dir = None
+        if prefix_mode == PREFIX_MODE_SHARED:
+            from Utils.launchers.steam import find_any_installed_proton
+            proton_script = find_any_installed_proton(proton_name)
+            if proton_script is not None:
+                prefix_dir = tool_prefix_dir(exe_path, proton_script, prefix_mode)
+        result = get_tool_prefix_env(
+            exe_path, proton_name, prefix_dir=prefix_dir,
+            steam_id=effective_steam_id(game),
+        )
     if result is None:
-        from Utils.launchers.steam import steamless_launch_error
-        reason = steamless_launch_error()
-        log_fn(f"Prefix tools: {reason}" if reason else
-               f"Prefix tools: could not find Proton '{proton_name}'.")
+        if sys.platform != "darwin":
+            from Utils.launchers.steam import steamless_launch_error
+            reason = steamless_launch_error()
+            log_fn(f"Prefix tools: {reason}" if reason else
+                   f"Prefix tools: could not find Proton '{proton_name}'.")
+        else:
+            log_fn(f"Prefix tools: could not resolve '{proton_name}' "
+                   "(CrossOver bottle or system Wine).")
         return None
     proton_script, prefix_dir, env = result
     if getattr(game, "synthesis_registry_name", None):
@@ -2060,6 +2189,13 @@ def shared_prefix_dir(proton_dir_name: str) -> Path:
     """
     from Utils.config_paths import get_wine_prefixes_dir
     return get_wine_prefixes_dir() / f"shared_{proton_dir_name}"
+
+
+def tool_prefix_dir(exe_path: Path, proton_script: Path,
+                    prefix_mode: str) -> Path:
+    if prefix_mode == PREFIX_MODE_SHARED:
+        return shared_prefix_dir(proton_script.parent.name)
+    return exe_path.parent / f"prefix_{proton_script.parent.name}"
 
 
 def load_prefix_mode(game, exe_name: str) -> str:
@@ -2320,7 +2456,8 @@ def _kill_process_group(proc, sig) -> bool:
             return False
 
 
-def reap_live_tools(owner=None, log_fn=None, timeout: float = 4.0) -> int:
+def reap_live_tools(owner=None, log_fn=None, timeout: float = 4.0, *,
+                    kill_wineserver: bool = True) -> int:
     """Terminate registered tools that are still running; returns how many.
 
     Escalates deliberately, because the Popen we hold is only the *launcher*
@@ -2331,7 +2468,8 @@ def reap_live_tools(owner=None, log_fn=None, timeout: float = 4.0) -> int:
     and lets each wizard's own `finally` cleanup finally run.
 
     With *owner* set, only that owner's tools are touched - one wizard tab
-    closing must not kill a tool another tab is still using.
+    closing must not kill a tool another tab is still using. Set
+    *kill_wineserver* false when other tools may share the prefix.
     """
     def _log(msg):
         if log_fn is not None:
@@ -2352,14 +2490,14 @@ def reap_live_tools(owner=None, log_fn=None, timeout: float = 4.0) -> int:
             _forget_live_tool(token)
             continue
 
-        _log(f"{label}: still running at shutdown - terminating")
+        _log(f"{label}: still running - terminating")
         _kill_process_group(proc, signal.SIGTERM)
         try:
             proc.wait(timeout=timeout / 2)
         except Exception:
             pass
 
-        if proc.poll() is None:
+        if proc.poll() is None and kill_wineserver:
             # The launcher is blocked on an .exe that will not exit. The
             # prefix's wineserver owns that .exe, so this is what reaches it.
             script, compat = entry["proton_script"], entry["compat_data"]
@@ -2397,8 +2535,15 @@ def shutdown_prefix_wineserver(proton_script: Path, compat_data: Path,
     try:
         script = Path(proton_script)
         if script.name in ("wine", "wine64"):
-            # Lutris wine binary: wineserver sits next to wine.
+            # Lutris / system wine binary: wineserver sits next to wine.
             bin_dir = script.parent if (script.parent / "wineserver").is_file() else None
+            if bin_dir is None and sys.platform == "darwin":
+                # CrossOver's raw wine lives in lib/wine/x86_64-unix/ with the
+                # wineserver in the build's bin/ folder.
+                from Utils import crossover_finder as cxf
+                ws = cxf.find_wineserver_for_wine(script)
+                if ws is not None:
+                    bin_dir = ws.parent
         else:
             proton_dir = script.parent
             bin_dir = next(
@@ -2544,6 +2689,223 @@ def get_game_prefix_env(game, log_fn=_noop_log, *,
     return proton_script, compat_data, env
 
 
+# ---------------------------------------------------------------------------
+# macOS (CrossOver / system Wine) resolution
+#
+# On macOS the "Proton name" chosen on the Proton step is a CrossOver bottle
+# name or "System Wine". There is no Proton script: we run the build's plain
+# wine binary against WINEPREFIX. Tool prefixes (isolated/shared) are plain
+# Wine prefixes, never bottles, so the bottle-aware CrossOver wrapper is
+# deliberately not used (it would trigger its bottle-update flow).
+# ---------------------------------------------------------------------------
+
+# Env marker: the resolved "proton script" is a wine binary, not Proton.
+MACOS_WINE_ENV = "AMM_MACOS_WINE"
+_SYSTEM_WINE_NAMES = ("", "system wine", "wine", "wine-stable", "system")
+
+
+def _macos_wine_for_runner(name: str, log_fn=_noop_log):
+    """Resolve (wine_binary, bottle) for a wizard runner name on macOS.
+
+    A bottle name selects both the build (the one that owns the bottle, so
+    the tool prefix is made by the same wine that drives the game) and, for
+    logging, the bottle itself. "System Wine" (or "") resolves a Homebrew/
+    PATH wine. Returns (None, None) with a log line when unresolvable.
+    """
+    from Utils import crossover_finder as cxf
+    from Utils.wine_runner import SystemWineRunner
+    low = (name or "").strip().lower()
+    if low in _SYSTEM_WINE_NAMES:
+        wine = SystemWineRunner().find_wine_binary()
+        if wine is None:
+            log_fn("no system Wine found - install one with "
+                   "`brew install --cask wine-stable` or use a CrossOver bottle.")
+            return None, None
+        return wine, None
+    bottle = cxf.find_crossover_bottle(name)
+    if bottle is None:
+        bottles = cxf.list_crossover_bottles()
+        log_fn("no CrossOver bottle named '{0}' found."
+               .format(name)
+               + (" Available bottles: " + ", ".join(b.name for b in bottles)
+                  if bottles else
+                  " No CrossOver bottles were found - install a game in "
+                  "CrossOver first, or pick 'System Wine' if installed."))
+        return None, None
+    app = cxf.app_for_bottle(bottle)
+    wine = cxf.find_raw_wine(app)
+    if wine is None:
+        log_fn("no usable wine binary was found in the installed "
+               "CrossOver build(s).")
+        return None, None
+    return wine, bottle
+
+
+def _macos_game_prefix_root(game, log_fn=_noop_log) -> Path | None:
+    """The game's WINEPREFIX dir on macOS, or None (logged) when unresolvable.
+
+    Prefers the prefix path saved in Configure Game; falls back to scanning
+    the CrossOver bottles for the game's exe (covers saved Linux-style
+    compatdata paths that cannot exist on macOS).
+    """
+    from Utils import crossover_finder as cxf
+    pfx = game.get_prefix_path() if hasattr(game, "get_prefix_path") else None
+    if pfx is not None:
+        p = Path(pfx)
+        if p.is_dir():
+            root = _tool_prefix_root(p)
+            log_fn(f"game prefix: {root}")
+            return root
+        log_fn(f"saved game prefix does not exist ({p}) - "
+               "looking for the game in the CrossOver bottles…")
+    exe = ""
+    try:
+        exe = getattr(game, "exe_name", "") or ""
+    except Exception:
+        exe = ""
+    if exe:
+        hit = cxf.find_crossover_bottle_for_exe(exe)
+        if hit is not None:
+            bottle, exe_path = hit
+            log_fn(f"found the game in the CrossOver bottle '{bottle.name}' "
+                   f"({exe_path}).")
+            return bottle
+    log_fn("no game prefix is configured and no CrossOver bottle with "
+           "'{0}' was found - set the prefix in Configure Game or pick a "
+           "different prefix option.").format(exe or "the game")
+    return None
+
+
+def _seed_tool_prefix_fonts(prefix_root: Path, bottle: Path,
+                            log_fn=_noop_log) -> None:
+    """Best-effort: copy the game bottle's fonts into a tool prefix.
+
+    Wine 11 falls back to host fonts, but tools that hardcode Windows fonts
+    (BethINI Pie hardcodes Segoe UI) render far better when the prefix
+    carries the bottle's font set. Skipped when the prefix already has fonts.
+    """
+    fonts_src = Path(bottle) / "drive_c" / "windows" / "Fonts"
+    if not fonts_src.is_dir():
+        return
+    fonts_dst = prefix_root / "drive_c" / "windows" / "Fonts"
+    try:
+        if fonts_dst.is_dir() and any(fonts_dst.iterdir()):
+            return
+        fonts_dst.mkdir(parents=True, exist_ok=True)
+        copied = 0
+        for f in fonts_src.iterdir():
+            try:
+                if (f.is_file()
+                        and f.suffix.lower() in (".ttf", ".otf", ".ttc", ".dfont")
+                        and f.stat().st_size < 20 * 1024 * 1024):
+                    shutil.copy2(f, fonts_dst / f.name)
+                    copied += 1
+            except OSError:
+                continue
+        if copied:
+            log_fn(f"seeded {copied} font(s) from the '{Path(bottle).name}' "
+                   "bottle into the tool prefix")
+    except OSError as exc:
+        log_fn(f"font seeding skipped: {exc}")
+
+
+def _resolve_tool_prefix_macos(exe: Path, game, proton_name: str,
+                               prefix_mode: str, log_fn=_noop_log, *,
+                               isolated_prefix_dir: "Path | None" = None
+                               ) -> "tuple[Path, Path, dict] | None":
+    """macOS port of the (proton_script, compat_data, env) resolution.
+
+    Returns (wine_binary, prefix_root, env) where prefix_root is the
+    WINEPREFIX directory itself (no pfx/ subdirectory) and env carries
+    WINEPREFIX + the :data:`MACOS_WINE_ENV` marker. First use of an
+    isolated/shared prefix runs a synchronous wineboot - call from a worker
+    thread. Returns None on failure (after logging why).
+    """
+    from Utils import crossover_finder as cxf
+    from Utils.wine_runner import SystemWineRunner
+    name = (proton_name or "").strip()
+    runner_label = name or "System Wine"
+
+    env = strip_appimage_env(os.environ.copy())
+
+    if prefix_mode == PREFIX_MODE_GAME:
+        prefix_root = _macos_game_prefix_root(game, log_fn)
+        if prefix_root is None:
+            return None
+        app = None
+        if cxf.is_crossover_bottle(prefix_root):
+            app = cxf.app_for_bottle(prefix_root)
+        wine_bin = (cxf.find_raw_wine(app) if app is not None else None)
+        if wine_bin is None:
+            wine_bin = cxf.find_raw_wine()
+        if wine_bin is None:
+            wine_bin = SystemWineRunner().find_wine_binary()
+        if wine_bin is None:
+            log_fn("no wine binary was found - install CrossOver or Wine "
+                   "via Homebrew (`brew install --cask wine-stable`).")
+            return None
+    else:
+        wine_bin, _bottle = _macos_wine_for_runner(name, log_fn)
+        if wine_bin is None:
+            return None
+        if prefix_mode == PREFIX_MODE_SHARED:
+            prefix_root = shared_prefix_dir(runner_label)
+        elif isolated_prefix_dir is not None:
+            prefix_root = Path(isolated_prefix_dir)
+        else:
+            prefix_root = exe.parent / f"prefix_{runner_label}"
+
+        is_new = not (prefix_root / "drive_c").is_dir()
+        if is_new:
+            try:
+                prefix_root.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                log_fn(f"could not create prefix directory {prefix_root}: {exc}")
+                return None
+            log_fn(f"creating a new Wine prefix at {prefix_root} "
+                   "(first use - wineboot, may take a minute)…")
+            boot_env = dict(env)
+            boot_env["WINEPREFIX"] = str(prefix_root)
+            boot_env["WINEDEBUG"] = "-all"
+            try:
+                subprocess.run(
+                    [str(wine_bin), "wineboot", "--init"],
+                    env=boot_env,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=300,
+                )
+            except Exception as exc:
+                log_fn(f"wineboot --init failed: {exc}")
+            if not (prefix_root / "drive_c").is_dir():
+                log_fn(f"prefix initialisation did not produce "
+                       f"{prefix_root}/drive_c - cannot continue.")
+                return None
+
+        # ShowDotFiles via direct user.reg edit (no wine startup needed).
+        from Utils.deployment.wine_dll import set_show_dot_files
+        set_show_dot_files(prefix_root, log_fn=lambda m: log_fn(f"ShowDotFiles: {m}"))
+
+        if _bottle is not None:
+            _seed_tool_prefix_fonts(prefix_root, _bottle, log_fn)
+
+    env["WINEPREFIX"] = str(prefix_root)
+    # CrossOver's plain wine still loads the build's cxcompatdb.dll, which
+    # spams "CX_ROOT not set" errors without it (harmless but noisy).
+    cx_root = cxf.crossover_root_for_wine(Path(wine_bin))
+    if cx_root is not None:
+        env["CX_ROOT"] = str(cx_root)
+    # Put the build's bin dir (wineserver & co) first on PATH for children.
+    bin_dir = Path(wine_bin).parent
+    if not (bin_dir / "wineserver").is_file():
+        ws = cxf.find_wineserver_for_wine(Path(wine_bin))
+        if ws is not None:
+            bin_dir = ws.parent
+    env["PATH"] = str(bin_dir) + os.pathsep + env.get("PATH", "")
+    env[MACOS_WINE_ENV] = "1"
+    log_fn(f"using wine: {wine_bin}")
+    return wine_bin, prefix_root, env
+
+
 def resolve_tool_prefix(exe: Path, game, proton_name: str, prefix_mode: str,
                         log_fn=_noop_log, *,
                         isolated_prefix_dir: "Path | None" = None):
@@ -2564,11 +2926,15 @@ def resolve_tool_prefix(exe: Path, game, proton_name: str, prefix_mode: str,
     tuple order: compat_data before env, matching get_tool_prefix_env).
     """
     log_fn(f"prefix mode: {prefix_mode}"
-           + (f", selected Proton '{proton_name}'"
+           + (f", selected {'CrossOver bottle or system Wine' if sys.platform == 'darwin' else 'Proton'} '{proton_name}'"
               if prefix_mode != PREFIX_MODE_GAME else
-              " (the selected Proton version is not used in this mode - "
+              " (the selected version is not used in this mode - "
               "the game's own prefix decides it)"))
-    if prefix_mode == PREFIX_MODE_GAME:
+    if sys.platform == "darwin":
+        result = _resolve_tool_prefix_macos(
+            exe, game, proton_name, prefix_mode, log_fn,
+            isolated_prefix_dir=isolated_prefix_dir)
+    elif prefix_mode == PREFIX_MODE_GAME:
         result = get_game_prefix_env(game, log_fn=log_fn,
                                      allow_runner_fallback=True)
     else:
@@ -2601,19 +2967,23 @@ def resolve_tool_prefix(exe: Path, game, proton_name: str, prefix_mode: str,
             steam_id=effective_steam_id(game),
         )
     if result is None:
-        # A Steam-less box with no umu-run has no viable launcher at all; say
-        # so instead of leaving the caller's vague "could not find Proton"
-        # (GH#320 - the reporter's SSEEdit run failed here).
-        from Utils.launchers.steam import steamless_launch_error
-        reason = steamless_launch_error()
-        if reason:
-            log_fn(reason)
+        if sys.platform != "darwin":
+            # A Steam-less box with no umu-run has no viable launcher at all;
+            # say so instead of leaving the caller's vague "could not find
+            # Proton" (GH#320 - the reporter's SSEEdit run failed here).
+            from Utils.launchers.steam import steamless_launch_error
+            reason = steamless_launch_error()
+            if reason:
+                log_fn(reason)
         return None
     proton_script, compat_data, env = result
     # One line that pins down the whole resolution for a bug report: which
     # build, from which install root, against which prefix.
-    log_fn(f"resolved Proton {Path(proton_script).parent.name} -> "
-           f"{proton_script} (prefix: {compat_data})")
+    if sys.platform == "darwin":
+        log_fn(f"resolved wine {proton_script} (prefix: {compat_data})")
+    else:
+        log_fn(f"resolved Proton {Path(proton_script).parent.name} -> "
+               f"{proton_script} (prefix: {compat_data})")
     extra = parse_env_overrides(load_tool_launch_env(exe))
     if extra:
         env.update(extra)
@@ -2684,11 +3054,13 @@ def run_tool_logged(
         if prefix:
             # The plain-Wine helper deliberately rebuilds a clean environment
             # to drop Proton/Steam session state. Preserve only the host GPU
-            # selectors: TexGen/DynDOLOD's discrete-GPU option relies on these
-            # reaching the texconv child process even in winetricks-style mode.
+            # selectors (TexGen/DynDOLOD's discrete-GPU option relies on these
+            # reaching the texconv child process) and, on macOS, CX_ROOT so
+            # CrossOver's cxcompatdb.dll stops logging "CX_ROOT not set".
             gpu_env_keys = (
                 "DRI_PRIME", "__NV_PRIME_RENDER_OFFLOAD",
                 "__VK_LAYER_NV_optimus", "__GLX_VENDOR_LIBRARY_NAME",
+                "CX_ROOT",
             )
             return run_tool_winetricks_style(
                 proton_script, exe, Path(prefix), log_fn=log_fn,
@@ -2724,8 +3096,15 @@ def run_tool_logged(
     # tool writing files relative to its cwd (e.g. WitcherScriptMerger's
     # MergeInventory.xml) would land at Z:\\ (host "/", unwritable).
     tool_cwd = str(cwd) if cwd is not None else str(exe.parent)
-    cmd = proton_run_command(proton_script, "runinprefix", str(exe), env=env,
-                             host_cwd=tool_cwd)
+    if env.get(MACOS_WINE_ENV) == "1":
+        # macOS: proton_script is the wine binary and env carries WINEPREFIX.
+        # `start.exe /wait /unix` (winetricks' form) blocks until the tool
+        # exits so the wizard flow can follow it; /unix keeps the path host
+        # spelled, as the tool's own folder may sit outside any drive.
+        cmd = [str(proton_script), "start.exe", "/wait", "/unix", str(exe)]
+    else:
+        cmd = proton_run_command(proton_script, "runinprefix", str(exe), env=env,
+                                 host_cwd=tool_cwd)
     if extra_args:
         cmd = cmd + list(extra_args)
 
@@ -2831,6 +3210,13 @@ WINEPREFIX + Proton's bin on PATH, ``wine start.exe <exe>``), with only two
         log_fn(f"{label}: no bare wine binary found for {script.parent.name}.")
         return 1
     bin_dir = wine_bin.parent
+    if sys.platform == "darwin" and not (bin_dir / "wineserver").is_file():
+        # CrossOver's raw wine: the tools (wineserver) live in the build's
+        # bin/ folder, not next to lib/wine/x86_64-unix/wine.
+        from Utils import crossover_finder as cxf
+        ws = cxf.find_wineserver_for_wine(wine_bin)
+        if ws is not None:
+            bin_dir = ws.parent
 
     pfx = Path(compat_data) / "pfx"
     env = strip_appimage_env(os.environ.copy())
@@ -3036,6 +3422,34 @@ def launch_game(game, log_fn=_noop_log) -> None:
             exe_path, game, log_fn, launch_settings_key=settings_key)
         return
 
+    native_bepinex = getattr(game, "get_native_bepinex_launch", None)
+    native_launch = native_bepinex() if callable(native_bepinex) else None
+    if native_launch is not None:
+        exe_path, launcher = native_launch
+        if not _require_direct_steam_client(game, log_fn):
+            return
+        prepared = _prepare_native_game_launch(
+            game, exe_path, host_env(), log_fn)
+        if prepared is None:
+            return
+        launch_env, command = prepared
+        try:
+            command = game.wrap_native_bepinex_command(
+                command, exe_path, launcher)
+        except Exception as exc:
+            reason = f"could not prepare the native BepInEx launch: {exc}"
+            log_fn(f"Play: {reason}")
+            launch_report.mark_failed(launch_report.actionable(reason))
+            return
+        command = forward_manager_env_through_flatpak_spawn(
+            command, launch_env)
+        log_fn(f"Play: launching native BepInEx via {launcher.name}: "
+               f"{' '.join(command)}")
+        spawn_process_watched(
+            command, env=launch_env, cwd=exe_path.parent,
+            label="Play (native BepInEx)", log_fn=log_fn)
+        return
+
     native_cmd = getattr(game, "get_launch_command", lambda: None)()
     if native_cmd is not None:
         # Launch settings' arguments/options apply to a native command too - it
@@ -3064,6 +3478,7 @@ def launch_game(game, log_fn=_noop_log) -> None:
             game, env, cmd, native=True, exe_path=resolve_game_exe(game),
             log_fn=log_fn)
         apply_lsfg_launch_setting(game, env, log_fn=log_fn)
+        apply_mangohud_launch_setting(game, env, log_fn=log_fn)
         cmd = forward_manager_env_through_flatpak_spawn(cmd, env)
         # A wrapper from Launch Options (gamemoderun, mangohud) that isn't
         # installed would otherwise fail as a bare Popen error.
@@ -3105,6 +3520,7 @@ def launch_game(game, log_fn=_noop_log) -> None:
     )
     launch_with_wayland = load_launch_with_wayland(game)
     launch_with_lsfg = load_lsfg_settings(game)["enabled"]
+    launch_with_mangohud = load_mangohud_settings(game)["enabled"]
     effective_mode = mode
     direct_play_rel = getattr(game, "direct_play_exe", "") or ""
     direct_play_path = None
@@ -3153,6 +3569,10 @@ def launch_game(game, log_fn=_noop_log) -> None:
         effective_mode = "none"
         log_fn("Play: LSFG-VK is enabled - launching the game directly so "
                "its frame-generation environment reaches the game process.")
+    elif launch_with_mangohud and mode != "none":
+        effective_mode = "none"
+        log_fn("Play: MangoHud is enabled - launching the game directly so "
+               "its overlay environment reaches the game process.")
     elif launch_with_wayland and mode != "none":
         log_fn("Play: Launch with Wayland is enabled, but launcher routing "
                "takes precedence. Configure Wayland in the selected launcher "
@@ -3564,8 +3984,8 @@ def launch_exe_via_proton(
         launch_settings_key: "str | None" = None) -> None:
     """Standard Proton launch path for .exe files. Call from a worker thread.
 
-    Uses the game's prefix by default; a saved per-exe Proton override runs in
-    an isolated prefix_<Proton>/ next to the exe (with Bethesda registry /
+    Uses the game's prefix by default; a saved per-exe Proton override uses
+    the selected isolated or shared tool prefix (with Bethesda registry /
     plugins.txt / My Games setup mirrored from the wizard prefixes).
 
     Non-Steam prefixes (Lutris, Heroic, hand-made): classic lutris-wine
@@ -3617,6 +4037,9 @@ def launch_exe_via_proton(
     ensure_umu_run(log_fn)
 
     proton_override_name = load_proton_override(game, exe_path.name)
+    prefix_mode = load_prefix_mode(game, exe_path.name)
+    if prefix_mode == PREFIX_MODE_GAME:
+        proton_override_name = None
     # Script extenders always use the game's prefix. The settings UI disables
     # the picker for these, but an override saved before that gate existed (or
     # edited by hand) must not resurrect the isolated-prefix path.
@@ -3642,10 +4065,10 @@ def launch_exe_via_proton(
         if proton_script is None:
             log_fn(f"Run EXE: Proton override '{proton_override_name}' not found.")
             return
-        # Dedicated prefix next to the exe so it's isolated from the game prefix
-        compat_data = exe_path.parent / f"prefix_{proton_script.parent.name}"
+        compat_data = tool_prefix_dir(exe_path, proton_script, prefix_mode)
         compat_data.mkdir(parents=True, exist_ok=True)
-        log_fn(f"Run EXE: using {proton_script.parent.name} with isolated prefix.")
+        log_fn(f"Run EXE: using {proton_script.parent.name} with "
+               f"{prefix_mode} prefix at {compat_data}.")
     else:
         prefix_path = (
             game.get_prefix_path()
@@ -3803,7 +4226,7 @@ def launch_exe_via_proton(
             if steam_id:
                 set_game_steam_context(env, steam_id)
         else:
-            # An isolated tool prefix must not inherit Amethyst's Steam
+            # A tool prefix must not inherit Amethyst's Steam
             # shortcut/game context. Keep lsteamclient neutral, matching
             # get_tool_prefix_env's dedicated-prefix path.
             env["SteamAppId"] = "0"
@@ -3815,7 +4238,7 @@ def launch_exe_via_proton(
 
     if proton_override_name:
         # Bethesda games: mirror the wizard-prefix setup so tools in the
-        # isolated prefix see the game path (registry), the deployed
+        # tool prefix see the game path (registry), the deployed
         # plugins.txt and the game's My Games INIs. All no-ops otherwise.
         if getattr(game, "synthesis_registry_name", None):
             from Utils.bethesda.registry import maybe_register_for_game
@@ -3929,6 +4352,8 @@ def launch_exe_via_proton(
             log_prefix="Run EXE")
         apply_lsfg_launch_setting(
             game, env, log_fn=log_fn, log_prefix="Run EXE")
+        apply_mangohud_launch_setting(
+            game, env, log_fn=log_fn, log_prefix="Run EXE")
 
     launch_environment(game, env)
     try:
@@ -4017,22 +4442,24 @@ def resolve_jar_prefix_env(jar_path: Path, game, log_fn=_noop_log):
     """Resolve (proton_script, compat_data, env) for running a .jar under Proton.
 
     Follows the same rule as regular exes (launch_exe_via_proton): with no
-    Proton override the game's own prefix is used; with an override an isolated
-    ``prefix_<Proton>/`` is created next to the jar. Returns None on failure
-    (after logging why). First use of an isolated prefix runs wineboot - call
+    Proton override the game's own prefix is used; with an override the saved
+    isolated or shared tool prefix is used. Returns None on failure
+    (after logging why). First use of a tool prefix runs wineboot - call
     from a worker thread.
     """
     from Utils.launchers.steam import (
         find_any_installed_proton, list_installed_proton,
     )
     override = load_proton_override(game, jar_path.name)
+    prefix_mode = load_prefix_mode(game, jar_path.name)
+    if prefix_mode == PREFIX_MODE_GAME:
+        override = None
     if not override:
         # Game prefix (no wineboot; already initialised by the game).
         return get_game_prefix_env(
             game, log_fn=lambda m: log_fn(f"Run JAR: {m}"),
             allow_runner_fallback=True)
 
-    # Specific Proton → isolated prefix_<Proton>/ next to the jar.
     proton_script = find_any_installed_proton(override)
     if proton_script is None:
         override_lower = override.lower()
@@ -4043,7 +4470,7 @@ def resolve_jar_prefix_env(jar_path: Path, game, log_fn=_noop_log):
     if proton_script is None:
         log_fn(f"Run JAR: Proton override '{override}' not found.")
         return None
-    prefix_dir = jar_path.parent / f"prefix_{proton_script.parent.name}"
+    prefix_dir = tool_prefix_dir(jar_path, proton_script, prefix_mode)
     result = get_tool_prefix_env(
         jar_path, override, prefix_dir=prefix_dir,
         steam_id=effective_steam_id(game))

@@ -90,7 +90,9 @@ def test_crossover_run_in_prefix_command() -> None:
 
         assert isinstance(cmd, list)
         assert cmd[0] == "/fake/wine"
-        assert "start" in cmd
+        # `start.exe /wait /unix` - blocks until the tool exits.
+        assert "start.exe" in cmd
+        assert "/wait" in cmd
         assert "/unix" in cmd
         assert "/game/tool.exe" in cmd
         assert "--verbose" in cmd
