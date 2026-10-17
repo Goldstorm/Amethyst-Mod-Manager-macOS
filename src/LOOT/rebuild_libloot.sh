@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Rebuild the libloot Python extension from
-# https://github.com/loot/libloot and place it so the Mod Manager can use it.
+# https://github.com/loot/libloot and place it so the Mod Manager and AppImage can use it.
 #
 # Usage:
 #   ./LOOT/rebuild_libloot.sh              # clone/update and build latest master
 #   ./LOOT/rebuild_libloot.sh v0.29.0      # build a specific release tag
 #
-# Requires: bash, git, Python 3, Rust (cargo), and a C toolchain (cc/gcc/clang).
+# Requires: bash, git, Python 3, Rust (cargo), and a C toolchain (cc/gcc).
 # The script creates/uses a .venv in the project root and installs maturin there.
 # The extension targets whatever Python version `python3` resolves to.
 #
@@ -29,10 +29,13 @@ PLATFORM="$(python3 -c 'import sys; print(sys.platform)')"
 if [ "$PLATFORM" = "darwin" ]; then
     # macOS: maturin produces wheels like loot-*-cp313-macosx_14_0_arm64.whl
     WHEEL_PATTERN="*macosx*.whl"
+    OUT_SO_NAME="loot.${PY_TAG}-darwin.so"
 else
     # Linux: maturin produces wheels like loot-*-cp313-linux_x86_64.whl
     WHEEL_PATTERN="*linux*.whl"
+    OUT_SO_NAME="loot.${PY_TAG}-$(uname -m)-linux-gnu.so"
 fi
+OUT_PRIMARY="${PROJECT_DIR}/${OUT_SO_NAME}"
 
 # Optional: build a specific tag or commit (e.g. v0.29.0)
 REF="${1:-}"
@@ -41,18 +44,12 @@ echo "=== Rebuilding libloot Python extension ==="
 echo "  Project root: $PROJECT_DIR"
 echo "  venv: $VENV_DIR"
 echo "  libloot clone: $LIBLOOT_DIR"
-echo "  Platform: $PLATFORM"
+echo "  Output: $OUT_PRIMARY"
 echo ""
 
 # ── Require C toolchain (Rust needs it to link) ───────────────────────
-if ! command -v cc >/dev/null 2>&1 && ! command -v gcc >/dev/null 2>&1 && ! command -v clang >/dev/null 2>&1; then
-    if [ "$PLATFORM" = "darwin" ]; then
-        echo "ERROR: No C compiler (cc/gcc/clang) found. Rust needs it to build the extension." >&2
-        echo "Install Xcode Command Line Tools: xcode-select --install" >&2
-        exit 1
-    fi
-
-    echo "=== No C compiler found. Attempting to install build tools... ==="
+if ! command -v cc >/dev/null 2>&1 && ! command -v gcc >/dev/null 2>&1; then
+    echo "=== No C compiler found. Attempting to install base-devel... ==="
 
     if ! command -v pacman >/dev/null 2>&1; then
         echo "ERROR: No C compiler (cc/gcc) found. Rust needs it to build the extension." >&2
@@ -164,8 +161,16 @@ TMP_EXTRACT="$(mktemp -d)"
 trap 'rm -rf "$TMP_EXTRACT"' EXIT
 unzip -q -o "$WHEEL" -d "$TMP_EXTRACT"
 
-# Find the .so — it's the only .so in the wheel, regardless of platform-specific naming
-SO_FILE="$(find "$TMP_EXTRACT" -name "loot*.so" -type f | head -1)"
+# Wheel may have .so at top level or under a package dir; module may be "loot" or "libloot"
+SO_FILE=""
+for candidate in "$TMP_EXTRACT/${OUT_SO_NAME}" \
+                 "$TMP_EXTRACT/loot/${OUT_SO_NAME}" \
+                 "$TMP_EXTRACT/libloot/${OUT_SO_NAME}"; do
+    if [ -f "$candidate" ]; then
+        SO_FILE="$candidate"
+        break
+    fi
+done
 if [ -z "$SO_FILE" ]; then
     SO_FILE="$(find "$TMP_EXTRACT" -name "*.so" -type f | head -1)"
 fi
@@ -175,9 +180,8 @@ if [ -z "$SO_FILE" ] || [ ! -f "$SO_FILE" ]; then
     exit 1
 fi
 
-# Place it next to src/LOOT/ so `import loot` works (it's a top-level module)
-cp -f "$SO_FILE" "${PROJECT_DIR}/"
-echo "  Installed: $(basename "$SO_FILE") -> ${PROJECT_DIR}/"
+cp -f "$SO_FILE" "$OUT_PRIMARY"
+echo "  Installed: $OUT_PRIMARY"
 echo ""
 
 # ── Cleanup build directories ─────────────────────────────────────────

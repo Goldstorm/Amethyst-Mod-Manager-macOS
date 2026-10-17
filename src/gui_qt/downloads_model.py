@@ -71,18 +71,6 @@ class ActiveDownload(DownloadEntry):
     interrupted: bool = False
 
 
-@dataclass
-class ActiveDownload(DownloadEntry):
-    key: str = ""
-    name: str = ""
-    done: int = 0
-    total: int = 0
-    cancellable: bool = False
-    cancelling: bool = False
-    pausable: bool = False
-    paused: bool = False
-
-
 class DownloadsModel(QAbstractTableModel):
     def __init__(self, parent=None):
         super().__init__(parent)
