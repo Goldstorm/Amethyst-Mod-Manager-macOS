@@ -529,6 +529,149 @@ class SystemWineRunner(WineRunner):
 
 
 # ---------------------------------------------------------------------------
+# NotProtonRunner — patched CrossOver wine from a NotProton tool (macOS)
+# ---------------------------------------------------------------------------
+class NotProtonRunner(WineRunner):
+    """Runner that uses a NotProton tool's patched CrossOver wine (macOS).
+
+    NotProton keeps one patched CrossOver copy per build under
+    ``~/Library/Application Support/notproton/runners/``; each tool (fex or
+    rosetta flavor) drives plain Wine prefixes with the runner's raw wine
+    binary plus the CX_ROOT / CX_HOME / WINEDLLPATH / WINESERVER env its own
+    run script sets (see :func:`Utils.notproton_finder.notproton_tool_env`).
+
+    *tool_name* is the runner label shown in the UI (display name with a
+    ``(FEX)``/``(Rosetta)`` suffix) or the tool directory name; ``None``
+    selects the first available tool.
+    """
+
+    def __init__(self, tool_name: str | None = None):
+        self._tool_name = (tool_name or "").strip() or None
+
+    def notproton_tool(self):
+        """The resolved NotProtonTool, or None when unresolvable."""
+        from Utils import notproton_finder as npf
+        if self._tool_name:
+            return npf.find_notproton_tool(self._tool_name)
+        for tool in npf.list_notproton_tools():
+            if tool.available:
+                return tool
+        return None
+
+    def _tool_env(self, tool, env: dict | None) -> dict:
+        """WINEPREFIX + the NotProton env, with the runner's bin/ on PATH."""
+        from Utils.notproton_finder import notproton_tool_env
+        run_env = env.copy() if env else {}
+        run_env.update(notproton_tool_env(tool))
+        run_env["PATH"] = (str(tool.cx_root / "bin") + os.pathsep
+                           + run_env.get("PATH", ""))
+        return run_env
+
+    def run_in_prefix(
+        self,
+        prefix: Path,
+        exe: Path,
+        args: Sequence[str] = (),
+        env: dict | None = None,
+        *,
+        host_cwd: str | Path | None = None,
+        verb: str = "runinprefix",
+    ) -> list[str]:
+        tool = self.notproton_tool()
+        wine_bin = tool.wine_bin if tool is not None else None
+        if wine_bin is None or not wine_bin.is_file():
+            return []
+        run_env = self._tool_env(tool, env)
+        run_env["WINEPREFIX"] = str(prefix)
+        cmd = [str(wine_bin), "start.exe", "/wait", "/unix", str(exe)]
+        if args:
+            cmd.extend(map(str, args))
+        return cmd
+
+    def run_reg_add(
+        self,
+        prefix: Path,
+        key: str,
+        value: str,
+        value_name: str = "",
+        value_type: str = "REG_SZ",
+        env: dict | None = None,
+    ) -> list[str]:
+        tool = self.notproton_tool()
+        wine_bin = tool.wine_bin if tool is not None else None
+        if wine_bin is None or not wine_bin.is_file():
+            return []
+        run_env = self._tool_env(tool, env)
+        run_env["WINEPREFIX"] = str(prefix)
+        cmd = [str(wine_bin), "reg", "add", key]
+        if value_name:
+            cmd.extend(["/v", value_name])
+        cmd.extend(["/t", value_type, "/d", value, "/f"])
+        return cmd
+
+    def find_wine_binary(self) -> Path | None:
+        tool = self.notproton_tool()
+        if tool is not None and tool.wine_bin.is_file():
+            return tool.wine_bin
+        return None
+
+    def list_available_versions(self) -> list[str]:
+        from Utils import notproton_finder as npf
+        versions = []
+        for tool in npf.list_notproton_tools():
+            suffix = " (FEX)" if tool.flavor == "fex" else " (Rosetta)"
+            versions.append(tool.display + suffix)
+        return versions
+
+    def install_dependency(
+        self,
+        prefix: Path,
+        component: str,
+        log_fn: LogFn,
+        env: dict | None = None,
+    ) -> bool:
+        """Install a dependency with winetricks using the tool's wine."""
+        tool = self.notproton_tool()
+        wine_bin = tool.wine_bin if tool is not None else None
+        if wine_bin is None or not wine_bin.is_file():
+            log_fn("NotProton: no usable wine binary for this tool")
+            return False
+        wt = shutil.which("winetricks")
+        if wt is None:
+            # The runner is a patched copy of a CrossOver build; the real
+            # CrossOver app (with its bundled winetricks) may be installed.
+            cx_wt = CrossOverRunner()._find_crossover_winetricks()
+            if cx_wt is not None:
+                wt = str(cx_wt)
+        if not wt:
+            log_fn(f"NotProton: no winetricks found for component '{component}'")
+            return False
+        run_env = self._tool_env(tool, env)
+        run_env["WINEPREFIX"] = str(prefix)
+        cmd = [wt, "--unattended", component]
+        try:
+            result = subprocess.run(
+                cmd,
+                env=run_env,
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            if result.returncode == 0:
+                log_fn(f"NotProton: installed {component}")
+                return True
+            log_fn(f"NotProton: winetricks failed for {component}: "
+                   f"{result.stderr[:200]}")
+            return False
+        except subprocess.TimeoutExpired:
+            log_fn(f"NotProton: winetricks timed out for {component}")
+            return False
+        except Exception as e:
+            log_fn(f"NotProton: error installing {component}: {e}")
+            return False
+
+
+# ---------------------------------------------------------------------------
 # LutrisRunner — Lutris Wine runner (Linux)
 # ---------------------------------------------------------------------------
 class LutrisRunner(WineRunner):
@@ -767,6 +910,8 @@ def get_runner(launcher_type: str | None = None) -> WineRunner:
     """
     if launcher_type == "crossover":
         return CrossOverRunner()
+    elif launcher_type == "notproton":
+        return NotProtonRunner()
     elif launcher_type == "system_wine":
         return SystemWineRunner()
     elif launcher_type == "lutris":
@@ -776,7 +921,12 @@ def get_runner(launcher_type: str | None = None) -> WineRunner:
 
     # Auto-detect
     if sys.platform == "darwin":
-        # macOS: try CrossOver first, then system Wine
+        # macOS: NotProton tools first, then CrossOver bottles, then system
+        # Wine. A tool whose runner copy is missing does not count as
+        # available (the wizard reports the missing dir instead).
+        from Utils.notproton_finder import list_notproton_tools
+        if any(t.available for t in list_notproton_tools()):
+            return NotProtonRunner()
         from Utils.crossover_finder import list_crossover_bottles
         if list_crossover_bottles():
             return CrossOverRunner()
@@ -807,6 +957,9 @@ def get_runner(launcher_type: str | None = None) -> WineRunner:
 def get_default_runner_type() -> str:
     """Return the default launcher type string for this platform."""
     if sys.platform == "darwin":
+        from Utils.notproton_finder import list_notproton_tools
+        if any(t.available for t in list_notproton_tools()):
+            return "notproton"
         from Utils.crossover_finder import list_crossover_bottles
         if list_crossover_bottles():
             return "crossover"

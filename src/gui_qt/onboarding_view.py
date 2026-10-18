@@ -13,6 +13,7 @@ calling `on_logged_in()` back on it - no OAuth client is owned here.
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -36,6 +37,7 @@ from Utils.environment.xdg import open_url
 
 _ICONS_DIR = Path(__file__).resolve().parent.parent / "icons"
 _WIKI_URL = "https://github.com/ChrisDKN/Amethyst-Mod-Manager/wiki"
+_MACOS_GUIDE_URL = "https://github.com/ChrisDKN/Amethyst-Mod-Manager/blob/main/README_macOS.md"
 _TOTAL_PAGES = 3
 
 
@@ -397,6 +399,26 @@ class OnboardingView(QWidget):
         add_btn.clicked.connect(self._on_add_game_clicked)
         add_row.addWidget(add_btn)
         v.addLayout(add_row)
+
+        # macOS-only pointer (plan F8): games and wizard tools run through
+        # NotProton or CrossOver; link to the macOS setup guide. No
+        # detection logic - this is a static hint.
+        if sys.platform == "darwin":
+            macos_hint = QLabel(self.tr(
+                "On macOS, games and wizard tools run through NotProton "
+                "(Steam Play) or CrossOver - see the "
+                "<a href=\"{url}\">macOS setup guide</a> before adding a "
+                "game.").format(url=_MACOS_GUIDE_URL))
+            macos_hint.setWordWrap(True)
+            macos_hint.setAlignment(Qt.AlignCenter)
+            macos_hint.setStyleSheet(
+                f"color: {_c(pal, 'TEXT_DIM')}; font-size: 11px;")
+            macos_hint.setOpenExternalLinks(False)
+            macos_hint.linkActivated.connect(
+                lambda _u: open_url(_MACOS_GUIDE_URL))
+            v.addSpacing(8)
+            v.addWidget(macos_hint)
+
         return outer
 
     def _section_title(self, text: str) -> QLabel:

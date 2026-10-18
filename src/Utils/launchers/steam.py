@@ -16,6 +16,8 @@ import stat
 import threading
 from pathlib import Path
 
+from Utils.launchers.nixos import wrap_nixos_command
+
 # ---------------------------------------------------------------------------
 # Known Steam base directories for different install methods
 # ---------------------------------------------------------------------------
@@ -25,7 +27,7 @@ _HOME = Path.home()
 _XDG_DATA = Path(os.environ.get("XDG_DATA_HOME") or (_HOME / ".local" / "share"))
 
 _STEAM_CANDIDATES: list[Path] = [
-    _HOME / ".local" / "share" / "Steam",                                          # Linux Standard
+    _HOME / ".local" / "share" / "Steam",                                          # Standard
     _XDG_DATA / "Steam",                                                           # XDG_DATA_HOME override
     _HOME / ".var" / "app" / "com.valvesoftware.Steam" / ".local" / "share" / "Steam",  # Flatpak
     _HOME / ".var" / "app" / "com.valvesoftware.Steam" / "data" / "Steam",         # Flatpak (ProtonPlus spelling)
@@ -41,6 +43,12 @@ if _sys.platform == "darwin":
     _STEAM_CANDIDATES.extend([
         _HOME / "Library" / "Application Support" / "Steam",                       # macOS standard
     ])
+
+# Script names a compat tool directory may expose: classic Proton tools ship
+# a `proton` script; NotProton tools (macOS) ship a Proton-verb-compatible
+# `run` script instead. Keeping this list darwin-guarded leaves Linux
+# behavior (and its scanning) completely untouched.
+_TOOL_SCRIPT_NAMES = ("proton", "run") if _sys.platform == "darwin" else ("proton",)
 
 # Steam normally writes "libraryfolders.vdf", but some installs (and older
 # clients) use the singular "libraryfolder.vdf". Accept both spellings.
@@ -98,6 +106,13 @@ def _own_process_in_steam_flatpak() -> bool:
 def _in_flatpak_sandbox() -> bool:
     """True when this process runs inside any Flatpak sandbox."""
     return os.path.exists("/.flatpak-info")
+
+
+def _host_tool_path(path: "str | Path") -> str:
+    value = str(path)
+    if _in_flatpak_sandbox() and value.startswith("/run/host/"):
+        return value[len("/run/host"):]
+    return value
 
 
 def steam_client_installed() -> bool:
@@ -545,8 +560,8 @@ def _wrap_in_steam_runtime(cmd: list[str], proton_script: "Path",
         # pressure-vessel need not bind a Proton that lives outside $HOME
         # (a compatibilitytools.d on a second drive).
         env.setdefault("STEAM_COMPAT_TOOL_PATHS",
-                       f"{proton_script.parent}:{entry.parent}")
-    return [str(entry), f"--verb={verb}", "--", *cmd]
+                       f"{_host_tool_path(proton_script.parent)}:{_host_tool_path(entry.parent)}")
+    return [_host_tool_path(entry), f"--verb={verb}", "--", *cmd]
 
 
 def _host_python() -> str:
@@ -634,17 +649,34 @@ def proton_run_command(
     # chdir into it.
     directory = str(host_cwd) if host_cwd is not None else "/"
 
+    if env and env.get("_AMM_BOTTLES_PREFIX"):
+        from Utils.launchers.bottles_runtime import bottles_tool_command
+        payload = list(map(str, args))
+        if payload and payload[0] in ("run", "runinprefix", "waitforexitandrun"):
+            payload.pop(0)
+        return bottles_tool_command(env["_AMM_BOTTLES_PREFIX"], payload, env,
+                                    cwd=host_cwd)
+
     script = Path(proton_script)
     if script.name in ("wine", "wine64"):
         payload = [a for a in map(str, args) if a not in
                    ("run", "runinprefix", "waitforexitandrun")]
-        cmd = [str(script), *payload]
+        cmd = wrap_nixos_command([_host_tool_path(script), *payload], env=env)
         if _in_flatpak_sandbox() and shutil.which("flatpak-spawn"):
             from Utils.flatpak.env import flatpak_forward_env_args
             fwd = flatpak_forward_env_args(env)
             cmd = ["flatpak-spawn", "--host", f"--directory={directory}",
                    *fwd, *cmd]
         return cmd
+
+    if (_sys.platform == "darwin" and script.name == "run"
+            and script.parent.name.startswith("notproton")):
+        # NotProton tool (macOS): the ``run`` script is a Proton-verb-
+        # compatible shell script (NotProton's dylib/feats/compat_run.sh).
+        # Invoke it directly with the verb passed through - the python3
+        # wrapper, Steam runtime container, flatpak wrapping and umu
+        # routing below are all Linux-only concepts for it.
+        return [str(script), *map(str, args)]
 
     if not steam_client_installed():
         # Steam-less system (Heroic/Lutris-only, GH#320): a raw
@@ -681,7 +713,7 @@ def proton_run_command(
                                    host_cwd=directory)
         _maybe_log_steamless_no_umu()
 
-    base = [_host_python(), str(proton_script), *map(str, args)]
+    base = [_host_python(), _host_tool_path(proton_script), *map(str, args)]
     if not (_proton_script_in_steam_flatpak(proton_script)
             and not _own_process_in_steam_flatpak()):
         # Game launches go through Steam's own runtime container (see
@@ -691,6 +723,7 @@ def proton_run_command(
         # left bare: that Proton already runs inside Steam's own sandbox,
         # where its runtime and libraries are the ones it expects.
         base = _wrap_in_steam_runtime(base, proton_script, args, env)
+        base = wrap_nixos_command(base, env=env)
         if _in_flatpak_sandbox() and shutil.which("flatpak-spawn"):
             from Utils.flatpak.env import flatpak_forward_env_args
             fwd = flatpak_forward_env_args(env)
@@ -786,8 +819,8 @@ def list_installed_proton() -> list[Path]:
                 for entry in search_dir.iterdir():
                     if not entry.is_dir():
                         continue
-                    proton_script = entry / "proton"
-                    if not proton_script.is_file():
+                    proton_script = _first_tool_script(entry)
+                    if proton_script is None:
                         continue
                     resolved = proton_script.resolve()
                     if resolved in seen:
@@ -855,6 +888,17 @@ def find_any_installed_proton(preferred_name: str = "") -> Path | None:
                         e.g. "GE-Proton10-28".
     """
     preferred_norm = _normalize_tool_name(preferred_name) if preferred_name else ""
+
+    if _sys.platform == "darwin" and preferred_name:
+        # Wizard/UI labels for NotProton tools are display names (with a
+        # flavor suffix), not tool directory names - match them label-aware
+        # before the directory-name logic below (bottle names and Proton
+        # dir names never match a NotProton label, so this cannot steal a
+        # non-NotProton selection).
+        from Utils.notproton_finder import find_notproton_tool
+        tool = find_notproton_tool(preferred_name)
+        if tool is not None:
+            return tool.run_script
 
     candidates = list_installed_proton()
 
@@ -1204,6 +1248,12 @@ def _all_proton_search_roots() -> list[Path]:
     for steam_root in _STEAM_CANDIDATES:
         _add(steam_root)
 
+    for system_root in ("/usr/share/steam", "/usr/local/share/steam"):
+        if _in_flatpak_sandbox():
+            _add(Path("/run/host") / system_root.lstrip("/"))
+        else:
+            _add(Path(system_root))
+
     for steam_root in _STEAM_CANDIDATES:
         vdf_path = steam_root / "steamapps" / _VDF_FILENAME
         if not vdf_path.is_file():
@@ -1482,17 +1532,26 @@ def find_proton_for_game(steam_id: str) -> Path | None:
 
         for search_dir in search_dirs:
             # Exact match first
-            candidate = search_dir / dir_name / "proton"
-            if candidate.is_file():
-                return candidate
+            for script_name in _TOOL_SCRIPT_NAMES:
+                candidate = search_dir / dir_name / script_name
+                if candidate.is_file():
+                    return candidate
 
             # Case-insensitive match (handles minor name variations)
             if search_dir.is_dir():
                 dir_lower = dir_name.lower()
                 for entry in search_dir.iterdir():
                     if entry.name.lower() == dir_lower:
-                        p = entry / "proton"
-                        if p.is_file():
+                        for p in _tool_scripts_in(entry):
+                            return p
+                    for p in _tool_scripts_in(entry):
+                        try:
+                            manifest = (entry / "compatibilitytool.vdf").read_text(
+                                encoding="utf-8", errors="replace")
+                        except OSError:
+                            continue
+                        if re.search(r'"' + re.escape(tool_name) + r'"\s*\{',
+                                     manifest):
                             return p
 
     # --- Fallback: read compatdata/<steam_id>/config_info ----------------
@@ -1533,6 +1592,42 @@ def find_proton_for_game(steam_id: str) -> Path | None:
                     return candidate
 
     return None
+
+
+def _first_tool_script(entry: Path) -> Path | None:
+    """First existing compat-tool script inside *entry* (``proton``, and on
+    macOS ``run`` for NotProton tools), or None."""
+    for name in _TOOL_SCRIPT_NAMES:
+        script = entry / name
+        if script.is_file():
+            return script
+    return None
+
+
+def _tool_scripts_in(entry: Path) -> list[Path]:
+    """Existing compat-tool scripts inside *entry*, in preference order
+    (``proton`` first, then ``run`` on macOS)."""
+    return [entry / name for name in _TOOL_SCRIPT_NAMES
+            if (entry / name).is_file()]
+
+
+def find_notproton_for_prefix(compat_data, prefix=None) -> Path | None:
+    """macOS/NotProton fallback for the per-game runner script.
+
+    When Steam wrote no ``CompatToolMapping`` entry and no ``config_info``
+    (a fresh prefix, or the tool was selected in NotProton rather than
+    Steam), the prefix's ``notproton-build`` record still names the build
+    that owns it. Resolves that record to the tool's ``run`` script, or
+    None - including on non-macOS systems, where it is always None.
+    """
+    if _sys.platform != "darwin":
+        return None
+    from Utils.notproton_finder import runner_for_prefix
+
+    tool = runner_for_prefix(Path(compat_data), prefix)
+    if tool is None or not tool.run_script.is_file():
+        return None
+    return tool.run_script
 
 
 def _parse_acf_installdir(acf_path: Path) -> str | None:

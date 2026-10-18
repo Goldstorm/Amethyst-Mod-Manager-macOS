@@ -34,6 +34,7 @@ HEROIC_FLATPAK_ID = "com.heroicgameslauncher.hgl"
 STEAM_FLATPAK_ID = "com.valvesoftware.Steam"
 LUTRIS_FLATPAK_ID = "net.lutris.Lutris"
 FAUGUS_FLATPAK_ID = "io.github.Faugus.faugus-launcher"
+BOTTLES_FLATPAK_ID = "com.usebottles.bottles"
 
 # Friendly launcher names for user-facing messages.
 _APP_NAMES = {
@@ -41,6 +42,7 @@ _APP_NAMES = {
     STEAM_FLATPAK_ID: "Steam",
     LUTRIS_FLATPAK_ID: "Lutris",
     FAUGUS_FLATPAK_ID: "Faugus",
+    BOTTLES_FLATPAK_ID: "Bottles",
 }
 
 _HOME = Path.home()
@@ -115,6 +117,17 @@ def sandbox_app_for_game(game, game_root: Optional[Path]) -> Optional[str]:
     If the user also has the native launcher installed and that one actually
     starts the game, the extra override is harmless.
     """
+    bottles_app = None
+    try:
+        from Utils.executables.launch import bottles_programs_for_launch, _saved_launcher_id
+        from Utils.launchers.bottles import find_bottles_launch_info
+        program = find_bottles_launch_info(bottles_programs_for_launch(game))
+        if program is not None:
+            bottles_app = BOTTLES_FLATPAK_ID if program.root.is_flatpak else None
+            if _saved_launcher_id(game, "bottles_program"):
+                return bottles_app
+    except Exception:
+        pass
     if game_root:
         app = _flatpak_app_owning_path(Path(game_root))
         if app:
@@ -146,7 +159,7 @@ def sandbox_app_for_game(game, game_root: Optional[Path]) -> Optional[str]:
                 return FAUGUS_FLATPAK_ID
         except Exception:
             pass
-    return None
+    return bottles_app
 
 
 # ---------------------------------------------------------------------------
@@ -384,9 +397,12 @@ def ensure_symlink_target_access(
     """
     if sys.platform == "darwin":
         return
-    if os.environ.get("AMM_FLATPAK_OVERRIDE", "1") == "0":
-        return
     try:
+        from Utils.launchers.bottles_sandbox import ensure_cpak_game_paths
+        if ensure_cpak_game_paths(game, game_root, staging, profile_dir, log_fn):
+            return
+        if os.environ.get("AMM_FLATPAK_OVERRIDE", "1") == "0":
+            return
         app_id = sandbox_app_for_game(game, game_root)
         if not app_id:
             return
