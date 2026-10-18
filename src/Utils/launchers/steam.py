@@ -44,6 +44,12 @@ if _sys.platform == "darwin":
         _HOME / "Library" / "Application Support" / "Steam",                       # macOS standard
     ])
 
+# Script names a compat tool directory may expose: classic Proton tools ship
+# a `proton` script; NotProton tools (macOS) ship a Proton-verb-compatible
+# `run` script instead. Keeping this list darwin-guarded leaves Linux
+# behavior (and its scanning) completely untouched.
+_TOOL_SCRIPT_NAMES = ("proton", "run") if _sys.platform == "darwin" else ("proton",)
+
 # Steam normally writes "libraryfolders.vdf", but some installs (and older
 # clients) use the singular "libraryfolder.vdf". Accept both spellings.
 _VDF_FILENAMES = ("libraryfolders.vdf", "libraryfolder.vdf")
@@ -804,8 +810,8 @@ def list_installed_proton() -> list[Path]:
                 for entry in search_dir.iterdir():
                     if not entry.is_dir():
                         continue
-                    proton_script = entry / "proton"
-                    if not proton_script.is_file():
+                    proton_script = _first_tool_script(entry)
+                    if proton_script is None:
                         continue
                     resolved = proton_script.resolve()
                     if resolved in seen:
@@ -1506,28 +1512,27 @@ def find_proton_for_game(steam_id: str) -> Path | None:
 
         for search_dir in search_dirs:
             # Exact match first
-            candidate = search_dir / dir_name / "proton"
-            if candidate.is_file():
-                return candidate
+            for script_name in _TOOL_SCRIPT_NAMES:
+                candidate = search_dir / dir_name / script_name
+                if candidate.is_file():
+                    return candidate
 
             # Case-insensitive match (handles minor name variations)
             if search_dir.is_dir():
                 dir_lower = dir_name.lower()
                 for entry in search_dir.iterdir():
                     if entry.name.lower() == dir_lower:
-                        p = entry / "proton"
-                        if p.is_file():
+                        for p in _tool_scripts_in(entry):
                             return p
-                    p = entry / "proton"
-                    if not p.is_file():
-                        continue
-                    try:
-                        manifest = (entry / "compatibilitytool.vdf").read_text(
-                            encoding="utf-8", errors="replace")
-                    except OSError:
-                        continue
-                    if re.search(r'"' + re.escape(tool_name) + r'"\s*\{', manifest):
-                        return p
+                    for p in _tool_scripts_in(entry):
+                        try:
+                            manifest = (entry / "compatibilitytool.vdf").read_text(
+                                encoding="utf-8", errors="replace")
+                        except OSError:
+                            continue
+                        if re.search(r'"' + re.escape(tool_name) + r'"\s*\{',
+                                     manifest):
+                            return p
 
     # --- Fallback: read compatdata/<steam_id>/config_info ----------------
     # When Steam uses the default Proton for a game it may not write an
@@ -1567,6 +1572,42 @@ def find_proton_for_game(steam_id: str) -> Path | None:
                     return candidate
 
     return None
+
+
+def _first_tool_script(entry: Path) -> Path | None:
+    """First existing compat-tool script inside *entry* (``proton``, and on
+    macOS ``run`` for NotProton tools), or None."""
+    for name in _TOOL_SCRIPT_NAMES:
+        script = entry / name
+        if script.is_file():
+            return script
+    return None
+
+
+def _tool_scripts_in(entry: Path) -> list[Path]:
+    """Existing compat-tool scripts inside *entry*, in preference order
+    (``proton`` first, then ``run`` on macOS)."""
+    return [entry / name for name in _TOOL_SCRIPT_NAMES
+            if (entry / name).is_file()]
+
+
+def find_notproton_for_prefix(compat_data, prefix=None) -> Path | None:
+    """macOS/NotProton fallback for the per-game runner script.
+
+    When Steam wrote no ``CompatToolMapping`` entry and no ``config_info``
+    (a fresh prefix, or the tool was selected in NotProton rather than
+    Steam), the prefix's ``notproton-build`` record still names the build
+    that owns it. Resolves that record to the tool's ``run`` script, or
+    None - including on non-macOS systems, where it is always None.
+    """
+    if _sys.platform != "darwin":
+        return None
+    from Utils.notproton_finder import runner_for_prefix
+
+    tool = runner_for_prefix(Path(compat_data), prefix)
+    if tool is None or not tool.run_script.is_file():
+        return None
+    return tool.run_script
 
 
 def _parse_acf_installdir(acf_path: Path) -> str | None:
