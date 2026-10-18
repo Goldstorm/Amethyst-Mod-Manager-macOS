@@ -307,7 +307,8 @@ def test_get_default_runner_type_is_string() -> None:
     """get_default_runner_type() must return a string."""
     t = get_default_runner_type()
     assert isinstance(t, str)
-    assert t in ("proton", "crossover", "system_wine", "lutris", "heroic")
+    assert t in ("proton", "crossover", "system_wine", "lutris", "heroic",
+                 "notproton")
     print(f"✓ get_default_runner_type() returns valid string: '{t}'")
 
 

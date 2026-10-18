@@ -54,6 +54,11 @@ _STEAM_ROOTS: list[Path] = list(_STEAM_CANDIDATES)
 # NotProton keeps its patched CrossOver runner copies here.
 _RUNNERS_ROOT = Path.home() / "Library" / "Application Support" / "notproton" / "runners"
 
+# The user's CrossOver home. NotProton's run script exports it so the
+# patched wine's cxcompatdb.dll resolves its database without logging an
+# error per loaded module (compat_run.sh: export CX_HOME=...).
+_CX_HOME = Path.home() / "Library" / "Application Support" / "CrossOver"
+
 _TOOL_NAME_PREFIX = "notproton"
 
 _DISPLAY_NAME_RE = re.compile(r'"display_name"\s+"([^"]*)"')
@@ -251,6 +256,25 @@ def find_notproton_tool(name: str) -> NotProtonTool | None:
         if target in candidates:
             return tool
     return None
+
+
+def notproton_tool_env(tool: NotProtonTool) -> dict[str, str]:
+    """The env the tool's own run script sets, as a dict.
+
+    Mirrors compat_run.sh exactly: ``CX_ROOT`` (the runner copy), ``CX_HOME``
+    (cxcompatdb's database lookup), ``WINEDLLPATH`` (the x86_64-windows DLLs
+    ahead of the unix loader dir - the first-listed directory wins when a DLL
+    exists in both) and ``WINESERVER`` (the flavor-matched server binary).
+    Callers additionally set ``WINEPREFIX`` and put ``tool.cx_root / "bin"``
+    first on ``PATH``, as the run script does for every invocation.
+    """
+    return {
+        "CX_ROOT": str(tool.cx_root),
+        "CX_HOME": str(_CX_HOME),
+        "WINEDLLPATH": (f"{tool.cx_root / 'lib' / 'wine' / 'x86_64-windows'}:"
+                        f"{tool.wine_unix_dir}"),
+        "WINESERVER": str(tool.wineserver),
+    }
 
 
 def tool_for_build(build: str, flavor: str | None = None) -> NotProtonTool | None:

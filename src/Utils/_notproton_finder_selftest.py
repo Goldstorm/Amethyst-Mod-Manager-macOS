@@ -152,6 +152,7 @@ def _run_all() -> None:
             _test_listing_and_exclusions(fx)
             _test_listing_order(fx)
             _test_wine_selection(fx)
+            _test_tool_env(fx)
             _test_missing_runner_copy(fx)
             _test_find_by_label(fx)
             _test_tool_for_build(fx)
@@ -212,6 +213,27 @@ def _test_wine_selection(fx: _Fixture) -> None:
     assert rosetta.wineserver == rosetta.cx_root / "bin" / "wineserver"
     assert rosetta.wineserver.is_file()
     print("✓ wine/wineserver resolution mirrors compat_run.sh per flavor")
+
+
+def _test_tool_env(fx: _Fixture) -> None:
+    tools = {t.name: t for t in npf.list_notproton_tools()}
+
+    rosetta = tools["notproton-26.3"]
+    env = npf.notproton_tool_env(rosetta)
+    assert set(env) == {"CX_ROOT", "CX_HOME", "WINEDLLPATH", "WINESERVER"}
+    assert env["CX_ROOT"] == str(rosetta.cx_root)
+    assert env["CX_HOME"] == str(npf._CX_HOME)
+    expected_dllpath = (f"{rosetta.cx_root / 'lib' / 'wine' / 'x86_64-windows'}"
+                        f":{rosetta.wine_unix_dir}")
+    assert env["WINEDLLPATH"] == expected_dllpath, env["WINEDLLPATH"]
+    assert env["WINESERVER"] == str(rosetta.wineserver)
+
+    fex = tools["notproton-fex-41069"]
+    fenv = npf.notproton_tool_env(fex)
+    # fex: WINEDLLPATH ends with the aarch64 loader dir, not x86_64-unix.
+    assert fenv["WINEDLLPATH"].endswith(f":{fex.wine_unix_dir}")
+    assert fex.wine_unix_dir.name == "aarch64-unix"
+    print("✓ notproton_tool_env() mirrors compat_run.sh per flavor")
 
 
 def _test_missing_runner_copy(fx: _Fixture) -> None:

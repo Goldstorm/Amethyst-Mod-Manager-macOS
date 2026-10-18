@@ -669,6 +669,15 @@ def proton_run_command(
                    *fwd, *cmd]
         return cmd
 
+    if (_sys.platform == "darwin" and script.name == "run"
+            and script.parent.name.startswith("notproton")):
+        # NotProton tool (macOS): the ``run`` script is a Proton-verb-
+        # compatible shell script (NotProton's dylib/feats/compat_run.sh).
+        # Invoke it directly with the verb passed through - the python3
+        # wrapper, Steam runtime container, flatpak wrapping and umu
+        # routing below are all Linux-only concepts for it.
+        return [str(script), *map(str, args)]
+
     if not steam_client_installed():
         # Steam-less system (Heroic/Lutris-only, GH#320): a raw
         # ``python3 proton <verb>`` needs a Steam client for its compat
@@ -879,6 +888,17 @@ def find_any_installed_proton(preferred_name: str = "") -> Path | None:
                         e.g. "GE-Proton10-28".
     """
     preferred_norm = _normalize_tool_name(preferred_name) if preferred_name else ""
+
+    if _sys.platform == "darwin" and preferred_name:
+        # Wizard/UI labels for NotProton tools are display names (with a
+        # flavor suffix), not tool directory names - match them label-aware
+        # before the directory-name logic below (bottle names and Proton
+        # dir names never match a NotProton label, so this cannot steal a
+        # non-NotProton selection).
+        from Utils.notproton_finder import find_notproton_tool
+        tool = find_notproton_tool(preferred_name)
+        if tool is not None:
+            return tool.run_script
 
     candidates = list_installed_proton()
 

@@ -48,13 +48,20 @@ if TYPE_CHECKING:
 def _list_runner_versions() -> list[str]:
     """Runner names for this platform.
 
-    Linux: installed Proton versions. macOS: CrossOver bottles plus a
-    "System Wine" entry when a Homebrew/system wine binary is found.
+    Linux: installed Proton versions. macOS: NotProton tools (display name
+    with a (FEX)/(Rosetta) suffix), then CrossOver bottles, then a "System
+    Wine" entry when a Homebrew/system wine binary is found. NotProton
+    labels resolve back to their tool label-aware (find_notproton_tool).
     """
     if sys.platform == "darwin":
+        from Utils import notproton_finder as npf
+        versions: list[str] = []
+        for tool in npf.list_notproton_tools():
+            suffix = " (FEX)" if tool.flavor == "fex" else " (Rosetta)"
+            versions.append(tool.display + suffix)
         from Utils.crossover_finder import list_crossover_bottles
         from Utils.wine_runner import SystemWineRunner
-        versions = [b.name for b in list_crossover_bottles()]
+        versions.extend(b.name for b in list_crossover_bottles())
         if SystemWineRunner().find_wine_binary():
             versions.append("System Wine")
         return versions
@@ -183,9 +190,13 @@ class ProtonStepWidget(QWidget):
         self._versions = _list_runner_versions()
         if sys.platform == "darwin":
             _no_versions_msg = self.tr(
-                "No CrossOver bottles or system Wine were found. Install "
-                "CrossOver (codeweavers.com) or Wine via Homebrew "
-                "(`brew install --cask wine-stable`), then reopen this wizard.")
+                "No NotProton tools, CrossOver bottles or system Wine were "
+                "found. Install NotProton "
+                "(`brew install --cask notprotonnot/notproton/notproton`) "
+                "and select a NotProton tool in Steam -> Settings -> "
+                "Compatibility, or install CrossOver (codeweavers.com) / "
+                "Wine (`brew install --cask wine-stable`), then reopen this "
+                "wizard.")
         else:
             _no_versions_msg = self.tr(
                 "No Proton versions were found. Install one through Steam or "
@@ -250,9 +261,19 @@ class ProtonStepWidget(QWidget):
             self._game_chk = QCheckBox(self.tr("Use game prefix"))
             self._game_chk.setChecked(mode == PREFIX_MODE_GAME)
             self._game_chk.toggled.connect(self._on_game_pfx_toggle)
-            add_help_control(self._game_chk, self.tr(
-                "Run inside the game's own prefix. No new prefix is created "
-                "and the Proton version follows the game's Steam setting."))
+            if sys.platform == "darwin":
+                _game_pfx_help = self.tr(
+                    "Run inside the game's own prefix. No new prefix is "
+                    "created; the runner that owns the prefix (the NotProton "
+                    "tool selected for the game, or the CrossOver bottle the "
+                    "game is in) drives the tool, so the runner picker above "
+                    "does not apply in this mode.")
+            else:
+                _game_pfx_help = self.tr(
+                    "Run inside the game's own prefix. No new prefix is "
+                    "created and the Proton version follows the game's Steam "
+                    "setting.")
+            add_help_control(self._game_chk, _game_pfx_help)
 
         # ---- winetricks-style launch ----
         self._winetricks_chk = QCheckBox(

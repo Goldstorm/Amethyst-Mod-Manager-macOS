@@ -100,20 +100,24 @@ def list_installed_proton() -> list[Path]:
         from Utils.launchers.steam import list_installed_proton as _original
         return _original()
 
-    # macOS: return CrossOver bottles as "runner paths"
+    # macOS: NotProton tools first (the Steam scan returns their run
+    # scripts; on a Mac without NotProton it returns nothing), then
+    # CrossOver bottles as "runner paths", then system wine.
+    from Utils.launchers.steam import list_installed_proton as _steam_list
+    entries = list(_steam_list())
     from Utils.crossover_finder import list_crossover_bottles
-    bottles = list_crossover_bottles()
+    entries.extend(list_crossover_bottles())
 
     # Also check for system wine
     from Utils.wine_runner import SystemWineRunner
     sys_wine = SystemWineRunner().find_wine_binary()
     if sys_wine:
-        bottles.append(sys_wine.parent)
+        entries.append(sys_wine.parent)
 
     # Deduplicate
     seen: set[Path] = set()
     result: list[Path] = []
-    for b in bottles:
+    for b in entries:
         try:
             resolved = b.resolve()
         except Exception:
@@ -143,10 +147,16 @@ def find_prefix(
         from Utils.launchers.steam import find_prefix as _original
         return _original(steam_id, game_path)
 
-    # macOS: try to find a CrossOver bottle
-    from Utils.crossover_finder import find_crossover_bottle, list_crossover_bottles
+    # macOS: Steam's compatdata layout first (NotProton prefixes live at
+    # steamapps/compatdata/<id>/pfx, exactly like Linux Proton), then fall
+    # back to CrossOver bottles.
+    from Utils.launchers.steam import find_prefix as _steam_find_prefix
+    steam_prefix = _steam_find_prefix(steam_id, game_path) if steam_id else None
+    if steam_prefix is not None:
+        return steam_prefix
 
     # Try to find by app ID (some games use Steam ID as bottle name)
+    from Utils.crossover_finder import find_crossover_bottle, list_crossover_bottles
     if steam_id:
         bottle = find_crossover_bottle(steam_id)
         if bottle:
