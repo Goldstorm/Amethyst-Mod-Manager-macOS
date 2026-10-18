@@ -1,3 +1,16 @@
+- v2.5.4-macOS
+### Additions
+- Added NotProton (Steam Play) support for wizard tools: NotProton tools (FEX and Rosetta) are listed in the "Choose Wine Runner" step and isolated/shared prefixes are created and run with the selected tool's patched-CrossOver wine
+- Game prefixes are now auto-detected from Steam's compatdata folder, and wizard tools in "Use game prefix" mode run with the NotProton runner that owns the prefix
+- Play with launch mode "None" launches Steam games through the NotProton run script for the tool Steam has mapped to the game
+- Play with launch mode "Auto" hands off to Steam via steam:// (LaunchServices)
+- When the NotProton build that owns a prefix is no longer installed, the failure is reported along with the tail of the prefix's notproton-run.log
+### Changes
+- Merged upstream main (v2.5.4) into the macOS branch
+- The wizard no-runner message and the onboarding add-a-game hint now point at NotProton first (CrossOver bottles and system Wine remain supported)
+
+---
+
 - v2.5.4
 ### Additions
 - Added support for games installed via Bottles
