@@ -14,7 +14,8 @@ from pathlib import Path
 
 
 def remove_mods(game, profile_dir: Path, mod_names: list[str], log_fn=None, *,
-                staging_root: Path | None = None, strict: bool = False) -> None:
+                staging_root: Path | None = None, strict: bool = False,
+                remove_links: bool = True) -> None:
     """Fully remove *mod_names* for *game* / *profile_dir*:
 
       1. undeploy their files from the game dir (before deleting staging, so
@@ -29,6 +30,8 @@ def remove_mods(game, profile_dir: Path, mod_names: list[str], log_fn=None, *,
     log = log_fn or (lambda _m: None)
     if game is None or not mod_names:
         return
+    from amethyst_plugins.guards import validate_operation
+    validate_operation(game, profile_dir, "mods.remove", mods=list(mod_names))
     try:
         staging_root = (Path(staging_root) if staging_root is not None
                         else game.get_effective_mod_staging_path())
@@ -57,7 +60,8 @@ def remove_mods(game, profile_dir: Path, mod_names: list[str], log_fn=None, *,
     if deploy_active:
         try:
             undeploy_catalog_mods(
-                game, profile, Path(staging_root), mod_names, log_fn=log)
+                game, profile, Path(staging_root), mod_names, log_fn=log,
+                strict=strict)
         except Exception as exc:
             log(f"undeploy during remove failed: {exc}")
             if strict:
@@ -74,59 +78,85 @@ def remove_mods(game, profile_dir: Path, mod_names: list[str], log_fn=None, *,
         if strict:
             raise
 
-    # 3. Delete staging folders. A symlinked mod dir (Profile Group link
-    #    farm) is unlinked, never rmtree'd - rmtree on a dir symlink raises,
-    #    and following it would delete the member profile's real files.
-    for name in mod_names:
-        folder = staging_root / name
-        if folder.is_symlink():
-            try:
-                folder.unlink()
-            except OSError as exc:
-                log(f"could not remove staging link for '{name}': {exc}")
-                if strict:
-                    raise
-        elif folder.is_dir():
-            try:
-                if strict:
-                    meta = folder / "meta.ini"
-                    saved_meta = meta.read_bytes() if meta.is_file() else None
-                    for child in folder.iterdir():
-                        if child.name == "meta.ini":
-                            continue
-                        if child.is_dir() and not child.is_symlink():
-                            shutil.rmtree(child)
-                        else:
-                            child.unlink()
-                    meta.unlink(missing_ok=True)
-                    try:
-                        folder.rmdir()
-                    except OSError:
-                        if saved_meta is not None and folder.is_dir() and not meta.exists():
-                            from Utils.atomic_write import atomic_writer
-                            with atomic_writer(meta, mode="wb") as stream:
-                                stream.write(saved_meta)
-                        raise
-                else:
-                    shutil.rmtree(folder)
-            except OSError as exc:
-                log(f"could not delete staging folder for '{name}': {exc}")
-                if strict:
-                    raise
-
-    # 4. Drop targeted catalog/deployed-state rows.
-    try:
-        profile.forget_deployed_mods(mod_names)
+    from Utils.mods.links import removing_sources
+    with removing_sources(game, [staging_root / name for name in mod_names],
+                          enabled=remove_links, log_fn=log):
+        # 3. Delete staging folders. A symlinked mod dir (Profile Group link
+        #    farm) is unlinked, never rmtree'd - rmtree on a dir symlink raises,
+        #    and following it would delete the member profile's real files.
         for name in mod_names:
-            library.remove_mod(name)
-    except Exception as exc:
-        log(f"catalog cleanup during remove failed: {exc}")
-        if strict:
-            raise
+            folder = staging_root / name
+            if folder.is_symlink():
+                try:
+                    folder.unlink()
+                    from Utils.mods.links import remove_link_state
+                    remove_link_state(profile_dir, name)
+                except OSError as exc:
+                    log(f"could not remove staging link for '{name}': {exc}")
+                    if strict:
+                        raise
+            elif folder.is_dir():
+                try:
+                    if strict:
+                        meta = folder / "meta.ini"
+                        saved_meta = meta.read_bytes() if meta.is_file() else None
+                        for child in folder.iterdir():
+                            if child.name == "meta.ini":
+                                continue
+                            if child.is_dir() and not child.is_symlink():
+                                shutil.rmtree(child)
+                            else:
+                                child.unlink()
+                        meta.unlink(missing_ok=True)
+                        try:
+                            folder.rmdir()
+                        except OSError:
+                            if saved_meta is not None and folder.is_dir() and not meta.exists():
+                                from Utils.atomic_write import atomic_writer
+                                with atomic_writer(meta, mode="wb") as stream:
+                                    stream.write(saved_meta)
+                            raise
+                    else:
+                        shutil.rmtree(folder)
+                except OSError as exc:
+                    log(f"could not delete staging folder for '{name}': {exc}")
+                    if strict:
+                        raise
+
+        # 4. Drop targeted catalog/deployed-state rows.
+        try:
+            profile.forget_deployed_mods(mod_names)
+            for name in mod_names:
+                library.remove_mod(name)
+        except Exception as exc:
+            log(f"catalog cleanup during remove failed: {exc}")
+            if strict:
+                raise
+
+    removed = [name for name in mod_names if not (Path(staging_root) / name).exists()
+               and not (Path(staging_root) / name).is_symlink()]
+    if removed:
+        try:
+            from amethyst_plugins.metadata import update_mods
+            from Utils.mods.copy import resolve_target_staging
+            profiles = {Path(profile_dir)}
+            root = getattr(game, "get_profile_root", lambda: None)()
+            if root is not None and (Path(root) / "profiles").is_dir():
+                for candidate in (Path(root) / "profiles").iterdir():
+                    if (candidate.is_dir() and not candidate.is_symlink()
+                            and Path(resolve_target_staging(game, candidate)).resolve() == Path(staging_root).resolve()):
+                        profiles.add(candidate)
+            for affected in profiles:
+                update_mods(affected, drops=removed)
+        except Exception as exc:
+            log(f"plugin metadata cleanup during remove failed: {exc}")
+            if strict:
+                raise
 
 
 def undeploy_catalog_mods(game, profile, staging_root: Path,
-                          mod_names: list[str], log_fn=None) -> int:
+                          mod_names: list[str], log_fn=None, *,
+                          strict: bool = False) -> int:
     """Safely unlink committed deployment entries owned by *mod_names*.
 
     The source tree must still exist. Copies are accepted only when size and
@@ -172,14 +202,37 @@ def undeploy_catalog_mods(game, profile, staging_root: Path,
                         stop_dirs.add(root)
         except OSError as exc:
             log(f"could not undeploy {destination}: {exc}")
+            if strict:
+                raise
     _prune_empty_dirs(dirs_to_prune, stop_dirs=stop_dirs)
     if removed:
         log(f"undeployed {removed} file(s) owned by removed mod(s).")
     return removed
 
 
+def _mod_plugin_names(game, folders) -> set[str]:
+    plugin_exts = {e.lower() for e in (getattr(game, "plugin_extensions", ()) or ())}
+    names: set[str] = set()
+    for folder in folders:
+        if folder.is_dir():
+            for f in folder.iterdir():
+                if f.is_file() and f.suffix.lower() in plugin_exts:
+                    names.add(f.name.lower())
+            # Rule-routing games (Oblivion Remastered): nested plugins that
+            # deploy to the top of the data dir were synced into plugins.txt
+            # too - strip those names as well.
+            try:
+                from Utils.games.registry import routed_mod_plugin_names
+                for n in routed_mod_plugin_names(game, folder):
+                    names.add(n.lower())
+            except Exception:
+                pass
+    return names
+
+
 def _remove_plugins_for_mods(game, profile_dir: Path, staging_root: Path,
-                             mod_names: list[str], log, *, preserve_remaining=False) -> None:
+                             mod_names: list[str], log, *, preserve_remaining=False,
+                             missing_plugins=()) -> None:
     """Drop the mods' plugin files from plugins.txt + loadorder.txt."""
     plugin_exts = {e.lower() for e in (getattr(game, "plugin_extensions", []) or [])}
     if not plugin_exts:
@@ -187,22 +240,8 @@ def _remove_plugins_for_mods(game, profile_dir: Path, staging_root: Path,
     plugins_path = profile_dir / "plugins.txt"
     if not plugins_path.is_file():
         return
-    to_remove: set[str] = set()
-    for name in mod_names:
-        folder = staging_root / name
-        if folder.is_dir():
-            for f in folder.iterdir():
-                if f.is_file() and f.suffix.lower() in plugin_exts:
-                    to_remove.add(f.name.lower())
-            # Rule-routing games (Oblivion Remastered): nested plugins that
-            # deploy to the top of the data dir were synced into plugins.txt
-            # too - strip those names as well.
-            try:
-                from Utils.games.registry import routed_mod_plugin_names
-                for n in routed_mod_plugin_names(game, folder):
-                    to_remove.add(n.lower())
-            except Exception:
-                pass
+    to_remove = set(missing_plugins) | _mod_plugin_names(
+        game, [staging_root / name for name in mod_names])
     if preserve_remaining and to_remove:
         from Utils.mods.modlist import read_modlist
         removed = {name.casefold() for name in mod_names}
@@ -215,9 +254,9 @@ def _remove_plugins_for_mods(game, profile_dir: Path, staging_root: Path,
             for child in folder.iterdir():
                 if child.is_file() and child.suffix.lower() in plugin_exts:
                     to_remove.discard(child.name.lower())
-            from Utils.games.registry import routed_mod_plugin_names
-            for name in routed_mod_plugin_names(game, folder):
-                to_remove.discard(name.lower())
+            from Utils.games.registry import routed_mod_plugin_names as routed_names
+            for plugin_name in routed_names(game, folder):
+                to_remove.discard(plugin_name.lower())
     if not to_remove:
         return
     from Utils.plugins import (

@@ -40,6 +40,8 @@ _NON_HANDLER_FILES = {
     "Baldur's Gate 3/modio_meta.py",
     "Baldur's Gate 3/modio_update_checker.py",
     "BepInEx/_bepinex_namespacing_selftest.py",
+    "BepInEx/bepinex_base.py",
+    "Bethesda/bethesda_base.py",
     "Bethesda/bethesda_ini.py",
     "Bethesda/skyrim_common.py",
     "Daggerfall Unity/dfu_mods_json.py",
@@ -54,6 +56,10 @@ _NON_HANDLER_FILES = {
     "Morrowind/mgexe_wizard_qt.py",
     "Morrowind/morrowind_ini.py",
     "Morrowind/openmw_cfg.py",
+    "Prey/_prey_selftest.py",
+    "RE_Engine_Invalidation/re_engine_invalidation_base.py",
+    "RE_Engine_LooseLoading/re_engine_loose_loading_base.py",
+    "The Sims/sims_base.py",
 }
 
 # Cache so we keep using the same path even if cwd changes later (e.g. after os.chdir in install_mod)
@@ -300,10 +306,10 @@ def _scan_games_dir(games_dir: Path, games: dict[str, BaseGame],
             if inspect.isabstract(cls):
                 continue
             # Strict __module__ match: classes IMPORTED into this file (e.g.
-            # Fallout_3 in every Bethesda subclass file) carry their defining
+            # BethesdaBase in each Bethesda handler) carry their defining
             # module's name and are instantiated when THEIR file loads - the
             # old membership fallback constructed each base once per sibling
-            # file (~13 Fallout_3 load_paths() runs per discovery).
+            # file (repeated load_paths() runs per discovery).
             if cls.__module__ != module_name:
                 continue
             try:
@@ -393,4 +399,9 @@ def discover_games(timing=None) -> dict[str, BaseGame]:
     except Exception:
         pass
 
+    try:
+        from amethyst_plugins.game_handlers import load
+        _load_failures.extend(load(games))
+    except Exception as exc:
+        _load_failures.append(("manager plugin games", str(exc)))
     return games

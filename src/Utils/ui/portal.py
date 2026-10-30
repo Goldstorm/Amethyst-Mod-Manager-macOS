@@ -597,7 +597,8 @@ def _run_waterfall(
     return empty
 
 
-def pick_folder(title: str, callback: Callable[[Path | None], None]) -> None:
+def pick_folder(title: str, callback: Callable[[Path | None], None], *,
+                direct_access: bool = False) -> None:
     """
     Open a native folder picker via XDG portal (or zenity fallback).
     On macOS, skips portal/zenity/kdialog and uses the toolkit picker directly.
@@ -606,10 +607,7 @@ def pick_folder(title: str, callback: Callable[[Path | None], None]) -> None:
     """
     def _worker() -> None:
         if sys.platform == "darwin":
-            chosen = _tkinter_folder(title)
-            if chosen is None:
-                chosen = None
-            callback(chosen)
+            callback(_tkinter_folder(title))
             return
         chosen = _run_waterfall(
             [
@@ -620,13 +618,16 @@ def pick_folder(title: str, callback: Callable[[Path | None], None]) -> None:
             ],
             Path, None, "Folder",
         )
+        if chosen is not None and direct_access:
+            from Utils.environment.sandbox import resolve_document_portal_path
+            chosen = resolve_document_portal_path(chosen)
         callback(chosen)
 
     threading.Thread(target=_worker, daemon=True).start()
 
 
 _MOD_ARCHIVE_FILTERS = [
-    ("Mod Archives (*.zip, *.7z, *.rar, *.tar.gz, *.tar, *.dazip, *.override, *.fomod)", ["*.zip", "*.7z", "*.rar", "*.tar.gz", "*.tar", "*.dazip", "*.override", "*.fomod"]),
+    ("Mod Archives (*.zip, *.7z, *.rar, *.tar.gz, *.tar, *.dazip, *.override, *.fomod, *.omod)", ["*.zip", "*.7z", "*.rar", "*.tar.gz", "*.tar", "*.dazip", "*.override", "*.fomod", "*.omod"]),
     ("All files", ["*"]),
 ]
 
@@ -634,10 +635,7 @@ _MOD_ARCHIVE_FILTERS = [
 def _run_file_picker_worker(title: str, filters: list[tuple[str, list[str]]], cb: Callable[[Path | None], None]) -> None:
     """Worker for file picker; runs in background thread."""
     if sys.platform == "darwin":
-        chosen = _tkinter_file(title, filters)
-        if chosen is None:
-            chosen = None
-        cb(chosen)
+        cb(_tkinter_file(title, filters))
         return
     chosen = _run_waterfall(
         [
@@ -683,7 +681,7 @@ def _zenity_files(title: str, initial_dir: str = "") -> "list[Path] | object | N
         "--separator=\n",
         f"--title={title}",
         *([f"--filename={os.path.join(initial_dir, '')}"] if initial_dir else []),
-        "--file-filter=Mod Archives (*.zip, *.7z, *.rar, *.tar.gz, *.tar, *.dazip, *.override, *.fomod) | *.zip *.7z *.rar *.tar.gz *.tar *.dazip *.override *.fomod",
+        "--file-filter=Mod Archives (*.zip, *.7z, *.rar, *.tar.gz, *.tar, *.dazip, *.override, *.fomod, *.omod) | *.zip *.7z *.rar *.tar.gz *.tar *.dazip *.override *.fomod *.omod",
         "--file-filter=All files | *",
     ])
     if result is None:
@@ -707,7 +705,7 @@ def _kdialog_files(title: str, initial_dir: str = "") -> "list[Path] | object | 
         result = subprocess.run(
             [
                 "kdialog", "--getopenfilenames", initial_dir or str(Path.home()),
-                "*.zip *.7z *.rar *.tar.gz *.tar *.dazip *.override *.fomod|Mod Archives (*.zip, *.7z, *.rar, *.tar.gz, *.tar, *.dazip, *.override, *.fomod)",
+                "*.zip *.7z *.rar *.tar.gz *.tar *.dazip *.override *.fomod *.omod|Mod Archives (*.zip, *.7z, *.rar, *.tar.gz, *.tar, *.dazip, *.override, *.fomod, *.omod)",
                 "--title", title,
             ],
             capture_output=True, text=True,
@@ -891,8 +889,7 @@ def _run_save_worker(
 ) -> None:
     if sys.platform == "darwin":
         tk_filters = [(label, " ".join(pats)) for label, pats in filters]
-        chosen = _tkinter_save(title, current_name, tk_filters)
-        cb(chosen)
+        cb(_tkinter_save(title, current_name, tk_filters))
         return
     tk_filters = [(label, " ".join(pats)) for label, pats in filters]
     chosen = _run_waterfall(

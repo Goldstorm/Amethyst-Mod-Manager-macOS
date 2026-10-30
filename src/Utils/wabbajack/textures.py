@@ -289,7 +289,7 @@ def _run_once(request, arguments, stop=None, timeout=600, log=None):
         raise InterruptedError("Texture conversion stopped")
     command, env = _command(request, arguments)
     started = time.monotonic()
-    emit(log, "texture.process.started", command=command,
+    emit(log, "texture.process.started", dev_only=True, command=command,
          proton=request.proton, prefix=_prefix(request), timeout=timeout,
          mode=request.setup_options.get("texture", {}).get("mode", "auto"),
          environment={name: env.get(name) for name in (
@@ -333,7 +333,7 @@ def _run_once(request, arguments, stop=None, timeout=600, log=None):
                 "wine server seems to be running"))
             raise _TextureFailure(f"Texconv exited with code {process.returncode}. {detail}", transient)
         detail = b"".join(tail).decode("utf-8", "replace")[-4000:]
-        emit(log, "texture.process.completed", exit_code=process.returncode,
+        emit(log, "texture.process.completed", dev_only=True, exit_code=process.returncode,
              output=detail,
              elapsed_seconds=round(time.monotonic() - started, 3))
         return detail
@@ -496,7 +496,7 @@ def _run_compressonator(request, arguments, stop=None, timeout=600, log=None):
     env["LD_LIBRARY_PATH"] = libraries + ((":" + env["LD_LIBRARY_PATH"]) if env.get("LD_LIBRARY_PATH") else "")
     env["OMP_NUM_THREADS"] = str(max(1, min(4, (os.cpu_count() or 2) // 2)))
     command = [str(tool), *map(str, arguments)]
-    emit(log, "texture.native.process.started", command=command, timeout=timeout,
+    emit(log, "texture.native.process.started", dev_only=True, command=command, timeout=timeout,
          environment={"LD_LIBRARY_PATH": libraries, "OMP_NUM_THREADS": env["OMP_NUM_THREADS"]})
     try:
         process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE,
@@ -530,7 +530,7 @@ def _run_compressonator(request, arguments, stop=None, timeout=600, log=None):
             emit(log, "texture.native.process.failed", exit_code=process.returncode,
                  output=detail)
             raise WabbajackError(f"Compressonator exited with code {process.returncode}. {detail}")
-        emit(log, "texture.native.process.completed", exit_code=process.returncode,
+        emit(log, "texture.native.process.completed", dev_only=True, exit_code=process.returncode,
              output=detail)
         return detail
     finally:
@@ -560,18 +560,32 @@ def _force_dx10_format(path, dxgi_format):
     Path(path).write_bytes(data)
 
 
+def _prefer_legacy_dds(path):
+    from Utils.ba2.extract import _make_dds_header
+    with path.open("rb") as stream:
+        header = stream.read(148)
+    if len(header) < 148 or header[84:88] != b"DX10":
+        return
+    dxgi_format, dimension, flags, array_size, alpha = struct.unpack_from("<5I", header, 128)
+    if dimension != 3 or array_size != 1 or flags & ~4 or alpha:
+        return
+    height, width = struct.unpack_from("<2I", header, 12)
+    mip_count = struct.unpack_from("<I", header, 28)[0] or 1
+    legacy = _make_dds_header(height=height, width=width, mip_count=mip_count,
+                              dxgi_format=dxgi_format, cube_map=bool(flags & 4),
+                              legacy=True)
+    if len(legacy) == 128:
+        data = path.read_bytes()
+        path.write_bytes(legacy + data[148:])
+
+
 def _write_native_dds(path, image, format_name, mip_count, resampling):
     from PIL import Image
+    from Utils.ba2.extract import _make_dds_header
     dxgi_format = _NATIVE_RAW_FORMATS[format_name]
-    channels = {28: 4, 29: 4, 49: 2, 61: 1, 65: 1,
-                87: 4, 88: 4, 91: 4, 93: 4}[dxgi_format]
-    flags = 0x1 | 0x2 | 0x4 | 0x8 | 0x1000 | (0x20000 if mip_count > 1 else 0)
-    caps = 0x1000 | (0x8 | 0x400000 if mip_count > 1 else 0)
-    header = (b"DDS " + struct.pack("<7I", 124, flags, image.height, image.width,
-              image.width * channels, 0, mip_count) + bytes(44) +
-              struct.pack("<2I4s5I", 32, 4, b"DX10", 0, 0, 0, 0, 0) +
-              struct.pack("<5I", caps, 0, 0, 0, 0) +
-              struct.pack("<5I", dxgi_format, 3, 0, 1, 0))
+    header = _make_dds_header(height=image.height, width=image.width,
+                              mip_count=mip_count, dxgi_format=dxgi_format,
+                              legacy=True)
     payload = bytearray()
     for level in range(mip_count):
         width, height = max(1, image.width >> level), max(1, image.height >> level)
@@ -627,6 +641,7 @@ def _transform_compressonator(request, source, result, width, height, mips,
         actual_dxgi = None
     if actual_dxgi != target_dxgi:
         _force_dx10_format(result, target_dxgi)
+    _prefer_legacy_dds(result)
     return expected_mips
 
 
@@ -677,7 +692,7 @@ def _texture_job(source, target, state):
 
 
 def _start_transform(job, mode, converter, batch_size, log):
-    emit(log, "texture.transform.started", source=job["source"],
+    emit(log, "texture.transform.started", dev_only=True, source=job["source"],
          target=job["target"], width=job["width"], height=job["height"],
          mip_levels=job["mips"], format=job["format"],
          filtering=job["filtering"], mode=mode, converter=converter,
@@ -701,7 +716,7 @@ def _validate_texture_result(result, job, expected_mips):
 def _finish_transform(job, result, expected_mips, elapsed, converter,
                       batch_size, log, on_completed):
     result.replace(job["target"])
-    emit(log, "texture.transform.completed", target=job["target"],
+    emit(log, "texture.transform.completed", dev_only=True, target=job["target"],
          bytes=job["target"].stat().st_size, width=job["width"],
          height=job["height"], mip_levels=expected_mips,
          format=job["format"], converter=converter, batch_size=batch_size,
@@ -735,7 +750,7 @@ def _texconv_arguments(inputs, output, job, mode):
             "-o", _windows_path(output), "-ft", "dds", "-f", job["format"],
             "-w", str(job["width"]), "-h", str(job["height"]),
             "-m", str(job["mips"]), "-if", job["filtering"],
-            *flags, "-dx10", "-y"]
+            *flags, "-y"]
 
 
 def _texconv_result(output, input_path):
@@ -885,7 +900,7 @@ def _transform_texconv_batch(request, jobs, stop, timeout, log, on_completed,
             except OSError:
                 shutil.copyfile(job["source"], path)
             staged.append(path)
-        emit(log, "texture.batch.started", converter="texconv", count=len(jobs),
+        emit(log, "texture.batch.started", dev_only=True, converter="texconv", count=len(jobs),
              width=jobs[0]["width"], height=jobs[0]["height"],
              mip_levels=jobs[0]["mips"], format=jobs[0]["format"],
              filtering=jobs[0]["filtering"])
@@ -902,7 +917,7 @@ def _transform_texconv_batch(request, jobs, stop, timeout, log, on_completed,
                                        on_completed, mode)
             return
         elapsed = time.monotonic() - started
-        emit(log, "texture.batch.completed", converter="texconv", count=len(jobs),
+        emit(log, "texture.batch.completed", dev_only=True, converter="texconv", count=len(jobs),
              format=jobs[0]["format"], elapsed_seconds=round(elapsed, 3))
         expected_mips = jobs[0]["mips"] or max(
             jobs[0]["width"], jobs[0]["height"]).bit_length()

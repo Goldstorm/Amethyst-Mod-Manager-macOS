@@ -1,13 +1,70 @@
-- v2.5.4-macOS
-### Additions
-- Added NotProton (Steam Play) support for wizard tools: NotProton tools (FEX and Rosetta) are listed in the "Choose Wine Runner" step and isolated/shared prefixes are created and run with the selected tool's patched-CrossOver wine
-- Game prefixes are now auto-detected from Steam's compatdata folder, and wizard tools in "Use game prefix" mode run with the NotProton runner that owns the prefix
-- Play with launch mode "None" launches Steam games through the NotProton run script for the tool Steam has mapped to the game
-- Play with launch mode "Auto" hands off to Steam via steam:// (LaunchServices)
-- When the NotProton build that owns a prefix is no longer installed, the failure is reported along with the tail of the prefix's notproton-run.log
+- v2.6.0-macOS
 ### Changes
-- Merged upstream main (v2.5.4) into the macOS branch
-- The wizard no-runner message and the onboarding add-a-game hint now point at NotProton first (CrossOver bottles and system Wine remain supported)
+- Merged upstream main (v2.6.0) into the macOS branch
+
+---
+
+- v2.6.0
+### Game Support
+- Added Nivalis Nights
+- Added Prey (2017) #751
+### Additions
+- Added a headless/api mode to the manager to allow external applictions/scripts to use most of the manager's functions directly
+- Added plugins support and a plugins browser,
+- Added automatic Steam overlay loading for direct game launches, including VFS
+- Added Thunderstore share code importing through the Thunderstore dropdown
+- Added an option to export saves on profile export and import on profile import
+- Added a LOOT report button to the plugins tab showing the masterlist's general messages and plugin download locations
+- Added Open as tab support to all plugin panel tabs
+### Changes
+- Custom repositories can now be added to source custom game handlers in the add game menu
+- Script extender wizards now default to installing into the modlist intead of the game folder
+- Centered the Plugins panel buttons to match the modlist panel
+### Bug Fixes
+- Fixed some Windows-created ZIP archives installing empty folders as files
+- Fixed Restore failing when profile-save state is empty or malformed.
+- Fixed FOMOD installers failing when paths begin with slashes or backslashes.
+- Fixed an issue where prefixes created in the mods folder from the BS/OS and Pandora wizards could cause other applications mods scanning to break
+- Fixed an issue in the Nexus browser when searching in the Tracked/Endored windows where it would search within the Browse window instead
+- Fixed an issue where manually adding a folder/mod to a wabbajack list would not appear even when refreshing the modlist
+- Fixed an issue where the game folder's text files were not showing in the text files tab
+
+---
+
+- v2.5.5
+### Game Support
+- Added The Sims 3
+- Added Star Wars: Zero Comapny
+- Added Grim Dawn
+### Additions
+- Added an option in the settings to forward nxm links to other applications
+- Added an option in the UI settings to change default priority sort order
+- Added one-click Windows component installation from the Proton menu.
+- Added an option to open the modlist panel as a tab for cross panel mod sorting. Can be opened from the eye icon in the mod name column
+- Added an option to symlink mods to other profiles
+- Added an option to the Thunderstore dropdown to import a r2x manifest
+- Added an option to disable keybinds in the keybinds settings menu
+### Changes
+- Appimage updates now install via the zsync file intead of rerunning the install script
+- Bethesda profile specfic saves now use sLocalSavePath to separate them from the usual saves folder
+- Creation club disabling within Fallout 4 and Skyrim SE is now optional
+- Profile export now sets disabled mods to optional by default and highlights them
+- The application theme can now be changed in the onboarding menu. The onboarding menu now also shows a list of installed games
+- Skyrim together reborn is detected when pressing play
+### Bug Fixes
+- Fixed Thunderstore dependancy downloading when a mod contains 200+ dependancies
+- Fixed issues when dragging mods in the download tab to install them
+- Fixed Oblivion Remastered Wabbajack lists using the wrong folder as the root folder
+- Fixed automatic detection and path setup for Lutris games using shortcuts or launchers.
+- Potential fix for pandora black screen when run via the wizard
+- Fixed wizard installs continuing after restoring the game to vanilla failed. #522
+- Fixed custom deployments continuing when their recovery log could not be saved. #523
+- Fixed mod installs being reported as successful when game-specific post-install processing failed. #524
+- Fixed deployments being reported as successful after file transfer failures #525
+- Fixed Wabbajack installs failing on unexpected mip sizes in unused BA2 textures.
+- Potential fix for automatic dll overrides causing controller issues
+- Fixed Wicther 3 Script Merger output disappearing after deploy/restore
+- Fixed Witcher 3 load ordering causing Sharedutils compilation errors
 
 ---
 

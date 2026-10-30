@@ -22,8 +22,8 @@ from PySide6.QtWidgets import (
     QHBoxLayout, QLabel, QPlainTextEdit, QPushButton, QVBoxLayout, QWidget,
 )
 
-from gui_qt.safe_emit import safe_emit
-from gui_qt.theme_qt import active_palette, _c
+from gui_qt.runtime.safe_emit import safe_emit
+from gui_qt.appearance.theme import active_palette, _c
 from wizards_qt._view_base import GREEN, RED, WizardViewBase
 from Utils.bethesda.ttw import (
     MODPUB_URL, OUTPUT_NAME,
@@ -89,7 +89,7 @@ class TTWView(WizardViewBase):
 
     # ---- page 0: download ------------------------------------------------------
     def _build_download_page(self) -> QWidget:
-        from gui_qt.mpi_installer_widget import MPIInstallerWidget
+        from gui_qt.installers.mpi_installer import MPIInstallerWidget
         page, lay = self._step_page(self.tr("Step 1: Install the MPI Installer"))
         self._mpi_installer = MPIInstallerWidget(
             self._game, get_api=getattr(self._ctx, "nexus_api", None),
@@ -352,6 +352,8 @@ class TTWView(WizardViewBase):
             r"\b(Building ready BSA|Extracting|Patching|Cleaning up)[^\r\n]*")
 
         try:
+            from Utils.mods.links import require_local_destination
+            require_local_destination(game, dest)
             dest.mkdir(parents=True, exist_ok=True)
             proc = subprocess.Popen(
                 cmd, cwd=str(exe.parent), stdout=subprocess.PIPE,

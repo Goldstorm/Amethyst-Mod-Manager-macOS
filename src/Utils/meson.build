@@ -2,6 +2,7 @@ subdir('archives')
 subdir('assets')
 subdir('ba2')
 subdir('bethesda')
+subdir('boundaries')
 subdir('bg3')
 subdir('bsa')
 subdir('collections')
@@ -50,7 +51,9 @@ py.install_sources(
   'crossover_finder.py',
   'fs_check.py',
   'hardlink_check.py',
+  'json_limits.py',
   'memory_cache.py',
+  'operations.py',
   'proton_compat.py',
   'wine_prefix_finder.py',
   'wine_runner.py',

@@ -22,6 +22,7 @@ from Utils.vfs import ProfileVFSGameMixin
 from Utils.deployment import (
     CustomRule,
     LinkMode,
+    RestoreWhitelistRule,
     deploy_custom_rules,
     deploy_filemap_to_root,
     load_per_mod_strip_prefixes,
@@ -38,6 +39,13 @@ from Utils.mods.modlist import read_modlist
 from Utils.config_paths import get_profiles_dir
 
 _PROFILES_DIR = get_profiles_dir()
+_REDMOD_TOOL = Path("tools/redmod/bin/redMod.exe")
+_REDMOD_MISSING = (
+    "Cyberpunk 2077 REDmod DLC is missing (tools/redmod/bin/redMod.exe). "
+    "In Steam, open Cyberpunk 2077 > Properties > DLC and install/enable "
+    "Cyberpunk 2077 REDmod, then deploy again. For other stores, install "
+    "the free REDmod add-on through your game launcher."
+)
 
 
 class Cyberpunk2077(ProfileVFSGameMixin, BaseGame):
@@ -121,6 +129,15 @@ class Cyberpunk2077(ProfileVFSGameMixin, BaseGame):
     @property
     def excluded_loose_filenames(self) -> set[str]:
         return {"*.txt"}
+
+    @property
+    def restore_whitelist(self) -> list[RestoreWhitelistRule]:
+        return super().restore_whitelist + [
+            RestoreWhitelistRule(
+                path="r6/cache", filenames=["tweakdb.bin", "tweakdb_ep1.bin"],
+            ),
+            RestoreWhitelistRule(path="archive/pc", folders=["content", "ep1"]),
+        ]
 
     @property
     def filemap_exclude_unknown_top_level(self) -> bool:
@@ -567,26 +584,56 @@ class Cyberpunk2077(ProfileVFSGameMixin, BaseGame):
         except OSError:
             return []
 
-    def _run_redmod_deploy(self, root: Path, *, private: bool,
-                           log_fn) -> None:
-        mods = sorted(p.parent.name for p in (root / "mods").glob("*/info.json"))
-        cache = root / "r6" / "cache" / "modded"
-        if not mods and not os.path.lexists(cache):
+    @staticmethod
+    def _redmod_cache_needs_deploy(root: Path) -> bool:
+        cache = root / "r6/cache/modded"
+        if not os.path.lexists(cache):
+            return False
+        if cache.is_symlink() or not cache.is_dir():
+            return True
+        return next(cache.iterdir(), None) is not None
+
+    def validate_deployment_plan(self, plan, *, root_folder_enabled=True) -> None:
+        if self._game_path is None:
             return
-
+        from Utils.filegraph.deploy import entry_relative_to
         from Utils.games.frameworks import resolve_file_ci
-        tool = resolve_file_ci(root, Path("tools/redmod/bin/redMod.exe"))
-        if tool is None:
-            raise RuntimeError(
-                "REDmod DLC is missing (tools/redmod/bin/redMod.exe). "
-                "Install Cyberpunk 2077 REDmod before deploying REDmods."
-            )
 
+        needs_redmod = (
+            any((self._game_path / "mods").glob("*/info.json"))
+            or self._redmod_cache_needs_deploy(self._game_path)
+        )
+        tool_planned = False
+        target_roots = {}
+        for entry in plan.entries:
+            if entry.provider_kind == "root" and not root_folder_enabled:
+                continue
+            relative = entry_relative_to(
+                self, entry, self._game_path, target_roots)
+            if relative is None:
+                continue
+            parts = relative.lower().split("/")
+            if len(parts) == 3 and parts[0] == "mods" and parts[2] == "info.json":
+                needs_redmod = True
+            if len(parts) > 3 and parts[:3] == ["r6", "cache", "modded"]:
+                needs_redmod = True
+            if relative.lower() == _REDMOD_TOOL.as_posix().lower():
+                source = entry.source_path
+                tool_planned = source is not None and source.is_file()
+        if (needs_redmod and not tool_planned
+                and resolve_file_ci(self._game_path, _REDMOD_TOOL) is None):
+            raise RuntimeError(_REDMOD_MISSING)
+        if needs_redmod:
+            from Utils.launchers.steam import proton_run_command
+            proton, env = self._redmod_runtime(read_only=True)
+            proton_run_command(
+                proton, "runinprefix", env=env, host_cwd=self._game_path)
+
+    def _redmod_runtime(self, *, read_only=False):
         from Utils.wine.protontricks import (
             build_proton_env_for_game, prefix_downgrade_warning,
-            run_prefix_installer,
         )
-        proton, env = build_proton_env_for_game(self)
+        proton, env = build_proton_env_for_game(self, read_only=read_only)
         if proton is None or env is None:
             raise RuntimeError(
                 "REDmod could not find the game's Proton prefix and runner. "
@@ -596,6 +643,21 @@ class Cyberpunk2077(ProfileVFSGameMixin, BaseGame):
             proton, env.get("STEAM_COMPAT_DATA_PATH"))
         if mismatch:
             raise RuntimeError(f"REDmod cannot use this Proton prefix: {mismatch}")
+        return proton, env
+
+    def _run_redmod_deploy(self, root: Path, *, private: bool,
+                           log_fn) -> None:
+        mods = sorted(p.parent.name for p in (root / "mods").glob("*/info.json"))
+        cache = root / "r6" / "cache" / "modded"
+        if not mods and not self._redmod_cache_needs_deploy(root):
+            return
+
+        from Utils.games.frameworks import resolve_file_ci
+        tool = resolve_file_ci(root, _REDMOD_TOOL)
+        if tool is None:
+            raise RuntimeError(_REDMOD_MISSING)
+
+        proton, env = self._redmod_runtime()
 
         if private:
             for path in (root / "r6", root / "r6" / "cache", cache):
@@ -619,6 +681,7 @@ class Cyberpunk2077(ProfileVFSGameMixin, BaseGame):
             f"-root={windows_root}", env=env, host_cwd=root,
         )
         log_fn(f"REDmod: deploying {len(mods)} mod(s) in {root} ...")
+        from Utils.wine.protontricks import run_prefix_installer
         rc, output = run_prefix_installer(
             cmd, env, root, label="REDmod deploy", log_fn=log_fn,
             timeout=600, proton_script=proton,
@@ -635,14 +698,13 @@ class Cyberpunk2077(ProfileVFSGameMixin, BaseGame):
         if not self.vfs_launch_enabled and self._game_path is not None:
             self._run_redmod_deploy(self._game_path, private=False, log_fn=_log)
         redmods = self._deployed_redmods()
-        if not redmods:
-            return
-        _log(f"REDmod: {len(redmods)} mod(s) deployed under mods/ - the game "
-             "only loads them when launched with -modded (the Play button "
-             "passes it automatically).")
+        if redmods:
+            _log(f"REDmod: {len(redmods)} mod(s) deployed under mods/ - the game "
+                 "only loads them when launched with -modded (the Play button "
+                 "passes it automatically).")
         warn = self._external_launch_missing_modded(_log)
         if warn:
-            _log(f"REDmod: {warn}")
+            _log(f"Cyberpunk 2077: {warn}")
             # Only toast it when no manager launch follows: the Play button
             # passes -modded itself, so the advice would be noise there. It
             # matters for a later launch from Steam/Heroic directly, and the
@@ -675,7 +737,7 @@ class Cyberpunk2077(ProfileVFSGameMixin, BaseGame):
                 results = {a: add_steam_launch_option(sid, a) for a in missing}
                 added = [a for a in missing if results[a] == "added"]
                 if added:
-                    _log(f"REDmod: added {' '.join(added)} to the game's "
+                    _log(f"Cyberpunk 2077: added {' '.join(added)} to the game's "
                          "Steam Launch Options - applies the next time Steam "
                          "starts.")
                 modded = results.get("-modded")
@@ -683,12 +745,13 @@ class Cyberpunk2077(ProfileVFSGameMixin, BaseGame):
                     return None
                 if modded == "steam_running":
                     return (
-                        "REDmods need -modded in the game's Steam Launch "
-                        "Options. Steam is running and would undo the change "
+                        "Launch Cyberpunk 2077 with -modded to enable mods. "
+                        "Steam is running and would undo the Launch Options change "
                         "- add it in Properties → Launch Options, or close "
                         "Steam and deploy again.")
                 return (
-                    "REDmods need -modded in the game's Steam Launch Options "
+                    "Launch Cyberpunk 2077 with -modded to enable mods. "
+                    "Add it to the game's Steam Launch Options "
                     "(Properties → Launch Options) - it couldn't be added "
                     "automatically.")
             elif game_is_heroic_install(self):
@@ -705,16 +768,17 @@ class Cyberpunk2077(ProfileVFSGameMixin, BaseGame):
                            for a in missing}
                 added = [a for a in missing if results[a]]
                 if added:
-                    _log(f"REDmod: added {' '.join(added)} to the game's "
+                    _log(f"Cyberpunk 2077: added {' '.join(added)} to the game's "
                          "launch arguments in Heroic.")
                 if results.get("-modded", True):
                     return None
                 return (
-                    "REDmods need -modded in Heroic's Game Arguments "
+                    "Launch Cyberpunk 2077 with -modded to enable mods. "
+                    "Add it to Heroic's Game Arguments "
                     "(game settings → Advanced) - it couldn't be added "
                     "automatically.")
         except Exception as exc:
-            _log(f"REDmod: launch-options check skipped ({exc})")
+            _log(f"Cyberpunk 2077: launch-options check skipped ({exc})")
         return None
 
     def restore(self, log_fn=None, progress_fn=None) -> None:

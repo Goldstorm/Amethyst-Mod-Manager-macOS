@@ -273,11 +273,21 @@ class GameState:
             same = library.root == expected
         if same:
             return False
+        self.release_filegraph()
+        return True
+
+    def release_filegraph(self) -> None:
         self._filegraph_conflict_cache.clear()
         self._filegraph_recent_profiles.clear()
         self._filegraph_profile = None
         self._filegraph_library = None
-        return True
+
+    def queue_mod_refresh(self, names):
+        profile = self.profile_dir()
+        if profile is not None:
+            with self._mod_refresh_lock:
+                pending = self._pending_mod_refreshes.setdefault(str(profile), {})
+                pending.update((name, object()) for name in names)
 
     def queue_mod_refresh(self, names):
         profile = self.profile_dir()

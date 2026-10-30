@@ -29,8 +29,8 @@ from PySide6.QtWidgets import (
     QPushButton, QRadioButton, QVBoxLayout, QWidget,
 )
 
-from gui_qt.safe_emit import safe_emit
-from gui_qt.theme_qt import active_palette, _c
+from gui_qt.runtime.safe_emit import safe_emit
+from gui_qt.appearance.theme import active_palette, _c
 from wizards_qt._view_base import GREEN, RED, WizardViewBase
 
 if TYPE_CHECKING:
@@ -323,6 +323,8 @@ class SpecialKView(WizardViewBase):
             if staging is None:
                 raise RuntimeError("Mod staging path is not configured.")
             mod_dir = staging / _MOD_NAME
+            from Utils.mods.links import require_local_destination
+            require_local_destination(self._game, mod_dir)
             # Replace any previous install so a proxy-name change doesn't leave
             # the old DLL behind as a second copy.
             if mod_dir.exists():

@@ -85,27 +85,34 @@ def _deploy_workers() -> int:
 
 
 def _map_batched(fn, items: list, chunk: int = 2048) -> list:
-    """Parallel map for very cheap per-item work (an lstat or readlink).
-
-    ThreadPoolExecutor.map creates one future per item (its chunksize
-    argument only applies to process pools), and at ~30µs of dispatch
-    overhead per future that swamps a ~10µs syscall - 125k items cost
-    seconds of pure overhead.  Slicing the list so each worker runs a plain
-    loop over a chunk keeps the parallelism while paying dispatch once per
-    chunk.  Preserves item order.
-    """
+    """Preserve input order, parallelizing metadata reads only when they stall."""
     if not items:
         return []
     if len(items) <= chunk:
         return [fn(x) for x in items]
-    slices = [items[i:i + chunk] for i in range(0, len(items), chunk)]
+    try:
+        workers = max(0, int(os.environ.get("MOD_MANAGER_METADATA_WORKERS", "0")))
+    except ValueError:
+        workers = 0
+    out: list = []
+    if workers == 0:
+        sample = min(256, chunk)
+        started = _time.perf_counter()
+        out = [fn(x) for x in items[:sample]]
+        # Cached metadata is cheaper than Python thread handoffs. Retain
+        # parallel reads for slow storage without repeating the sampled work.
+        workers = (1 if _time.perf_counter() - started <= sample * 0.000020
+                   else _deploy_workers())
+    if workers == 1:
+        out.extend(fn(x) for x in items[len(out):])
+        return out
+    slices = [items[i:i + chunk] for i in range(len(out), len(items), chunk)]
 
     def _run(sl: list) -> list:
         return [fn(x) for x in sl]
 
-    out: list = []
     with concurrent.futures.ThreadPoolExecutor(
-            max_workers=min(_deploy_workers(), len(slices))) as pool:
+            max_workers=min(workers, len(slices))) as pool:
         for part in pool.map(_run, slices):
             out.extend(part)
     return out
@@ -722,10 +729,10 @@ class CustomRule:
                  plugins where "Foo.asi" and "Foo.ini" must both live at the
                  game root even though the ``.ini`` extension is too generic
                  to route unconditionally.
-    flatten    - when True, folder matches drop all directory components
-                 below the matched folder so the file lands flat under
-                 ``dest``.  Default False (preserve subfolders, the historical
-                 behaviour).
+    flatten    - drop parents above a matched folder, or use the bare filename
+                 for extension/filename matches. Default False.
+    flatten_contents - place matched files directly under ``dest``, removing
+                 all folders. Include Siblings still takes precedence.
     include_siblings - when True, a single match drags the *containing
                  folder* of the matched file along with it: every sibling
                  file under that folder (from the same mod) is routed to
@@ -773,6 +780,7 @@ class CustomRule:
     mirror_dests: list[str] = field(default_factory=list)
     exclude_extensions: list[str] = field(default_factory=list)
     rule_id: str = ""
+    flatten_contents: bool = False
 
 
 @dataclass
@@ -1401,13 +1409,13 @@ def _restore_from_log(
     def _unlink_one(p: str) -> int:
         try:
             st = os.lstat(p)
-        except OSError:
+        except FileNotFoundError:
             return 0
         if _stat.S_ISLNK(st.st_mode) or _stat.S_ISREG(st.st_mode):
             try:
                 os.unlink(p)
                 return 1
-            except OSError:
+            except FileNotFoundError:
                 return 0
         return 0
 
@@ -2276,7 +2284,8 @@ def _case_alias_parent_dirs(game_root: Path, alias_dirs):
             yield parent
 
 
-def remove_case_alias_links(game_root: Path, alias_dirs, log_fn=None) -> int:
+def remove_case_alias_links(game_root: Path, alias_dirs, log_fn=None, *,
+                            strict: bool = False) -> int:
     """Remove alias symlinks created by `deploy_case_alias_links`.
 
     Called from handlers' restore() so the game folder returns to true
@@ -2286,18 +2295,30 @@ def remove_case_alias_links(game_root: Path, alias_dirs, log_fn=None) -> int:
     """
     _log = _safe_log(log_fn)
     removed = 0
-    for real, extra in _expand_case_alias_dirs(game_root, alias_dirs):
-        variants = {real.name.lower(), real.name.upper()}
-        if extra:
-            variants.add(extra)
-        for variant in variants - {real.name}:
-            alias = real.parent / variant
-            try:
-                if alias.is_symlink() and os.readlink(alias) == real.name:
+    parents: dict[Path, set[str]] = {}
+    for rel in alias_dirs or ():
+        rel = rel.replace("\\", "/").strip("/")
+        parent_rel, _, name = rel.rpartition("/")
+        parent = _resolve_nocase_dir(game_root, parent_rel) if parent_rel else game_root
+        if parent is not None:
+            parents.setdefault(parent, set()).add(name.casefold())
+    for parent, names in parents.items():
+        try:
+            with os.scandir(parent) as entries:
+                aliases = [entry.name for entry in entries if entry.is_symlink()]
+            for name in aliases:
+                if "*" not in names and name.casefold() not in names:
+                    continue
+                alias = parent / name
+                target = os.readlink(alias)
+                if ("/" not in target and target != name
+                        and target.casefold() == name.casefold()):
                     alias.unlink()
                     removed += 1
-            except OSError as exc:
-                _log(f"  WARN: case alias cleanup {variant!r}: {exc}")
+        except OSError as exc:
+            if strict:
+                raise
+            _log(f"  WARN: case alias cleanup in {parent}: {exc}")
     if removed:
         _log(f"  Case aliases: {removed} symlink(s) removed.")
     return removed

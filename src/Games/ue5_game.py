@@ -245,21 +245,7 @@ class UE5Game(ProfileVFSGameMixin, BaseGame):
 
     @property
     def filemap_casing_pins(self) -> dict[str, str]:
-        """UE4SS loads a lua mod's entry point from ``Scripts/main.lua`` (capital
-        S) but discovers the mod folder by a lowercase ``scripts`` check - see
-        UE4SS ``setup_mods()`` vs ``queue_start_lua_mod_by_path()``. On Windows
-        the filesystem is case-insensitive so either casing works, but under
-        Proton on a case-sensitive Linux filesystem a mod shipping a lowercase
-        ``scripts`` folder is discovered yet fails to load its ``main.lua``.
-
-        Pinning every ``scripts`` segment to ``Scripts`` at deploy time makes the
-        casing UE4SS's loader expects, and also makes this manager's own
-        ``Scripts/main.lua`` check in ``_collect_deployed_ue4ss_folders`` match,
-        so lowercase-shipped mods get a ``mods.txt`` entry too.
-
-        Every UE5 game (and UE5-deploy custom games, which merge this in) shares
-        this default.
-        """
+        """Default UE4SS casing override, bypassed by Preserve."""
         return {"scripts": "Scripts"}
 
     # -----------------------------------------------------------------------
@@ -933,6 +919,8 @@ class UE5Game(ProfileVFSGameMixin, BaseGame):
             if info is not None and container_path:
                 container_name = info[1]
                 final_rel = container_name + "/" + norm[len(container_path) + 1:]
+            elif rule._custom_rule and rule._custom_rule.flatten_contents:
+                final_rel = Path(norm).name
             elif rule.flatten:
                 if is_folder_match:
                     # Folder/prefix/folder_anywhere match: strip parents above
@@ -1041,7 +1029,9 @@ class UE5Game(ProfileVFSGameMixin, BaseGame):
                         new_primaries.append((i, dyn_strip, is_folder_match))
                         continue
                 # Non-include_siblings: standard flatten / preserve placement.
-                if rule.flatten:
+                if rule._custom_rule and rule._custom_rule.flatten_contents:
+                    final_rel = Path(norm).name
+                elif rule.flatten:
                     if is_folder_match:
                         final_rel = self._apply_strip(staged_rel, dyn_strip) if dyn_strip else norm
                     else:
@@ -1644,9 +1634,7 @@ class UE5Game(ProfileVFSGameMixin, BaseGame):
         Filters applied (post-deploy, against the live game tree):
           - Skip if the folder contains ``enabled.txt`` (UE4SS auto-loads via
             the per-folder marker - duplicate entry is unnecessary).
-          - Skip if the folder doesn't contain ``Scripts/main.lua`` (UE4SS
-            only treats folders with a main.lua as actual mods; everything
-            else is library/shared code).
+          - Skip folders without ``scripts/main.lua`` or ``Scripts/main.lua``.
 
         Manifest entries are game-root-relative (custom-dir absolute entries
         are skipped - UE4SS lua mods always land in the game tree).
@@ -1668,8 +1656,7 @@ class UE5Game(ProfileVFSGameMixin, BaseGame):
                 continue
             candidate_folders.add(first_seg)
 
-        # Filter against the live game tree: folder must have Scripts/main.lua
-        # and must NOT have enabled.txt.
+        # Require a Lua entry point and no enabled.txt marker.
         game_path = self._ue5_active_deploy_root()
         if game_path is None:
             return candidate_folders
@@ -1681,7 +1668,8 @@ class UE5Game(ProfileVFSGameMixin, BaseGame):
             folder_dir = mods_root / folder
             if (folder_dir / "enabled.txt").is_file():
                 continue
-            if not (folder_dir / "Scripts" / "main.lua").is_file():
+            if not any((folder_dir / name / "main.lua").is_file()
+                       for name in ("scripts", "Scripts")):
                 continue
             kept.add(folder)
         return kept

@@ -38,12 +38,17 @@ options).  The mod then scans/deploys like any normal mod.  The selection menu
 from __future__ import annotations
 
 import configparser
+import io
 import json
 import os
 import re
 import shutil
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from Utils.mods.metadata import meta_file_signature, read_meta_ini
+from Utils.memory_cache import ByteLruCache
 
 
 __all__ = [
@@ -755,18 +760,23 @@ def merge_bundle_spec(new_spec: BundleSpec, old_spec: BundleSpec) -> BundleSpec:
 # meta.ini [Bundle] section ------------------------------------------------
 _BUNDLE_SECTION = "Bundle"
 _BUNDLE_KEY = "spec"
+_BUNDLE_CACHE = ByteLruCache(8 * 1024 * 1024)
 
 
 def read_bundle_spec(meta_ini_path: Path) -> "BundleSpec | None":
     """Read the ``[Bundle] spec`` JSON from a mod's meta.ini, or None if absent."""
-    if not meta_ini_path.is_file():
+    path = str(meta_ini_path)
+    signature = meta_file_signature(path)
+    if signature is None:
         return None
-    cp = configparser.ConfigParser()
-    try:
-        cp.read(str(meta_ini_path), encoding="utf-8")
-    except configparser.Error:
-        return None
-    raw = cp.get(_BUNDLE_SECTION, _BUNDLE_KEY, fallback="")
+    cached = _BUNDLE_CACHE.get(path)
+    if cached is not None and cached[0] == signature:
+        raw = cached[1]
+    else:
+        signature, cp, error = read_meta_ini(path)
+        raw = "" if error else cp.get(_BUNDLE_SECTION, _BUNDLE_KEY, fallback="")
+        if signature is not None:
+            _BUNDLE_CACHE.put(path, (signature, raw))
     if not raw:
         return None
     # configparser doubles literal % on write - undo for our JSON blob.
@@ -785,9 +795,23 @@ def write_bundle_spec(meta_ini_path: Path, spec: BundleSpec) -> None:
     if not cp.has_section(_BUNDLE_SECTION):
         cp.add_section(_BUNDLE_SECTION)
     cp.set(_BUNDLE_SECTION, _BUNDLE_KEY, spec.to_json().replace("%", "%%"))
-    meta_ini_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(meta_ini_path, "w", encoding="utf-8") as f:
-        cp.write(f)
+    output = io.StringIO()
+    cp.write(output)
+    _atomic_write_text(meta_ini_path, output.getvalue())
+
+
+def _atomic_write_text(path: Path, value: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as file:
+            if path.is_file():
+                os.fchmod(file.fileno(), path.stat().st_mode & 0o777)
+            file.write(value)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 # Library folder (inside the mod) that holds the original extracted option
@@ -893,9 +917,7 @@ def _read_materialized_manifest(lib_dir: Path) -> list[str]:
 
 
 def _write_materialized_manifest(lib_dir: Path, rels: list[str]) -> None:
-    lib_dir.mkdir(parents=True, exist_ok=True)
-    (lib_dir / _MATERIALIZED_MANIFEST).write_text(
-        "\n".join(rels), encoding="utf-8")
+    _atomic_write_text(lib_dir / _MATERIALIZED_MANIFEST, "\n".join(rels))
 
 
 def _link_or_copy(src: Path, dst: Path) -> None:
@@ -928,20 +950,7 @@ def materialize_selection(mod_dir: Path, spec: BundleSpec) -> list[str]:
     """
     lib_dir = mod_dir / BUNDLE_LIB_DIR
 
-    # 1. Remove previously materialised files (and now-empty parent dirs).
-    old = _read_materialized_manifest(lib_dir)
-    for rel in old:
-        f = mod_dir / rel
-        try:
-            if f.is_file() or f.is_symlink():
-                f.unlink()
-        except OSError:
-            pass
-    _prune_empty_dirs(mod_dir, {Path(r).parent for r in old}, stop=lib_dir.name)
-
-    # 2. Materialise the current selection, in apply order.
-    materialised: list[str] = []
-    seen: set[str] = set()  # lowercased rel - later option overrides earlier
+    planned: list[tuple[Path, str]] = []
     for folder in _ordered_selected_folders(spec):
         opt_root = lib_dir / folder
         if not opt_root.is_dir():
@@ -954,11 +963,30 @@ def materialize_selection(mod_dir: Path, spec: BundleSpec) -> list[str]:
                 continue
             if _is_option_metadata(src.name) and src.parent == opt_root:
                 continue
-            _link_or_copy(src, mod_dir / rel)
-            low = rel.lower()
-            if low not in seen:
-                seen.add(low)
-                materialised.append(rel)
+            planned.append((src, rel))
+
+    # 1. Remove previously materialised files (and now-empty parent dirs).
+    old = _read_materialized_manifest(lib_dir)
+    _write_materialized_manifest(
+        lib_dir, list(dict.fromkeys([*old, *(rel for _, rel in planned)])))
+    for rel in old:
+        f = mod_dir / rel
+        try:
+            if f.is_file() or f.is_symlink():
+                f.unlink()
+        except OSError:
+            pass
+    _prune_empty_dirs(mod_dir, {Path(r).parent for r in old}, stop=lib_dir.name)
+
+    # 2. Materialise the current selection, in apply order.
+    materialised: list[str] = []
+    seen: set[str] = set()  # lowercased rel - later option overrides earlier
+    for src, rel in planned:
+        _link_or_copy(src, mod_dir / rel)
+        low = rel.lower()
+        if low not in seen:
+            seen.add(low)
+            materialised.append(rel)
 
     _write_materialized_manifest(lib_dir, materialised)
     return materialised

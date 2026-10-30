@@ -9,7 +9,7 @@ from pathlib import Path
 
 from Utils.diagnostics.performance import InstallerTrace
 from Utils.downloads.install import InstallCallbacks, InstallControl, consume_pipeline
-from Utils.deployment.locking import game_mutation_lock
+from Utils.deployment.locking import coordinated_game_mutation
 from .acquire import Acquisition, _CombinedStop
 from .archive_cache import ArchiveBudget
 from .diagnostics import bind, emit, emit_exception, log_request
@@ -50,10 +50,10 @@ def run_install(request, *, callbacks=None, control=None, report=None):
         if phase != last_phase:
             if last_phase:
                 cb.on_log(f"{last_phase} finished in {now - phase_started:.2f}s")
-                emit(cb.on_log, "install.phase.completed", phase=last_phase,
+                emit(cb.on_log, "install.phase.completed", dev_only=True, phase=last_phase,
                      elapsed_seconds=round(now - phase_started, 3))
             cb.on_log(phase)
-            emit(cb.on_log, "install.phase.started", phase=phase, detail=detail)
+            emit(cb.on_log, "install.phase.started", dev_only=True, phase=phase, detail=detail)
             phase_started = now
         if phase != last_phase or now - last_emit >= 0.1 or (total and current == total):
             cb.on_phase(phase, current, total, detail)
@@ -84,10 +84,15 @@ def run_install(request, *, callbacks=None, control=None, report=None):
             raise WabbajackError("\n".join(f"{c.name}: {c.detail}" for c in report.checks if c.status == "error"))
         store = Store(request.directory, Path(request.game.get_profile_root()), log=cb.on_log)
         emit(cb.on_log, "install.game_lock.waiting", game=request.package.game)
-        with game_mutation_lock(request.game), store.exclusive(progress=progress):
+        with (coordinated_game_mutation(request.game, "wabbajack.install"),
+              store.exclusive(progress=progress)):
             emit(cb.on_log, "install.game_lock.acquired", game=request.package.game)
             if request.game.get_deploy_active():
                 raise WabbajackError("Restore the deployed game before modifying this installation")
+            clear_overwrite = request.mode == "update" or (
+                request.mode == "resume"
+                and store.get("pending_overwrite_cleanup") == request.package.identity)
+            store.set("pending_overwrite_cleanup", request.package.identity if clear_overwrite else None)
             store.set("status", "installing")
             store.set("pending_package", request.package.identity)
             store.set("name", request.package.name)
@@ -97,6 +102,7 @@ def run_install(request, *, callbacks=None, control=None, report=None):
             store.set("game", request.package.game)
             store.set("selected_profiles", request.profiles)
             store.set("setup_options", request.setup_options)
+            store.set("skip_game_files", request.skip_game_files)
             store.set("pending_authored_profiles", request.package.profiles)
             saved = store.directory / (request.package.identity + ".wabbajack")
             package_xxhash = None
@@ -220,7 +226,7 @@ def run_install(request, *, callbacks=None, control=None, report=None):
                     emit(cb.on_log, "install.download_group.started", source=source)
                     update_status()
                 def ready(archive):
-                    emit(cb.on_log, "install.archive.ready", archive=archive.name,
+                    emit(cb.on_log, "install.archive.ready", dev_only=True, archive=archive.name,
                          archive_hash=archive.key, row=acquire.ids[archive.key])
                     with count_lock:
                         counts[0] += 1
@@ -245,7 +251,7 @@ def run_install(request, *, callbacks=None, control=None, report=None):
                                 acquire.clear_archive(archive, path, required=cleanup)
                         resources.completed(acquire.ids[archive.key])
                         cb.on_row_installed(acquire.ids[archive.key])
-                        emit(cb.on_log, "install.archive.extraction_completed",
+                        emit(cb.on_log, "install.archive.extraction_completed", dev_only=True,
                              archive=archive.name,
                              capacity_wait_seconds=round(waited, 3),
                              active_seconds=round(time.monotonic() - archive_started - waited, 3),
@@ -307,15 +313,24 @@ def run_install(request, *, callbacks=None, control=None, report=None):
                 raise WabbajackError("Required files failed:\n" + "\n".join(f"{a.name}: {e}" for a, e in errors[:20]))
             desired = reconstruction.finish(progress=progress)
             from .post_install import prepare_stock, prepare_smapi, apply_adjustments
-            prepare_stock(request, store, desired, ctl.stop, progress, log=cb.on_log)
-            from .setup_tasks import run_tasks
-            task_records = run_tasks(request, store, desired, ctl.stop, progress,
-                                     log=cb.on_log)
-            from .bsa_setup import run_setup
-            generated_mods = run_setup(request, store, desired, ctl.stop, progress,
-                                       log=cb.on_log)
-            priority_mods = prepare_smapi(request, store, desired, ctl.stop, progress,
+            task_records, generated_mods, priority_mods = {}, [], []
+            if request.skip_game_files:
+                from .manifest import stock_folder
+                from .paths import within
+                stock = stock_folder(request.package)
+                if stock:
+                    within(reconstruction.output, stock).mkdir(parents=True, exist_ok=True)
+                emit(cb.on_log, "install.game_setup.skipped", development_inspection=True)
+            else:
+                prepare_stock(request, store, desired, ctl.stop, progress, log=cb.on_log)
+                from .setup_tasks import run_tasks
+                task_records = run_tasks(request, store, desired, ctl.stop, progress,
                                          log=cb.on_log)
+                from .bsa_setup import run_setup
+                generated_mods = run_setup(request, store, desired, ctl.stop, progress,
+                                           log=cb.on_log)
+                priority_mods = prepare_smapi(request, store, desired, ctl.stop, progress,
+                                             log=cb.on_log)
             progress("Preparing profiles", 0, 0, "Applying authored profiles, INIs and launch settings")
             profiles = prepare_profiles(request, store, reconstruction, desired,
                                         generated_mods=generated_mods,
@@ -324,7 +339,10 @@ def run_install(request, *, callbacks=None, control=None, report=None):
             apply_adjustments(request, store, desired, ctl.stop, progress,
                               log=cb.on_log, adapter=reconstruction.adapter)
             validate_links(store, profiles, log=cb.on_log)
-            current, conflicts = store.preview(desired, repair=request.mode == "repair", stop=ctl.stop, progress=progress)
+            overwrite_profiles = [profile.name for profile in profiles] if clear_overwrite else None
+            current, conflicts = store.preview(
+                desired, repair=request.mode == "repair", overwrite_profiles=overwrite_profiles,
+                stop=ctl.stop, progress=progress)
             choices = {}
             if conflicts:
                 emit(cb.on_log, "install.conflicts.waiting", count=len(conflicts),
@@ -343,7 +361,8 @@ def run_install(request, *, callbacks=None, control=None, report=None):
                      choices=choices)
             from .runtime import ensure_runtime
             progress("Preparing runtime components", 0, 0, "Installing accepted runtime requirements")
-            ensure_runtime(request, ctl.stop, cb.on_log)
+            if not request.skip_game_files:
+                ensure_runtime(request, ctl.stop, cb.on_log)
             if ctl.stop.is_set():
                 store.set("status", "paused")
                 emit(cb.on_log, "install.publication.deferred")
@@ -351,14 +370,15 @@ def run_install(request, *, callbacks=None, control=None, report=None):
             if request.game.get_deploy_active():
                 raise WabbajackError("Restore the game before publishing the installation")
             store.publish(desired, choices, current, {"version": request.package.version,
+                "pending_overwrite_cleanup": None,
                 "package_identity": request.package.identity, "gallery_id": request.gallery_id,
                 "package_xxhash": store.get("pending_package_xxhash"),
                 "authored_profiles": request.package.profiles,
                 "setup_tasks": task_records, "setup_options": request.setup_options,
                 "bsa_setup": store.get("pending_bsa_setup", {}) if generated_mods else {},
                 "fixes": request.fixes, "readme": request.package.metadata.get("Readme", ""),
-                "remaining_instructions": [c.detail for c in report.checks if c.name in {"Author instructions", "Linux compatibility", "Tool output configuration"}]},
-                stop=ctl.stop, progress=progress)
+                "remaining_instructions": [c.detail for c in report.checks if c.name in {"Author instructions", "Linux compatibility", "Tool output configuration", "Development inspection", "Skipped game outputs"}]},
+                stop=ctl.stop, progress=progress, overwrite_profiles=overwrite_profiles)
             progress("Linking profiles", 0, 0, "Connecting profiles to the shared mods directory")
             publish_links(store, profiles, log=cb.on_log)
             all_profiles = referenced_profiles(store.directory, store.profile_root,
@@ -381,6 +401,8 @@ def run_install(request, *, callbacks=None, control=None, report=None):
                 store.db.execute("DELETE FROM completed")
             progress("Installation complete", 1, 1, "Selected profile is ready")
             result = InstallResult("complete", profiles, selected, len(desired),
+                                   "Development inspection complete. Game files and dependent outputs were omitted; this installation is incomplete."
+                                   if request.skip_game_files else
                                    "Installation complete. Review the author's remaining instructions.")
             emit(cb.on_log, "install.completed", diagnostic_id=request.diagnostic_id,
                  profiles=profiles, selected_profile=selected, outputs=len(desired),

@@ -74,10 +74,14 @@ def _value(value, key=""):
     return redact(value)
 
 
-def emit(log, event: str, **fields) -> None:
+def emit(log, event: str, *, dev_only: bool = False, **fields) -> None:
     if log is None:
         return
     try:
+        if dev_only:
+            from Utils.ui.config import load_dev_mode
+            if not load_dev_mode():
+                return
         record = {"schema": 1, "session": _SESSION, "sequence": next(_SEQUENCE),
                   "monotonic_seconds": round(time.monotonic(), 6),
                   "event": event, "pid": os.getpid(),
@@ -208,6 +212,17 @@ def file_facts(path) -> dict:
     return result
 
 
+def _bubblewrap_facts() -> dict:
+    from Utils.vfs.overlay import _bubblewrap_help, _bubblewrap_invocation
+
+    invocation = _bubblewrap_invocation()
+    if not Path("/.flatpak-info").is_file():
+        return file_facts(invocation[0] if invocation else None)
+    available, reason, _ = _bubblewrap_help()
+    return {"execution": "Flatpak host", "invocation": invocation,
+            "available": available, "reason": reason}
+
+
 def _library_versions() -> dict:
     result = {}
     for name in ("requests", "urllib3", "certifi", "cryptography", "lz4", "xxhash"):
@@ -258,6 +273,7 @@ def _log_request(log, request, event) -> None:
         "MESA_LOADER_DRIVER_OVERRIDE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
         "SSL_CERT_FILE", "SSL_CERT_DIR", "HTTP_PROXY", "HTTPS_PROXY",
         "ALL_PROXY", "NO_PROXY",
+        "AMM_WABBAJACK_SKIP_GAME_FILES",
     ) if os.environ.get(name)}
     emit(log, event + ".environment", system=system, cwd=Path.cwd(),
          executable=sys.executable, uid=os.getuid(), gid=os.getgid(),
@@ -292,6 +308,7 @@ def _log_request(log, request, event) -> None:
         selected_profiles=request.profiles,
         premium=request.premium,
         clear_archives=getattr(request, "clear_archives", False),
+        skip_game_files=getattr(request, "skip_game_files", False),
         nexus_api=bool(request.api),
         fixes=request.fixes,
         setup_options=request.setup_options,
@@ -381,7 +398,7 @@ def _log_request(log, request, event) -> None:
         ca_bundle=ca_bundle,
         seven_zip=file_facts(seven_zip),
         ffmpeg=file_facts(shutil.which("ffmpeg")),
-        bubblewrap=file_facts(shutil.which("bwrap")),
+        bubblewrap=_bubblewrap_facts(),
         protontricks=file_facts(shutil.which("protontricks")),
         texconv=file_facts(getattr(request, "texconv", None)),
         compressonator=file_facts(getattr(request, "compressonator", None)),
