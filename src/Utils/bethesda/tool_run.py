@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 import threading
 from contextlib import ExitStack
 from pathlib import Path
@@ -49,7 +50,7 @@ def run_bethesda_tool(game, choice, exe, proton_name, prefix_mode, *, mode="inte
         launch_env = load_tool_launch_env(exe)
     cancel = cancel or threading.Event()
     owner = owner if owner is not None else object()
-    prefix = prefix or preview_prefix(game, exe, proton_name, prefix_mode)
+    prefix = prefix or preview_prefix(game, exe, proton_name, prefix_mode, log_fn=log_fn)
     result = {"deploy_attempted": False, "prefix_preparation_attempted": False,
               "settings_persisted": False,
               "process_started": False, "restore_attempted": False, "restored": False,
@@ -100,7 +101,15 @@ def run_bethesda_tool(game, choice, exe, proton_name, prefix_mode, *, mode="inte
                 check()
                 result["prefix_preparation_attempted"] = True
                 progress_fn(0, 1, f"prepare_{family}_prefix")
-                runner_name = (Path(prefix["script"]).parent.name if prefix_mode != "game" else proton_name)
+                if sys.platform == "darwin":
+                    # The resolved "script" is a raw wine binary; its parent
+                    # dir (x86_64-unix / aarch64-unix) is the same for every
+                    # runner, so only the runner label round-trips through
+                    # _resolve_tool_prefix_macos.
+                    runner_name = proton_name
+                else:
+                    runner_name = (Path(prefix["script"]).parent.name
+                                   if prefix_mode != "game" else proton_name)
                 resolved = resolve_tool_prefix(exe, game, runner_name, prefix_mode, log_fn=log_fn,
                                                 launch_env=launch_env, winetricks_style=winetricks_style)
                 if resolved is None:

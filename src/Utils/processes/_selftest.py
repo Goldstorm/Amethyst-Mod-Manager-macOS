@@ -8,6 +8,7 @@ Run with::
 from __future__ import annotations
 
 import subprocess
+import sys
 import time
 
 from Utils.processes import game as game_process
@@ -50,7 +51,12 @@ def test_tagged_process_stop() -> None:
     started = time.monotonic()
     with game_process.bind(session), \
             launch_report.report(failures.append) as report:
-        command, env = game_process.prepare_spawn(["sleep", "30"], None)
+        # On macOS /bin/sleep is an Apple platform binary whose environment
+        # ps -E withholds, so the marker scan could never see the token.
+        # A user binary exercises the same path on every platform.
+        tagged = ([sys.executable, "-c", "import time; time.sleep(30)"]
+                  if sys.platform == "darwin" else ["sleep", "30"])
+        command, env = game_process.prepare_spawn(tagged, None)
         proc = subprocess.Popen(command, env=env, start_new_session=True)
         report.mark_spawned()
         game_process.attach_process(proc)

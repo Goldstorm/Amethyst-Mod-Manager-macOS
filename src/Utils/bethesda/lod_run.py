@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import stat
+import sys
 import uuid
 from pathlib import Path
 
@@ -32,6 +33,11 @@ def saved_options(game, choice, tool_id):
 
 
 def new_output_path():
+    if sys.platform == "darwin":
+        # macOS: all Amethyst state lives in the Application Support dir
+        # (there is no XDG data-dir convention on macOS).
+        from Utils.config_paths import get_config_dir
+        return get_config_dir().resolve() / "lod-runs" / uuid.uuid4().hex
     home = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
     return home.resolve() / "AmethystModManager" / "lod-runs" / uuid.uuid4().hex
 

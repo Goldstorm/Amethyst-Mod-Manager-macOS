@@ -20,6 +20,7 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -97,6 +98,60 @@ exit 0
 '''
 
 
+def _darwin_matching_pids(wanted: tuple[str, ...]) -> set[int] | None:
+    """Scan own-user process environments with ``ps`` (macOS has no /proc).
+
+    ``ps -E`` appends each process's environment to its command line, so a
+    ``KEY=VALUE`` marker is matched as a literal substring with a
+    space/EOL boundary on both sides.  Values may contain spaces
+    ("Application Support"), so the output is never tokenised.  Two
+    deliberate, benign differences from the /proc scan: a marker inside a
+    process's *command line* also counts (a wrapper script embedding
+    "WINEPREFIX=…" would count as using the prefix), and only own-user
+    processes expose their environment (Amethyst's own launches are always
+    own-user).
+
+    Newer macOS spells the environment flag ``-E`` (``-e`` meaning "all
+    processes"); older releases use ``-e``.  Try both.
+    """
+    result = None
+    for command in (["ps", "-AEww"], ["ps", "-eww"]):
+        try:
+            result = subprocess.run(
+                command, capture_output=True, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if result.returncode == 0:
+            break
+        result = None
+    if result is None:
+        return None
+    output = result.stdout.decode(errors="surrogateescape")
+    found: set[int] = set()
+    own_pid = os.getpid()
+    for line in output.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) != 2 or not parts[0].isdigit():
+            continue
+        pid = int(parts[0])
+        if pid == own_pid:
+            continue
+        rest = parts[1]
+        for marker in wanted:
+            start = 0
+            while True:
+                index = rest.find(marker, start)
+                if index < 0:
+                    break
+                after = index + len(marker)
+                if (index == 0 or rest[index - 1] == " ") \
+                        and (after == len(rest) or rest[after] == " "):
+                    found.add(pid)
+                    break
+                start = index + 1
+    return found
+
+
 def matching_pids(markers: Iterable[str]) -> set[int] | None:
     """Return processes whose environment contains any exact *marker*.
 
@@ -106,6 +161,8 @@ def matching_pids(markers: Iterable[str]) -> set[int] | None:
     wanted = tuple(dict.fromkeys(str(m) for m in markers if m))
     if not wanted:
         return set()
+    if sys.platform == "darwin":
+        return _darwin_matching_pids(wanted)
     if _inside_flatpak():
         cmd = ["flatpak-spawn", "--host", "bash", "-c",
                _PROC_SCAN_SCRIPT, "bash", *wanted]

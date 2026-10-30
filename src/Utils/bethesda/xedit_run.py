@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 from .tool_run import ToolRunError as XEditRunError, ToolRunCancelled as XEditRunCancelled
@@ -38,9 +39,36 @@ def saved_options(game, choice, use_64bit=None):
             "launch_env": load_tool_launch_env(exe), "winetricks_style": load_winetricks_style(game, exe.name)}
 
 
-def preview_prefix(game, exe, proton_name, prefix_mode):
+def preview_prefix(game, exe, proton_name, prefix_mode, log_fn=None):
     from Utils.executables.launch import PREFIX_MODE_GAME, PREFIX_MODE_SHARED, shared_prefix_dir
     from Utils.wine.registry import normalize_pfx
+
+    if sys.platform == "darwin":
+        # macOS: resolve through the SAME resolver the run re-resolves
+        # through (resolve_tool_prefix -> _resolve_tool_prefix_macos), so
+        # the preview values survive the identity check in tool_run. The
+        # "script" is a wine binary and the prefix root IS the WINEPREFIX
+        # dir - macOS prefixes have no pfx/ level. First use of a fresh
+        # isolated/shared prefix runs wineboot --init (synchronous), so
+        # callers must run in a worker thread (all of them do).
+        from Utils.executables.launch import _noop_log, _resolve_tool_prefix_macos
+        if prefix_mode == PREFIX_MODE_GAME:
+            configured = game.get_prefix_path()
+            if configured is None or not Path(configured).is_dir():
+                raise XEditRunError("wine_prefix_unavailable", "The selected game prefix is unavailable.")
+        resolved = _resolve_tool_prefix_macos(
+            exe, game, proton_name, prefix_mode,
+            log_fn if log_fn is not None else _noop_log)
+        if resolved is None:
+            raise XEditRunError("xedit_runner_unavailable",
+                                "The selected prefix has no available Wine/Proton runner.")
+        wine_bin, prefix_root, _env = resolved
+        if not Path(wine_bin).is_file():
+            raise XEditRunError("xedit_runner_unavailable",
+                                "The selected prefix has no available Wine/Proton runner.")
+        return {"script": str(wine_bin),
+                "compat_data": str(prefix_root),
+                "prefix_path": str(prefix_root)}
 
     if prefix_mode == PREFIX_MODE_GAME:
         configured = game.get_prefix_path()
