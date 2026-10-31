@@ -21,8 +21,28 @@ def _token(path):
         value = Path(path).lstat()
     except FileNotFoundError:
         return None
-    return [value.st_dev, value.st_ino, value.st_mode, value.st_size,
-            value.st_mtime_ns, value.st_ctime_ns]
+    # st_ctime_ns is deliberately excluded: macOS updates ctime on
+    # metadata-only events with no content change (system xattr re-stamps,
+    # e.g. provenance/Spotlight, including at exec time), so an untouched
+    # runner binary can look "changed" mid-run. dev/ino/mode/size/mtime
+    # still catch every content-affecting change.
+    return [value.st_dev, value.st_ino, value.st_mode, value.st_size, value.st_mtime_ns]
+
+
+def _stale_diff(before, after, limit=8):
+    """Entries that differ between two {path: token} maps, oldest keys first.
+
+    Makes stale-run checkpoints self-diagnosing: a mismatch names the files
+    whose identity changed and the before/after tokens in JobError details.
+    """
+    changes = []
+    for path in sorted(set(before) | set(after)):
+        old, new = before.get(path), after.get(path)
+        if old != new:
+            changes.append({"path": path, "before": old, "after": new})
+            if len(changes) >= limit:
+                break
+    return changes
 
 
 def _selected_game(game, profile):

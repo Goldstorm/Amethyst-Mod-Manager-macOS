@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 
 from .jobs import JobCancelled, JobError
-from .tool_install import _selected_game
+from .tool_install import _selected_game, _stale_diff
 from .xedit_run import _identity, _inputs
 
 
@@ -207,9 +207,21 @@ def run_runner(game, profile, tool_id, catalogue_revision, choice, request, revi
 
             def checkpoint():
                 check_binding()
-                if (identities != [_identity(exe), _identity(runner_path)] or binaries != _application_binaries(exe)
-                        or inputs != {p: _identity(Path(p)) for p in inputs}):
-                    raise JobError("stale_lod_run", "Profile, tool or launch settings changed during the LOD run.")
+                latest_identities = [_identity(exe), _identity(runner_path)]
+                latest_binaries = _application_binaries(exe)
+                latest_inputs = {p: _identity(Path(p)) for p in inputs}
+                if identities != latest_identities or binaries != latest_binaries or inputs != latest_inputs:
+                    changes = {}
+                    if identities != latest_identities:
+                        changes["identities"] = _stale_diff(
+                            {str(exe): identities[0], str(runner_path): identities[1]},
+                            {str(exe): latest_identities[0], str(runner_path): latest_identities[1]})
+                    if binaries != latest_binaries:
+                        changes["application_binaries"] = _stale_diff(binaries, latest_binaries)
+                    if inputs != latest_inputs:
+                        changes["inputs"] = _stale_diff(inputs, latest_inputs)
+                    raise JobError("stale_lod_run", "Profile, tool or launch settings changed during the LOD run.",
+                                   {"changes": changes})
 
             def after_prepare():
                 nonlocal inputs

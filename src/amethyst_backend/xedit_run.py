@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 
 from .jobs import JobCancelled, JobError
-from .tool_install import _selected_game, _token
+from .tool_install import _selected_game, _stale_diff, _token
 
 
 def _identity(path):
@@ -179,10 +179,16 @@ def run_runner(game, profile, tool_id, catalogue_revision, choice, request, revi
 
         def checkpoint():
             check_binding()
-            if executable_identity != _identity(exe) or runner_identity != _identity(runner_path):
-                raise JobError("stale_xedit_run", "The xEdit executable or runner changed during preparation.")
-            if inputs != _inputs(selected, profile, exe):
-                raise JobError("stale_xedit_run", "Profile or launch settings changed during the xEdit run.")
+            latest_executable, latest_runner = _identity(exe), _identity(runner_path)
+            if executable_identity != latest_executable or runner_identity != latest_runner:
+                raise JobError("stale_xedit_run", "The xEdit executable or runner changed during preparation.",
+                               {"changes": {"identities": _stale_diff(
+                                   {str(exe): executable_identity, str(runner_path): runner_identity},
+                                   {str(exe): latest_executable, str(runner_path): latest_runner})}})
+            latest_inputs = _inputs(selected, profile, exe)
+            if inputs != latest_inputs:
+                raise JobError("stale_xedit_run", "Profile or launch settings changed during the xEdit run.",
+                               {"changes": {"inputs": _stale_diff(inputs, latest_inputs)}})
 
         def after_prepare():
             nonlocal inputs

@@ -6,7 +6,7 @@ from pathlib import Path
 
 from .jobs import JobCancelled, JobError
 from .lod_run import _application_binaries, _binding, _source_tree
-from .tool_install import _selected_game
+from .tool_install import _selected_game, _stale_diff
 from .xedit_run import _identity, _inputs, _plugin_sources
 
 
@@ -123,9 +123,22 @@ def run_runner(game, profile, tool_id, catalogue_revision, choice, request, revi
             def checkpoint():
                 check_binding()
                 game_link(selected, initial["prefix"]["prefix_path"])
-                if (identities != [_identity(exe), _identity(runner_path)] or binaries != _application_binaries(exe)
-                        or inputs != {p: _identity(Path(p)) for p in inputs}):
-                    raise JobError("stale_wrye_bash_run", "Profile, tool or launch settings changed during the Wrye Bash run.")
+                latest_identities = [_identity(exe), _identity(runner_path)]
+                latest_binaries = _application_binaries(exe)
+                latest_inputs = {p: _identity(Path(p)) for p in inputs}
+                if identities != latest_identities or binaries != latest_binaries or inputs != latest_inputs:
+                    changes = {}
+                    if identities != latest_identities:
+                        changes["identities"] = _stale_diff(
+                            {str(exe): identities[0], str(runner_path): identities[1]},
+                            {str(exe): latest_identities[0], str(runner_path): latest_identities[1]})
+                    if binaries != latest_binaries:
+                        changes["application_binaries"] = _stale_diff(binaries, latest_binaries)
+                    if inputs != latest_inputs:
+                        changes["inputs"] = _stale_diff(inputs, latest_inputs)
+                    raise JobError("stale_wrye_bash_run",
+                                   "Profile, tool or launch settings changed during the Wrye Bash run.",
+                                   {"changes": changes})
 
             def after_prepare():
                 nonlocal inputs
